@@ -173,15 +173,25 @@ defmodule ClaudeNotify.TelegramPoller do
 
           session ->
             tty_path = session[:tty_path]
-            TerminalInjector.send_text(tty_path, text)
-
             short_id = String.slice(session_id, 0, 8)
             truncated = String.slice(text, 0, 100)
 
-            confirm =
-              MessageFormatter.escape_full("Sent to #{short_id}: #{truncated}")
+            case TerminalInjector.send_text(tty_path, text) do
+              :ok ->
+                Telegram.send_message(
+                  MessageFormatter.escape_full("Sent to #{short_id}: #{truncated}")
+                )
 
-            Telegram.send_message(confirm)
+              {:error, reason} ->
+                Logger.warning("TelegramPoller: send_text failed: #{inspect(reason)}")
+
+                Telegram.send_message(
+                  MessageFormatter.escape_full(
+                    "Failed to send to #{short_id} (tty: #{tty_path || "none"}): #{inspect(reason)}"
+                  )
+                )
+            end
+
             state
         end
     end
@@ -190,7 +200,10 @@ defmodule ClaudeNotify.TelegramPoller do
   # --- Session list ---
 
   defp send_session_list(chat_id) do
-    sessions = SessionStore.all_sessions()
+    sessions =
+      SessionStore.all_sessions()
+      |> Enum.reject(fn {id, _session} -> id == "unknown" end)
+      |> Map.new()
 
     if map_size(sessions) == 0 do
       Telegram.send_message(MessageFormatter.escape_full("No active sessions."))
