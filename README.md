@@ -33,30 +33,95 @@ Terminal.app — keystrokes injected into correct tab
 - **macOS** (uses AppleScript for terminal keystroke injection)
 - **Terminal.app** (not iTerm2 — AppleScript targets Terminal.app tabs by TTY)
 - **Elixir >= 1.19** and **Erlang/OTP >= 28**
+- **python3** (used by hook scripts for JSON processing)
 - A **Telegram Bot** (create one via [@BotFather](https://t.me/BotFather))
 
-## Setup
+## Quick Setup
 
-### 1. Clone and install dependencies
-
-```bash
-git clone git@github.com:iagocavalcante/claude_notify.git
-cd claude_notify
-mix deps.get
-```
-
-### 2. Create a Telegram Bot
+### 1. Create a Telegram Bot
 
 1. Open Telegram and message [@BotFather](https://t.me/BotFather)
 2. Send `/newbot` and follow the prompts
-3. Copy the **bot token** (looks like `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`)
-4. Send a message to your new bot, then get your **chat ID**:
+3. Copy the **bot token**
+4. Send any message to your new bot, then get your **chat ID**:
    ```bash
    curl -s "https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates" | python3 -m json.tool
    ```
    Look for `"chat": {"id": 123456789}` — that number is your chat ID.
 
-### 3. Configure environment variables
+### 2. Run setup
+
+```bash
+git clone git@github.com:iagocavalcante/claude_notify.git
+cd claude_notify
+./setup.sh
+```
+
+The setup script will:
+- Prompt for your Telegram bot token and chat ID (saved to `.env`)
+- Install Elixir dependencies
+- Register all Claude Code hooks in `~/.claude/settings.json`
+- Install a macOS LaunchAgent (auto-starts on login, auto-restarts on crash)
+- Start the service and verify it's healthy
+
+### 3. Grant Accessibility permissions
+
+The app uses AppleScript to inject keystrokes into Terminal.app. macOS requires **Accessibility** permissions:
+
+1. Go to **System Settings > Privacy & Security > Accessibility**
+2. Add **Terminal.app** to the allowed list
+
+Without this, responding to prompts from Telegram won't work.
+
+### That's it!
+
+Open a Claude Code session in Terminal.app and you'll start getting Telegram notifications.
+
+## Managing the Service
+
+```bash
+# Stop
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.claude-notify.plist
+
+# Start
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-notify.plist
+
+# Restart
+launchctl kickstart -k gui/$(id -u)/com.claude-notify
+
+# View logs
+tail -f ~/Library/Logs/claude-notify.log
+
+# Run manually (foreground)
+source .env && mix run --no-halt
+
+# Run in IEx (foreground, interactive)
+source .env && iex -S mix
+```
+
+## Telegram Commands
+
+| Command | Description |
+|---------|-------------|
+| `/sessions` | List active Claude Code sessions with selection buttons |
+| `/help` | Show available commands |
+
+After selecting a session, any text you type in Telegram gets sent as input to that terminal session.
+
+## Testing
+
+```bash
+mix test
+```
+
+## Manual Setup
+
+If you prefer to configure things manually instead of using `setup.sh`:
+
+<details>
+<summary>Click to expand manual setup steps</summary>
+
+### Environment variables
 
 Create a `.env` file in the project root:
 
@@ -65,9 +130,9 @@ TELEGRAM_BOT_TOKEN=your_bot_token_here
 TELEGRAM_CHAT_ID=your_chat_id_here
 ```
 
-### 4. Register Claude Code hooks
+### Claude Code hooks
 
-Add the following to your `~/.claude/settings.json` (create the file if it doesn't exist):
+Add to `~/.claude/settings.json`:
 
 ```json
 {
@@ -122,51 +187,11 @@ Add the following to your `~/.claude/settings.json` (create the file if it doesn
 
 Replace `/path/to/claude_notify` with the actual absolute path to the project.
 
-Make the hook scripts executable:
-
 ```bash
 chmod +x hooks/*.sh
 ```
 
-### 5. Grant Accessibility permissions
-
-The app uses AppleScript (`osascript`) to inject keystrokes into Terminal.app. macOS requires **Accessibility** permissions for this:
-
-1. Go to **System Settings > Privacy & Security > Accessibility**
-2. Add **Terminal.app** (or whatever runs the Elixir app) to the allowed list
-
-Without this, responding to prompts from Telegram won't work.
-
-### 6. Run the app
-
-```bash
-source .env && mix run --no-halt
-```
-
-Or in an IEx session:
-
-```bash
-source .env && iex -S mix
-```
-
-The app starts on port `4040`.
-
-## Telegram Commands
-
-Once the app is running and hooks are configured:
-
-| Command | Description |
-|---------|-------------|
-| `/sessions` | List active Claude Code sessions with selection buttons |
-| `/help` | Show available commands |
-
-After selecting a session, any text you type in Telegram gets sent as input to that terminal session.
-
-## Testing
-
-```bash
-mix test
-```
+</details>
 
 ## Architecture
 
