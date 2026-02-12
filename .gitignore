@@ -1,0 +1,10 @@
+/_build/
+/cover/
+/deps/
+/doc/
+/tmp/
+erl_crash.dump
+*.ez
+claude_notify-*.tar
+.env
+.claude-memory/
