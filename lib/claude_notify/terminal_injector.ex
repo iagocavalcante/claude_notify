@@ -10,7 +10,16 @@ defmodule ClaudeNotify.TerminalInjector do
     "yes" => "y",
     "yes_dont_ask" => "a",
     "no" => "n",
-    "escape" => :escape
+    "escape" => :escape,
+    "opt_1" => "1",
+    "opt_2" => "2",
+    "opt_3" => "3",
+    "opt_4" => "4",
+    "opt_5" => "5",
+    "opt_6" => "6",
+    "opt_7" => "7",
+    "opt_8" => "8",
+    "opt_9" => "9"
   }
 
   @doc """

@@ -83,10 +83,13 @@ defmodule ClaudeNotify.MessageFormatter do
     truncated = truncate(text, 1500)
     short_id = String.slice(session_id, 0, 8)
 
+    # Wrap in pre block — only backticks and backslashes need escaping inside
+    safe_text = escape_pre(truncated)
+
     [
       "*Claude Response*",
       "",
-      escape(truncated),
+      "```\n#{safe_text}\n```",
       "",
       "Session: `#{escape_code(short_id)}`"
     ]
@@ -201,6 +204,15 @@ defmodule ClaudeNotify.MessageFormatter do
   Public escape for MarkdownV2 code spans.
   """
   def escape_code_public(text), do: escape_code(text)
+
+  # Inside MarkdownV2 pre blocks (```), only backtick and backslash need escaping
+  defp escape_pre(text) when is_binary(text) do
+    text
+    |> String.replace("\\", "\\\\")
+    |> String.replace("`", "\\`")
+  end
+
+  defp escape_pre(text), do: escape_pre(to_string(text))
 
   # Inside MarkdownV2 code spans, only backtick and backslash need escaping
   defp escape_code(text) when is_binary(text) do

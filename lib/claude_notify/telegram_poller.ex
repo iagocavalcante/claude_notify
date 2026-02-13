@@ -285,5 +285,6 @@ defmodule ClaudeNotify.TelegramPoller do
   defp response_label("yes_dont_ask"), do: "Sent: Yes (don't ask)"
   defp response_label("no"), do: "Sent: No"
   defp response_label("escape"), do: "Sent: Escape"
+  defp response_label("opt_" <> n), do: "Sent: Option #{n}"
   defp response_label(_), do: "Sent"
 end

@@ -87,7 +87,17 @@ defmodule ClaudeNotify.EventHandler do
     send_last_response(session_id, params["transcript_path"])
 
     text = MessageFormatter.notification_question(message, session_id)
-    buttons = notification_buttons(session_id)
+
+    # Detect numbered options (multi-choice) vs simple yes/no
+    options = parse_numbered_options(message)
+
+    buttons =
+      if options != [] do
+        multi_choice_buttons(session_id, options)
+      else
+        notification_buttons(session_id)
+      end
+
     Telegram.send_with_buttons(text, buttons)
   end
 
@@ -104,6 +114,30 @@ defmodule ClaudeNotify.EventHandler do
       ["Esc", "#{session_id}:escape"]
     ]
   end
+
+  defp multi_choice_buttons(session_id, options) do
+    option_buttons =
+      Enum.map(options, fn {num, label} ->
+        short_label = String.slice(label, 0, 40)
+        ["#{num}. #{short_label}", "#{session_id}:opt_#{num}"]
+      end)
+
+    # Add Esc button at the end
+    option_buttons ++ [["Esc", "#{session_id}:escape"]]
+  end
+
+  defp parse_numbered_options(message) when is_binary(message) do
+    message
+    |> String.split("\n")
+    |> Enum.flat_map(fn line ->
+      case Regex.run(~r/^\s*(\d+)\.\s+(.+)$/, String.trim(line)) do
+        [_, num, text] -> [{num, String.trim(text)}]
+        _ -> []
+      end
+    end)
+  end
+
+  defp parse_numbered_options(_), do: []
 
   defp send_last_response(session_id, transcript_path) do
     # Try transcript_path from the event, fall back to session's stored path
