@@ -22,31 +22,68 @@ if ! command -v python3 &>/dev/null; then
 fi
 
 # --- 2. Telegram bot config ---
+# Check permissions on existing .env
+if [ -f "$PROJECT_DIR/.env" ]; then
+  perms=$(stat -f '%Lp' "$PROJECT_DIR/.env" 2>/dev/null || stat -c '%a' "$PROJECT_DIR/.env" 2>/dev/null)
+  if [ "$perms" != "600" ]; then
+    echo "WARNING: .env has insecure permissions ($perms). Fixing to 600..."
+    chmod 600 "$PROJECT_DIR/.env"
+  fi
+fi
+
 if [ -f "$PROJECT_DIR/.env" ]; then
   echo "Found existing .env file."
   source "$PROJECT_DIR/.env"
   echo "  TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:0:10}..."
   echo "  TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID"
+  if [ -n "$CLAUDE_NOTIFY_WEBHOOK_SECRET" ]; then
+    echo "  CLAUDE_NOTIFY_WEBHOOK_SECRET=${CLAUDE_NOTIFY_WEBHOOK_SECRET:0:10}..."
+  else
+    echo "  CLAUDE_NOTIFY_WEBHOOK_SECRET=<missing>"
+  fi
   echo ""
   read -p "Keep existing config? (Y/n) " keep_env
   if [[ "$keep_env" =~ ^[Nn] ]]; then
-    unset TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID
+    unset TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID CLAUDE_NOTIFY_WEBHOOK_SECRET
   fi
 fi
 
-if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ] || [ -z "$CLAUDE_NOTIFY_WEBHOOK_SECRET" ]; then
   echo ""
   echo "Create a Telegram bot via @BotFather and get your chat ID."
   echo "See README for instructions."
   echo ""
-  read -p "Telegram Bot Token: " TELEGRAM_BOT_TOKEN
-  read -p "Telegram Chat ID: " TELEGRAM_CHAT_ID
+  if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+    read -p "Telegram Bot Token: " TELEGRAM_BOT_TOKEN
+  fi
 
-  cat > "$PROJECT_DIR/.env" <<ENVEOF
+  if [ -z "$TELEGRAM_CHAT_ID" ]; then
+    read -p "Telegram Chat ID: " TELEGRAM_CHAT_ID
+  fi
+
+  if [ -z "$CLAUDE_NOTIFY_WEBHOOK_SECRET" ]; then
+    read -p "Webhook secret (leave blank to auto-generate): " CLAUDE_NOTIFY_WEBHOOK_SECRET
+  fi
+
+  if [ -z "$CLAUDE_NOTIFY_WEBHOOK_SECRET" ]; then
+    CLAUDE_NOTIFY_WEBHOOK_SECRET="$(python3 - <<'PY'
+import secrets
+print(secrets.token_hex(32))
+PY
+)"
+    echo "Generated webhook secret."
+  fi
+
+  (
+    umask 077
+    cat > "$PROJECT_DIR/.env" <<ENVEOF
 TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
 TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID
+CLAUDE_NOTIFY_WEBHOOK_SECRET=$CLAUDE_NOTIFY_WEBHOOK_SECRET
 ENVEOF
-  echo "Saved .env"
+  )
+  chmod 600 "$PROJECT_DIR/.env"
+  echo "Saved .env (permissions: owner-only)"
 fi
 
 # --- 3. Install dependencies ---
