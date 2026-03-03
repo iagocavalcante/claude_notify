@@ -2,6 +2,8 @@
 # Claude Code Notification hook - sends notification events to claude_notify
 # Reads JSON from stdin (contains "message" field with the notification text)
 
+source "$(dirname "$0")/claude-notify-common.sh"
+
 INPUT=$(cat)
 
 SESSION_ID="${CLAUDE_SESSION_ID:-unknown}"
@@ -13,29 +15,22 @@ else
   TTY_PATH="unknown"
 fi
 
-# Build payload using python3 - extracts message and transcript_path
+# Build payload using python3 - pass shell vars as argv to avoid injection
 PAYLOAD=$(echo "$INPUT" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 out = {
     "event": "notification",
-    "session_id": d.get("session_id", "'"${SESSION_ID}"'"),
+    "session_id": d.get("session_id", sys.argv[1]),
     "message": d.get("message", ""),
-    "term_session_id": "'"${TERM_SID}"'",
-    "tty_path": "'"${TTY_PATH}"'",
-    "working_dir": d.get("cwd", "'"${PWD}"'"),
+    "term_session_id": sys.argv[2],
+    "tty_path": sys.argv[3],
+    "working_dir": d.get("cwd", sys.argv[4]),
     "transcript_path": d.get("transcript_path", "")
 }
 print(json.dumps(out))
-' 2>/dev/null)
+' "$SESSION_ID" "$TERM_SID" "$TTY_PATH" "$PWD" 2>/dev/null)
 
-if [ -n "$PAYLOAD" ]; then
-  curl -s -X POST http://localhost:4040/api/events \
-    -H "Content-Type: application/json" \
-    -d "$PAYLOAD" \
-    --connect-timeout 2 \
-    --max-time 3 \
-    > /dev/null 2>&1
-fi
+post_event_payload "$PAYLOAD"
 
 exit 0

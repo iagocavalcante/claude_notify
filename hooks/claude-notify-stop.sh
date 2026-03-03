@@ -2,6 +2,8 @@
 # Claude Code Stop hook - sends stop events to claude_notify
 # Reads JSON from stdin, extracts session_id, stop reason, and cwd
 
+source "$(dirname "$0")/claude-notify-common.sh"
+
 INPUT=$(cat)
 
 TERM_SID="${TERM_SESSION_ID:-unknown}"
@@ -12,7 +14,7 @@ else
   TTY_PATH="unknown"
 fi
 
-# Extract all useful fields from stdin JSON
+# Extract all useful fields from stdin JSON, passing shell vars as argv
 PAYLOAD=$(echo "$INPUT" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
@@ -21,20 +23,13 @@ out = {
     "session_id": d.get("session_id", "unknown"),
     "stop_reason": d.get("stop_reason", d.get("reason", "unknown")),
     "working_dir": d.get("cwd", "unknown"),
-    "term_session_id": "'"${TERM_SID}"'",
-    "tty_path": "'"${TTY_PATH}"'",
+    "term_session_id": sys.argv[1],
+    "tty_path": sys.argv[2],
     "transcript_path": d.get("transcript_path", "")
 }
 print(json.dumps(out))
-' 2>/dev/null)
+' "$TERM_SID" "$TTY_PATH" 2>/dev/null)
 
-if [ -n "$PAYLOAD" ]; then
-  curl -s -X POST http://localhost:4040/api/events \
-    -H "Content-Type: application/json" \
-    -d "$PAYLOAD" \
-    --connect-timeout 2 \
-    --max-time 3 \
-    > /dev/null 2>&1
-fi
+post_event_payload "$PAYLOAD"
 
 exit 0

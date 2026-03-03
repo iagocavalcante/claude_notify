@@ -2,6 +2,8 @@
 # Claude Code UserPromptSubmit hook - sends prompt events to claude_notify
 # Runs curl in background to avoid blocking Claude Code
 
+source "$(dirname "$0")/claude-notify-common.sh"
+
 SESSION_ID="${CLAUDE_SESSION_ID:-unknown}"
 PROMPT="${CLAUDE_PROMPT:-}"
 WORKING_DIR="${CLAUDE_WORKING_DIRECTORY:-$(pwd)}"
@@ -16,14 +18,20 @@ fi
 # Truncate prompt to 500 chars to keep payload small
 PROMPT="${PROMPT:0:500}"
 
-# Escape JSON special characters
-PROMPT=$(echo "$PROMPT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))')
+# Build JSON payload safely using python3 json.dumps for all values
+PAYLOAD=$(python3 -c '
+import json, sys
+out = {
+    "event": "prompt",
+    "session_id": sys.argv[1],
+    "prompt": sys.argv[2],
+    "working_dir": sys.argv[3],
+    "term_session_id": sys.argv[4],
+    "tty_path": sys.argv[5]
+}
+print(json.dumps(out))
+' "$SESSION_ID" "$PROMPT" "$WORKING_DIR" "$TERM_SID" "$TTY_PATH" 2>/dev/null)
 
-curl -s -X POST http://localhost:4040/api/events \
-  -H "Content-Type: application/json" \
-  -d "{\"event\":\"prompt\",\"session_id\":\"${SESSION_ID}\",\"prompt\":${PROMPT},\"working_dir\":\"${WORKING_DIR}\",\"term_session_id\":\"${TERM_SID}\",\"tty_path\":\"${TTY_PATH}\"}" \
-  --connect-timeout 2 \
-  --max-time 3 \
-  > /dev/null 2>&1
+post_event_payload "$PAYLOAD"
 
 exit 0

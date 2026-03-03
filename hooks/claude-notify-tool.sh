@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Claude Code PostToolUse hook - sends tool use events to claude_notify
 
+source "$(dirname "$0")/claude-notify-common.sh"
+
 INPUT=$(cat)
 
 SESSION_ID="${CLAUDE_SESSION_ID:-unknown}"
@@ -13,6 +15,7 @@ else
 fi
 
 # Extract tool_name, tool_input, and tool_response from stdin JSON
+# Pass shell vars as argv to avoid injection
 PAYLOAD=$(echo "$INPUT" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
@@ -29,25 +32,18 @@ else:
 
 out = {
     "event": "tool_use",
-    "session_id": d.get("session_id", "'"${SESSION_ID}"'"),
-    "term_session_id": "'"${TERM_SID}"'",
-    "tty_path": "'"${TTY_PATH}"'",
-    "working_dir": d.get("cwd", "'"${PWD}"'"),
+    "session_id": d.get("session_id", sys.argv[1]),
+    "term_session_id": sys.argv[2],
+    "tty_path": sys.argv[3],
+    "working_dir": d.get("cwd", sys.argv[4]),
     "tool_name": d.get("tool_name", "unknown"),
     "tool_input": tool_input,
     "tool_output": tool_output,
     "transcript_path": d.get("transcript_path", "")
 }
 print(json.dumps(out))
-' 2>/dev/null)
+' "$SESSION_ID" "$TERM_SID" "$TTY_PATH" "$PWD" 2>/dev/null)
 
-if [ -n "$PAYLOAD" ]; then
-  curl -s -X POST http://localhost:4040/api/events \
-    -H "Content-Type: application/json" \
-    -d "$PAYLOAD" \
-    --connect-timeout 2 \
-    --max-time 3 \
-    > /dev/null 2>&1
-fi
+post_event_payload "$PAYLOAD"
 
 exit 0
