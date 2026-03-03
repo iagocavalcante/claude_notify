@@ -6,10 +6,14 @@ defmodule ClaudeNotify.Application do
   @impl true
   def start(_type, _args) do
     port = Application.get_env(:claude_notify, :port, 4040)
+    max_event_concurrency = Application.get_env(:claude_notify, :max_event_concurrency, 8)
 
     children =
       [
         ClaudeNotify.SessionStore,
+        ClaudeNotify.Dashboard,
+        {Task.Supervisor,
+         name: ClaudeNotify.EventTaskSupervisor, max_children: max_event_concurrency},
         {Bandit, plug: ClaudeNotify.Router, port: port}
       ] ++ poller_child()
 

@@ -1,6 +1,45 @@
 defmodule ClaudeNotify.Telegram do
   require Logger
 
+  @max_retries 3
+
+  @doc """
+  Sends a message with automatic retry on 429 (rate limit) responses.
+  """
+  def send_message_with_retry(text, retries \\ @max_retries) do
+    case send_message(text) do
+      {:error, {429, body}} when retries > 0 ->
+        retry_after = get_retry_after(body)
+        Logger.warning("Telegram rate limited, retrying in #{retry_after}s (#{retries} left)")
+        Process.sleep(retry_after * 1_000)
+        send_message_with_retry(text, retries - 1)
+
+      other ->
+        other
+    end
+  end
+
+  @doc """
+  Sends a message with buttons and automatic retry on 429 responses.
+  """
+  def send_with_buttons_retry(text, buttons, retries \\ @max_retries) do
+    case send_with_buttons(text, buttons) do
+      {:error, {429, body}} when retries > 0 ->
+        retry_after = get_retry_after(body)
+        Logger.warning("Telegram rate limited, retrying in #{retry_after}s (#{retries} left)")
+        Process.sleep(retry_after * 1_000)
+        send_with_buttons_retry(text, buttons, retries - 1)
+
+      other ->
+        other
+    end
+  end
+
+  defp get_retry_after(%{"parameters" => %{"retry_after" => seconds}}) when is_integer(seconds),
+    do: seconds
+
+  defp get_retry_after(_), do: 1
+
   def send_message(text) do
     body = %{
       chat_id: chat_id(),

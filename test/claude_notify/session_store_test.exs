@@ -53,4 +53,16 @@ defmodule ClaudeNotify.SessionStoreTest do
     sessions = SessionStore.all_sessions()
     assert map_size(sessions) == 2
   end
+
+  test "update_session_metadata does not increment prompt_count" do
+    SessionStore.register_prompt("sess-1", "hello", "/tmp/project")
+
+    {_action, updated} =
+      SessionStore.update_session_metadata("sess-1", "/tmp/project", %{
+        "tty_path" => "/dev/ttys001"
+      })
+
+    assert updated.prompt_count == 1
+    assert updated.tty_path == "/dev/ttys001"
+  end
 end

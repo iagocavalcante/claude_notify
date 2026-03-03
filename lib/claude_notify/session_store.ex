@@ -24,6 +24,14 @@ defmodule ClaudeNotify.SessionStore do
     GenServer.call(__MODULE__, {:get_session, session_id})
   end
 
+  def update_session_metadata(session_id, working_dir, opts \\ %{}) do
+    GenServer.call(__MODULE__, {:update_session_metadata, session_id, working_dir, opts})
+  end
+
+  def update_status(session_id, status, extras \\ %{}) do
+    GenServer.call(__MODULE__, {:update_status, session_id, status, extras})
+  end
+
   def all_sessions do
     GenServer.call(__MODULE__, :all_sessions)
   end
@@ -54,6 +62,8 @@ defmodule ClaudeNotify.SessionStore do
             first_prompt: prompt,
             started_at: now,
             last_activity: now,
+            status: :active,
+            last_tool: nil,
             tty_path: opts["tty_path"],
             term_session_id: opts["term_session_id"]
           }
@@ -63,7 +73,11 @@ defmodule ClaudeNotify.SessionStore do
         existing ->
           session =
             existing
-            |> Map.merge(%{prompt_count: existing.prompt_count + 1, last_activity: now})
+            |> Map.merge(%{
+              prompt_count: existing.prompt_count + 1,
+              last_activity: now,
+              status: :active
+            })
             |> maybe_put(:working_dir, working_dir)
             |> maybe_update_tty(opts)
 
@@ -72,6 +86,61 @@ defmodule ClaudeNotify.SessionStore do
 
     new_state = %{state | sessions: Map.put(state.sessions, session_id, session)}
     {:reply, {action, session}, new_state}
+  end
+
+  @impl true
+  def handle_call({:update_session_metadata, session_id, working_dir, opts}, _from, state) do
+    now = System.system_time(:second)
+
+    {action, session} =
+      case Map.get(state.sessions, session_id) do
+        nil ->
+          session = %{
+            id: session_id,
+            working_dir: working_dir,
+            prompt_count: 0,
+            first_prompt: nil,
+            started_at: now,
+            last_activity: now,
+            status: :active,
+            last_tool: nil,
+            tty_path: opts["tty_path"],
+            term_session_id: opts["term_session_id"]
+          }
+
+          {:new_session, maybe_update_tty(session, opts)}
+
+        existing ->
+          session =
+            existing
+            |> Map.merge(%{last_activity: now})
+            |> maybe_put(:working_dir, working_dir)
+            |> maybe_update_tty(opts)
+
+          {:metadata_update, session}
+      end
+
+    new_state = %{state | sessions: Map.put(state.sessions, session_id, session)}
+    {:reply, {action, session}, new_state}
+  end
+
+  @impl true
+  def handle_call({:update_status, session_id, status, extras}, _from, state) do
+    case Map.get(state.sessions, session_id) do
+      nil ->
+        {:reply, :not_found, state}
+
+      existing ->
+        now = System.system_time(:second)
+
+        session =
+          existing
+          |> Map.merge(%{status: status, last_activity: now})
+          |> Map.merge(extras)
+
+        new_state = %{state | sessions: Map.put(state.sessions, session_id, session)}
+        {:reply, {:ok, session}, new_state}
+    end
   end
 
   @impl true

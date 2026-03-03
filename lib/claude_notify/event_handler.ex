@@ -1,7 +1,14 @@
 defmodule ClaudeNotify.EventHandler do
   require Logger
 
-  alias ClaudeNotify.{SessionStore, MessageFormatter, Telegram, TranscriptReader}
+  alias ClaudeNotify.{
+    SessionStore,
+    MessageFormatter,
+    Telegram,
+    TranscriptReader,
+    PathSafety,
+    Dashboard
+  }
 
   @update_interval 10
 
@@ -10,18 +17,21 @@ defmodule ClaudeNotify.EventHandler do
     prompt = params["prompt"] || ""
     working_dir = params["working_dir"] || "unknown"
 
-    opts = Map.take(params, ["tty_path", "term_session_id"])
+    opts = params |> Map.take(["tty_path", "term_session_id"]) |> sanitize_opts()
     {action, session} = SessionStore.register_prompt(session_id, prompt, working_dir, opts)
 
     case action do
       :new_session ->
         message = MessageFormatter.session_started(session)
-        Telegram.send_message(message)
+        notify(message, session_id: session_id)
+        Dashboard.refresh()
 
       :prompt_update ->
+        Dashboard.refresh()
+
         if rem(session.prompt_count, @update_interval) == 0 do
           message = MessageFormatter.session_update(session)
-          Telegram.send_message(message)
+          notify(message, session_id: session_id)
         else
           :ok
         end
@@ -50,13 +60,15 @@ defmodule ClaudeNotify.EventHandler do
         }
 
         message = MessageFormatter.session_stopped(session)
-        Telegram.send_message(message)
+        notify(message, session_id: session_id)
 
       _session ->
         {_action, session} = SessionStore.register_stop(session_id, stop_reason)
         message = MessageFormatter.session_stopped(session)
-        Telegram.send_message(message)
+        notify(message, session_id: session_id)
     end
+
+    Dashboard.refresh()
   end
 
   def handle_event(%{"event" => "tool_use"} = params) do
@@ -67,11 +79,14 @@ defmodule ClaudeNotify.EventHandler do
     working_dir = params["working_dir"] || "unknown"
 
     # Update session with TTY, transcript path, and working_dir
-    opts = Map.take(params, ["tty_path", "term_session_id", "transcript_path"])
+    opts =
+      params |> Map.take(["tty_path", "term_session_id", "transcript_path"]) |> sanitize_opts()
+
     update_session_tty(session_id, working_dir, opts)
+    SessionStore.update_status(session_id, :active, %{last_tool: tool_name})
 
     message = MessageFormatter.tool_use(tool_name, tool_input, tool_output)
-    Telegram.send_message(message)
+    notify(message, session_id: session_id)
   end
 
   def handle_event(%{"event" => "notification"} = params) do
@@ -80,8 +95,11 @@ defmodule ClaudeNotify.EventHandler do
     working_dir = params["working_dir"] || "unknown"
 
     # Update session with TTY, transcript path, and working_dir
-    opts = Map.take(params, ["tty_path", "term_session_id", "transcript_path"])
+    opts =
+      params |> Map.take(["tty_path", "term_session_id", "transcript_path"]) |> sanitize_opts()
+
     update_session_tty(session_id, working_dir, opts)
+    SessionStore.update_status(session_id, :waiting_input)
 
     # Send the last assistant response (Claude's summary before asking)
     send_last_response(session_id, params["transcript_path"])
@@ -98,7 +116,8 @@ defmodule ClaudeNotify.EventHandler do
         notification_buttons(session_id)
       end
 
-    Telegram.send_with_buttons(text, buttons)
+    notify_with_buttons(text, buttons, session_id: session_id)
+    Dashboard.refresh()
   end
 
   def handle_event(params) do
@@ -143,14 +162,14 @@ defmodule ClaudeNotify.EventHandler do
     # Try transcript_path from the event, fall back to session's stored path
     path =
       case transcript_path do
-        p when is_binary(p) and p != "" -> p
+        p when is_binary(p) and p != "" -> PathSafety.sanitize_transcript_path(p)
         _ -> get_stored_transcript_path(session_id)
       end
 
     case TranscriptReader.last_assistant_message(path) do
       {:ok, text} ->
         message = MessageFormatter.assistant_response(text, session_id)
-        Telegram.send_message(message)
+        notify(message, session_id: session_id)
 
       :error ->
         :ok
@@ -160,11 +179,37 @@ defmodule ClaudeNotify.EventHandler do
   defp get_stored_transcript_path(session_id) do
     case SessionStore.get_session(session_id) do
       nil -> nil
-      session -> session[:transcript_path]
+      session -> PathSafety.sanitize_transcript_path(session[:transcript_path])
     end
   end
 
   defp update_session_tty(session_id, working_dir, opts) do
-    SessionStore.register_prompt(session_id, "", working_dir, opts)
+    SessionStore.update_session_metadata(session_id, working_dir, opts)
+  end
+
+  defp sanitize_opts(opts) do
+    Map.update(opts, "transcript_path", nil, &PathSafety.sanitize_transcript_path/1)
+  end
+
+  defp notify(message, context) do
+    case Telegram.send_message_with_retry(message) do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Telegram send failed: #{inspect(reason)}", context)
+        {:error, reason}
+    end
+  end
+
+  defp notify_with_buttons(text, buttons, context) do
+    case Telegram.send_with_buttons_retry(text, buttons) do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Telegram send_with_buttons failed: #{inspect(reason)}", context)
+        {:error, reason}
+    end
   end
 end

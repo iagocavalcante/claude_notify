@@ -54,4 +54,35 @@ defmodule ClaudeNotify.EventHandlerTest do
     result = EventHandler.handle_event(%{"event" => "unknown_event"})
     assert result == {:error, :unknown_event}
   end
+
+  test "tool_use metadata updates do not inflate prompt_count" do
+    SessionStore.register_prompt("test-sess", "hello", "/tmp/test")
+
+    EventHandler.handle_event(%{
+      "event" => "tool_use",
+      "session_id" => "test-sess",
+      "working_dir" => "/tmp/test",
+      "tool_name" => "Read",
+      "tool_input" => ~s({"file_path":"lib/foo.ex"}),
+      "tool_output" => "",
+      "tty_path" => "/dev/ttys001"
+    })
+
+    session = SessionStore.get_session("test-sess")
+    assert session.prompt_count == 1
+    assert session.tty_path == "/dev/ttys001"
+  end
+
+  test "transcript_path outside allowed roots is discarded" do
+    EventHandler.handle_event(%{
+      "event" => "notification",
+      "session_id" => "test-sess",
+      "working_dir" => "/tmp/test",
+      "message" => "Need approval",
+      "transcript_path" => "/etc/passwd"
+    })
+
+    session = SessionStore.get_session("test-sess")
+    assert session[:transcript_path] == nil
+  end
 end
