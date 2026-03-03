@@ -6,23 +6,29 @@ Elixir app that sends interactive Telegram notifications for Claude Code session
 
 - **Session tracking** — see when Claude Code sessions start, update, and stop
 - **Tool use monitoring** — get formatted messages for each tool Claude uses (Read, Write, Bash, etc.)
-- **Interactive buttons** — respond to permission prompts with Yes / No / Yes (don't ask) / Esc directly from Telegram
+- **Interactive approvals** — respond to permission prompts with Yes / No / Yes (don't ask) / Esc directly from Telegram
+- **Numbered option support** — for multi-choice prompts, choose options `1..9` from inline buttons
 - **Remote prompting** — list active sessions, select one, and type prompts from Telegram
-- **Last response** — see Claude's final response/summary in Telegram before permission prompts and on session end
+- **Last response context** — see Claude's final response/summary in Telegram before permission prompts and on session end
+- **Safer terminal injection** — text input is sent via clipboard paste with TTY validation
+- **Security hardening** — signed hook events (HMAC), replay protection, Telegram chat authorization, and debug endpoint protection
 
 ## How It Works
 
 ```
 Claude Code (Terminal.app)
-    | hooks (curl POST)
+    | hooks (signed curl POST + timestamp + HMAC)
     v
 Elixir App (port 4040)
+    | verify signature + replay window
+    | update session state + format messages
     | sendMessage + inline_keyboard
     v
 Telegram Bot
     | user taps button / types command
     v
 Elixir App (long polling getUpdates)
+    | validate configured chat_id
     | osascript (AppleScript)
     v
 Terminal.app — keystrokes injected into correct tab
@@ -59,6 +65,7 @@ cd claude_notify
 
 The setup script will:
 - Prompt for your Telegram bot token and chat ID (saved to `.env`)
+- Generate or prompt for a webhook signing secret (`CLAUDE_NOTIFY_WEBHOOK_SECRET`)
 - Install Elixir dependencies
 - Register all Claude Code hooks in `~/.claude/settings.json`
 - Install a macOS LaunchAgent (auto-starts on login, auto-restarts on crash)
@@ -73,7 +80,17 @@ The app uses AppleScript to inject keystrokes into Terminal.app. macOS requires 
 
 Without this, responding to prompts from Telegram won't work.
 
-### That's it!
+### 4. Load hook signing env in your shell
+
+Hook scripts sign events with `CLAUDE_NOTIFY_WEBHOOK_SECRET`. Before starting Claude Code in a shell session, load your `.env`:
+
+```bash
+set -a
+source .env
+set +a
+```
+
+### That's it
 
 Open a Claude Code session in Terminal.app and you'll start getting Telegram notifications.
 
@@ -104,9 +121,46 @@ source .env && iex -S mix
 | Command | Description |
 |---------|-------------|
 | `/sessions` | List active Claude Code sessions with selection buttons |
+| `/select` | Alias for `/sessions` |
 | `/help` | Show available commands |
 
 After selecting a session, any text you type in Telegram gets sent as input to that terminal session.
+
+## Security Model
+
+- Only the configured `TELEGRAM_CHAT_ID` can control sessions from Telegram messages/callbacks.
+- Hook requests to `POST /api/events` must include:
+  - `X-Claude-Notify-Timestamp`
+  - `X-Claude-Notify-Signature: sha256=<hmac>`
+- Signatures are verified with `CLAUDE_NOTIFY_WEBHOOK_SECRET`.
+- Replayed signed payloads are rejected.
+- `GET /debug/sessions` is disabled by default and returns `403` unless explicitly enabled.
+
+## Configuration
+
+Core variables:
+
+```bash
+TELEGRAM_BOT_TOKEN=your_bot_token_here
+TELEGRAM_CHAT_ID=your_chat_id_here
+CLAUDE_NOTIFY_WEBHOOK_SECRET=replace_with_random_64_hex_chars
+```
+
+Optional variables:
+
+```bash
+ENABLE_DEBUG_ENDPOINTS=false
+MAX_EVENT_CONCURRENCY=8
+WEBHOOK_MAX_SKEW_SECONDS=300
+```
+
+Load this env in the shell where you run Claude Code so hooks can sign webhook requests:
+
+```bash
+set -a
+source .env
+set +a
+```
 
 ## Testing
 
@@ -128,6 +182,19 @@ Create a `.env` file in the project root:
 ```bash
 TELEGRAM_BOT_TOKEN=your_bot_token_here
 TELEGRAM_CHAT_ID=your_chat_id_here
+CLAUDE_NOTIFY_WEBHOOK_SECRET=replace_with_random_64_hex_chars
+# optional
+ENABLE_DEBUG_ENDPOINTS=false
+MAX_EVENT_CONCURRENCY=8
+WEBHOOK_MAX_SKEW_SECONDS=300
+```
+
+Load env in the shell where Claude Code runs:
+
+```bash
+set -a
+source .env
+set +a
 ```
 
 ### Claude Code hooks
@@ -198,13 +265,15 @@ chmod +x hooks/*.sh
 | Module | Role |
 |--------|------|
 | `Router` | Plug HTTP server — receives hook events on `POST /api/events` |
+| `EventAuth` | Verifies webhook timestamp + HMAC signature and replay protection |
 | `EventHandler` | Routes events to session store and Telegram |
-| `SessionStore` | GenServer tracking active sessions (ID, working dir, TTY path) |
+| `SessionStore` | GenServer tracking active sessions (ID, working dir, TTY path, transcript path) |
 | `Telegram` | Telegram Bot API client (send messages, inline keyboards, long polling) |
-| `TelegramPoller` | GenServer polling `getUpdates` for button presses and text commands |
-| `TerminalInjector` | AppleScript keystroke injection into Terminal.app by TTY path |
+| `TelegramPoller` | GenServer polling `getUpdates`, validating `chat_id`, and handling buttons/text commands |
+| `TerminalInjector` | AppleScript injection into Terminal.app by TTY path (clipboard paste for text input) |
 | `MessageFormatter` | MarkdownV2 formatted messages with emoji tool icons |
 | `TranscriptReader` | Reads Claude Code JSONL transcripts for last assistant response |
+| `PathSafety` | Sanitizes externally provided paths (e.g., transcript paths) |
 
 ## Hooks
 
@@ -214,3 +283,8 @@ chmod +x hooks/*.sh
 | `claude-notify-stop.sh` | `Stop` | Session ID, stop reason, working dir |
 | `claude-notify-notify.sh` | `Notification` | Session ID, notification message, TTY path |
 | `claude-notify-tool.sh` | `PostToolUse` | Session ID, tool name, input, output |
+
+All hooks send signed requests with:
+
+- `X-Claude-Notify-Timestamp`
+- `X-Claude-Notify-Signature: sha256=<hmac>`
