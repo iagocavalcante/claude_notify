@@ -15,6 +15,19 @@ else
   TTY_PATH="unknown"
 fi
 
+# Capture git diff for the working directory
+WORKING_DIR="${PWD}"
+GIT_DIFF=""
+if command -v git &>/dev/null && git -C "$WORKING_DIR" rev-parse --is-inside-work-tree &>/dev/null 2>&1; then
+  GIT_DIFF_STAT=$(git -C "$WORKING_DIR" diff --stat 2>/dev/null | head -20)
+  GIT_DIFF_CONTENT=$(git -C "$WORKING_DIR" diff 2>/dev/null | head -200)
+  if [ -n "$GIT_DIFF_STAT" ] || [ -n "$GIT_DIFF_CONTENT" ]; then
+    GIT_DIFF="${GIT_DIFF_STAT}
+
+${GIT_DIFF_CONTENT}"
+  fi
+fi
+
 # Build payload using python3 - pass shell vars as argv to avoid injection
 PAYLOAD=$(echo "$INPUT" | python3 -c '
 import json, sys
@@ -26,10 +39,11 @@ out = {
     "term_session_id": sys.argv[2],
     "tty_path": sys.argv[3],
     "working_dir": d.get("cwd", sys.argv[4]),
-    "transcript_path": d.get("transcript_path", "")
+    "transcript_path": d.get("transcript_path", ""),
+    "git_diff": sys.argv[5]
 }
 print(json.dumps(out))
-' "$SESSION_ID" "$TERM_SID" "$TTY_PATH" "$PWD" 2>/dev/null)
+' "$SESSION_ID" "$TERM_SID" "$TTY_PATH" "$PWD" "$GIT_DIFF" 2>/dev/null)
 
 post_event_payload "$PAYLOAD"
 
