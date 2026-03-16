@@ -196,6 +196,109 @@ defmodule ClaudeNotify.MessageFormatter do
   end
 
   @doc """
+  Format a compact "session started" message.
+  """
+  def session_started_compact(session) do
+    project = project_name(session.working_dir)
+    dir = escape_code(session.working_dir)
+    "🟢 #{escape(project)} · started\nDirectory: `#{dir}`"
+  end
+
+  @doc """
+  Format a compact "session stopped" message.
+  """
+  def session_stopped_compact(session) do
+    project = project_name(session.working_dir)
+
+    duration =
+      if session[:started_at] && session[:stopped_at] do
+        format_duration(session.stopped_at - session.started_at)
+      else
+        "unknown"
+      end
+
+    reason = session[:stop_reason] || "unknown"
+    count = session[:prompt_count] || 0
+
+    "🔴 #{escape(project)} · ended\nDuration: #{escape(duration)} · #{count} prompts · reason: #{escape(reason)}"
+  end
+
+  @doc """
+  Format an edit-in-place activity status message.
+  """
+  def activity_message(state) do
+    files = state.files_touched |> MapSet.to_list() |> Enum.sort() |> Enum.join(", ")
+    current = format_current_tool(state[:current_tool], state[:current_detail])
+
+    [
+      "⚙️ #{escape(state.project)}",
+      "━━━━━━━━━━━━━━━",
+      "Actions: #{state.action_count}",
+      "Files touched: #{escape(files)}",
+      current
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  @doc """
+  Format an edit-in-place activity status message for waiting/approval state.
+  """
+  def activity_message_waiting(state) do
+    files = state.files_touched |> MapSet.to_list() |> Enum.sort() |> Enum.join(", ")
+
+    [
+      "⏸️ #{escape(state.project)}",
+      "━━━━━━━━━━━━━━━",
+      "Actions: #{state.action_count}",
+      "Files touched: #{escape(files)}",
+      "Waiting for approval\\.\\.\\."
+    ]
+    |> Enum.join("\n")
+  end
+
+  @max_diff_chars 3000
+
+  @doc """
+  Format a git diff summary message. Returns nil for empty/nil input.
+  """
+  def diff_summary(nil), do: nil
+  def diff_summary(""), do: nil
+
+  def diff_summary(diff_text) when is_binary(diff_text) do
+    trimmed = String.trim(diff_text)
+    if trimmed == "", do: nil, else: format_diff(trimmed)
+  end
+
+  defp format_diff(diff_text) do
+    if byte_size(diff_text) > @max_diff_chars do
+      stat_line = diff_text |> String.split("\n") |> Enum.take(3) |> Enum.join("\n")
+      safe = escape_pre(String.slice(stat_line, 0, @max_diff_chars))
+
+      "📋 *Changes since last checkpoint*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n```\n#{safe}\n```\n\n_Diff too large, showing summary only_"
+    else
+      safe = escape_pre(diff_text)
+      "📋 *Changes since last checkpoint*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n```\n#{safe}\n```"
+    end
+  end
+
+  defp format_current_tool(nil, _), do: nil
+
+  defp format_current_tool(tool, detail) do
+    label = tool_action_label(tool)
+    if detail, do: "#{label}: #{escape(truncate(detail, 80))}", else: label
+  end
+
+  defp tool_action_label("Bash"), do: "Running"
+  defp tool_action_label("Read"), do: "Reading"
+  defp tool_action_label("Write"), do: "Writing"
+  defp tool_action_label("Edit"), do: "Editing"
+  defp tool_action_label("Glob"), do: "Searching"
+  defp tool_action_label("Grep"), do: "Searching"
+  defp tool_action_label("Task"), do: "Delegating"
+  defp tool_action_label(tool), do: escape(tool)
+
+  @doc """
   Public escape for MarkdownV2 plain text (outside entities).
   """
   def escape_full(text), do: escape(text)
