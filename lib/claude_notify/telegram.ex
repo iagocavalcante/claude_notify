@@ -35,6 +35,40 @@ defmodule ClaudeNotify.Telegram do
     end
   end
 
+  @doc """
+  Edits an existing message's text. Returns {:ok, response} or {:error, reason}.
+  """
+  def edit_message_text(message_id, text) do
+    body = %{
+      chat_id: chat_id(),
+      message_id: message_id,
+      text: text,
+      parse_mode: "MarkdownV2"
+    }
+
+    api_post("editMessageText", body)
+  end
+
+  @doc """
+  Edits a message with automatic retry on 429 (rate limit) responses.
+  """
+  def edit_message_text_with_retry(message_id, text, retries \\ @max_retries) do
+    case edit_message_text(message_id, text) do
+      {:error, {429, body}} when retries > 0 ->
+        retry_after = get_retry_after(body)
+
+        Logger.warning(
+          "Telegram rate limited (edit), retrying in #{retry_after}s (#{retries} left)"
+        )
+
+        Process.sleep(retry_after * 1_000)
+        edit_message_text_with_retry(message_id, text, retries - 1)
+
+      other ->
+        other
+    end
+  end
+
   defp get_retry_after(%{"parameters" => %{"retry_after" => seconds}}) when is_integer(seconds),
     do: seconds
 
