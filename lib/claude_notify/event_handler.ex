@@ -5,12 +5,9 @@ defmodule ClaudeNotify.EventHandler do
     SessionStore,
     MessageFormatter,
     Telegram,
-    TranscriptReader,
-    PathSafety,
+    ActivityTracker,
     Dashboard
   }
-
-  @update_interval 10
 
   def handle_event(%{"event" => "prompt"} = params) do
     session_id = params["session_id"]
@@ -22,19 +19,13 @@ defmodule ClaudeNotify.EventHandler do
 
     case action do
       :new_session ->
-        message = MessageFormatter.session_started(session)
-        notify(message, session_id: session_id)
+        message = MessageFormatter.session_started_compact(session)
+        notify_and_register(message, session_id)
         Dashboard.refresh()
 
       :prompt_update ->
         Dashboard.refresh()
-
-        if rem(session.prompt_count, @update_interval) == 0 do
-          message = MessageFormatter.session_update(session)
-          notify(message, session_id: session_id)
-        else
-          :ok
-        end
+        :ok
     end
   end
 
@@ -42,9 +33,9 @@ defmodule ClaudeNotify.EventHandler do
     session_id = params["session_id"]
     stop_reason = params["stop_reason"] || "unknown"
     working_dir = params["working_dir"] || "unknown"
+    git_diff = params["git_diff"]
 
-    # Try to send the last assistant response before the stop message
-    send_last_response(session_id, params["transcript_path"])
+    ActivityTracker.end_session(session_id)
 
     case SessionStore.get_session(session_id) do
       nil ->
@@ -59,13 +50,15 @@ defmodule ClaudeNotify.EventHandler do
           stop_reason: stop_reason
         }
 
-        message = MessageFormatter.session_stopped(session)
-        notify(message, session_id: session_id)
+        maybe_send_diff(git_diff, session_id)
+        message = MessageFormatter.session_stopped_compact(session)
+        notify_and_register(message, session_id)
 
       _session ->
         {_action, session} = SessionStore.register_stop(session_id, stop_reason)
-        message = MessageFormatter.session_stopped(session)
-        notify(message, session_id: session_id)
+        maybe_send_diff(git_diff, session_id)
+        message = MessageFormatter.session_stopped_compact(session)
+        notify_and_register(message, session_id)
     end
 
     Dashboard.refresh()
@@ -75,34 +68,39 @@ defmodule ClaudeNotify.EventHandler do
     session_id = params["session_id"]
     tool_name = params["tool_name"] || "unknown"
     tool_input = params["tool_input"] || ""
-    tool_output = params["tool_output"] || ""
     working_dir = params["working_dir"] || "unknown"
 
-    # Update session with TTY, transcript path, and working_dir
     opts =
-      params |> Map.take(["tty_path", "term_session_id", "transcript_path"]) |> sanitize_opts()
+      params |> Map.take(["tty_path", "term_session_id"]) |> sanitize_opts()
 
     update_session_tty(session_id, working_dir, opts)
     SessionStore.update_status(session_id, :active, %{last_tool: tool_name})
 
-    message = MessageFormatter.tool_use(tool_name, tool_input, tool_output)
-    notify(message, session_id: session_id)
+    detail = extract_tool_detail(tool_name, tool_input)
+    project = project_name(working_dir)
+
+    ActivityTracker.track_tool(session_id, %{
+      project: project,
+      tool_name: tool_name,
+      tool_detail: detail
+    })
   end
 
   def handle_event(%{"event" => "notification"} = params) do
     session_id = params["session_id"]
     message = params["message"] || ""
     working_dir = params["working_dir"] || "unknown"
+    git_diff = params["git_diff"]
 
-    # Update session with TTY, transcript path, and working_dir
     opts =
-      params |> Map.take(["tty_path", "term_session_id", "transcript_path"]) |> sanitize_opts()
+      params |> Map.take(["tty_path", "term_session_id"]) |> sanitize_opts()
 
     update_session_tty(session_id, working_dir, opts)
+
+    ActivityTracker.pause_session(session_id)
     SessionStore.update_status(session_id, :waiting_input)
 
-    # Send the last assistant response (Claude's summary before asking)
-    send_last_response(session_id, params["transcript_path"])
+    maybe_send_diff(git_diff, session_id)
 
     text = MessageFormatter.notification_question(message, session_id)
 
@@ -116,7 +114,7 @@ defmodule ClaudeNotify.EventHandler do
         notification_buttons(session_id)
       end
 
-    notify_with_buttons(text, buttons, session_id: session_id)
+    notify_with_buttons_and_register(text, buttons, session_id)
     Dashboard.refresh()
   end
 
@@ -124,6 +122,8 @@ defmodule ClaudeNotify.EventHandler do
     Logger.warning("Unknown event: #{inspect(params)}")
     {:error, :unknown_event}
   end
+
+  # -- Private helpers --
 
   defp notification_buttons(session_id) do
     [
@@ -141,7 +141,6 @@ defmodule ClaudeNotify.EventHandler do
         ["#{num}. #{short_label}", "#{session_id}:opt_#{num}"]
       end)
 
-    # Add Esc button at the end
     option_buttons ++ [["Esc", "#{session_id}:escape"]]
   end
 
@@ -158,28 +157,13 @@ defmodule ClaudeNotify.EventHandler do
 
   defp parse_numbered_options(_), do: []
 
-  defp send_last_response(session_id, transcript_path) do
-    # Try transcript_path from the event, fall back to session's stored path
-    path =
-      case transcript_path do
-        p when is_binary(p) and p != "" -> PathSafety.sanitize_transcript_path(p)
-        _ -> get_stored_transcript_path(session_id)
-      end
+  defp maybe_send_diff(nil, _session_id), do: :ok
+  defp maybe_send_diff("", _session_id), do: :ok
 
-    case TranscriptReader.last_assistant_message(path) do
-      {:ok, text} ->
-        message = MessageFormatter.assistant_response(text, session_id)
-        notify(message, session_id: session_id)
-
-      :error ->
-        :ok
-    end
-  end
-
-  defp get_stored_transcript_path(session_id) do
-    case SessionStore.get_session(session_id) do
-      nil -> nil
-      session -> PathSafety.sanitize_transcript_path(session[:transcript_path])
+  defp maybe_send_diff(git_diff, session_id) when is_binary(git_diff) do
+    case MessageFormatter.diff_summary(git_diff) do
+      nil -> :ok
+      message -> notify_and_register(message, session_id)
     end
   end
 
@@ -187,29 +171,79 @@ defmodule ClaudeNotify.EventHandler do
     SessionStore.update_session_metadata(session_id, working_dir, opts)
   end
 
-  defp sanitize_opts(opts) do
-    Map.update(opts, "transcript_path", nil, &PathSafety.sanitize_transcript_path/1)
-  end
+  defp sanitize_opts(opts), do: opts
 
-  defp notify(message, context) do
+  defp notify_and_register(message, session_id) do
     case Telegram.send_message_with_retry(message) do
+      {:ok, %{"result" => %{"message_id" => mid}}} ->
+        SessionStore.register_message(mid, session_id)
+        :ok
+
       {:ok, _} ->
         :ok
 
       {:error, reason} ->
-        Logger.warning("Telegram send failed: #{inspect(reason)}", context)
+        Logger.warning("Telegram send failed: #{inspect(reason)}", session_id: session_id)
         {:error, reason}
     end
   end
 
-  defp notify_with_buttons(text, buttons, context) do
+  defp notify_with_buttons_and_register(text, buttons, session_id) do
     case Telegram.send_with_buttons_retry(text, buttons) do
+      {:ok, %{"result" => %{"message_id" => mid}}} ->
+        SessionStore.register_message(mid, session_id)
+        :ok
+
       {:ok, _} ->
         :ok
 
       {:error, reason} ->
-        Logger.warning("Telegram send_with_buttons failed: #{inspect(reason)}", context)
+        Logger.warning("Telegram send_with_buttons failed: #{inspect(reason)}",
+          session_id: session_id
+        )
+
         {:error, reason}
     end
   end
+
+  defp project_name(dir) when is_binary(dir), do: Path.basename(dir)
+  defp project_name(_), do: "unknown"
+
+  # -- Tool detail extraction --
+
+  defp extract_tool_detail(tool_name, tool_input) when tool_name in ["Read", "Write", "Edit"] do
+    extract_json_value(tool_input, "file_path") || truncate_input(tool_input)
+  end
+
+  defp extract_tool_detail("Bash", tool_input) do
+    extract_json_value(tool_input, "command") || truncate_input(tool_input)
+  end
+
+  defp extract_tool_detail("Glob", tool_input) do
+    extract_json_value(tool_input, "pattern") || truncate_input(tool_input)
+  end
+
+  defp extract_tool_detail("Grep", tool_input) do
+    extract_json_value(tool_input, "pattern") || truncate_input(tool_input)
+  end
+
+  defp extract_tool_detail("Task", tool_input) do
+    desc = extract_json_value(tool_input, "description") || ""
+    agent = extract_json_value(tool_input, "subagent_type") || ""
+    if agent != "", do: "#{agent}: #{desc}", else: desc
+  end
+
+  defp extract_tool_detail(_, tool_input), do: truncate_input(tool_input)
+
+  defp extract_json_value(input, field) when is_binary(input) do
+    case Jason.decode(input) do
+      {:ok, map} when is_map(map) -> Map.get(map, field)
+      _ -> nil
+    end
+  end
+
+  defp extract_json_value(_, _), do: nil
+
+  defp truncate_input(input) when is_binary(input), do: String.slice(input, 0, 100)
+  defp truncate_input(input), do: to_string(input) |> String.slice(0, 100)
 end

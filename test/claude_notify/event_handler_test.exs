@@ -45,7 +45,6 @@ defmodule ClaudeNotify.EventHandlerTest do
       "working_dir" => "/tmp/project"
     }
 
-    # Should not crash, sends notification with event data
     result = EventHandler.handle_event(params)
     assert result != {:error, :unknown_event}
   end
@@ -55,7 +54,7 @@ defmodule ClaudeNotify.EventHandlerTest do
     assert result == {:error, :unknown_event}
   end
 
-  test "tool_use metadata updates do not inflate prompt_count" do
+  test "tool_use event tracks via ActivityTracker" do
     SessionStore.register_prompt("test-sess", "hello", "/tmp/test")
 
     EventHandler.handle_event(%{
@@ -64,25 +63,54 @@ defmodule ClaudeNotify.EventHandlerTest do
       "working_dir" => "/tmp/test",
       "tool_name" => "Read",
       "tool_input" => ~s({"file_path":"lib/foo.ex"}),
-      "tool_output" => "",
-      "tty_path" => "/dev/ttys001"
+      "tool_output" => ""
     })
 
     session = SessionStore.get_session("test-sess")
     assert session.prompt_count == 1
-    assert session.tty_path == "/dev/ttys001"
   end
 
-  test "transcript_path outside allowed roots is discarded" do
+  test "notification event updates session status to waiting_input" do
+    SessionStore.register_prompt("test-sess", "hello", "/tmp/test")
+
     EventHandler.handle_event(%{
       "event" => "notification",
       "session_id" => "test-sess",
       "working_dir" => "/tmp/test",
-      "message" => "Need approval",
-      "transcript_path" => "/etc/passwd"
+      "message" => "Allow bash?",
+      "git_diff" => " 1 file changed\n-old\n+new"
     })
 
     session = SessionStore.get_session("test-sess")
-    assert session[:transcript_path] == nil
+    assert session.status == :waiting_input
+  end
+
+  test "notification with empty git_diff skips diff message" do
+    SessionStore.register_prompt("test-sess", "hello", "/tmp/test")
+
+    EventHandler.handle_event(%{
+      "event" => "notification",
+      "session_id" => "test-sess",
+      "working_dir" => "/tmp/test",
+      "message" => "Allow bash?",
+      "git_diff" => ""
+    })
+
+    session = SessionStore.get_session("test-sess")
+    assert session.status == :waiting_input
+  end
+
+  test "stop event with git_diff sends diff before session ended" do
+    SessionStore.register_prompt("test-sess", "hello", "/tmp/test")
+
+    EventHandler.handle_event(%{
+      "event" => "stop",
+      "session_id" => "test-sess",
+      "stop_reason" => "user_quit",
+      "working_dir" => "/tmp/test",
+      "git_diff" => " 1 file changed\n-old\n+new"
+    })
+
+    assert SessionStore.get_session("test-sess") == nil
   end
 end
