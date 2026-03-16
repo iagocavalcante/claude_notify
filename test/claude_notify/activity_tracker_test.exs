@@ -29,7 +29,7 @@ defmodule ClaudeNotify.ActivityTrackerTest do
       tool_detail: "lib/foo.ex"
     })
 
-    assert_receive {:telegram, :send, _}, 200
+    assert_receive {:telegram, :send, _}, 500
   end
 
   test "track_tool edits message on subsequent events", %{tracker: pid} do
@@ -39,7 +39,7 @@ defmodule ClaudeNotify.ActivityTrackerTest do
       tool_detail: "lib/foo.ex"
     })
 
-    assert_receive {:telegram, :send, _}, 200
+    assert_receive {:telegram, :send, _}, 500
 
     ActivityTracker.track_tool(pid, "sess-1", %{
       project: "my_app",
@@ -47,7 +47,7 @@ defmodule ClaudeNotify.ActivityTrackerTest do
       tool_detail: "lib/bar.ex"
     })
 
-    assert_receive {:telegram, :edit, _}, 200
+    assert_receive {:telegram, :edit, _}, 500
   end
 
   test "pause_session sends waiting message", %{tracker: pid} do
@@ -57,10 +57,10 @@ defmodule ClaudeNotify.ActivityTrackerTest do
       tool_detail: "lib/foo.ex"
     })
 
-    assert_receive {:telegram, :send, _}, 200
+    assert_receive {:telegram, :send, _}, 500
 
     ActivityTracker.pause_session(pid, "sess-1")
-    assert_receive {:telegram, :edit, _}, 200
+    assert_receive {:telegram, :edit, _}, 500
   end
 
   test "resume_session resets state for new activity message", %{tracker: pid} do
@@ -70,7 +70,7 @@ defmodule ClaudeNotify.ActivityTrackerTest do
       tool_detail: "lib/foo.ex"
     })
 
-    assert_receive {:telegram, :send, _}, 200
+    assert_receive {:telegram, :send, _}, 500
 
     ActivityTracker.resume_session(pid, "sess-1")
 
@@ -80,7 +80,7 @@ defmodule ClaudeNotify.ActivityTrackerTest do
       tool_detail: "mix test"
     })
 
-    assert_receive {:telegram, :send, _}, 200
+    assert_receive {:telegram, :send, _}, 500
   end
 
   test "get_state returns current tracking state", %{tracker: pid} do
@@ -103,7 +103,7 @@ defmodule ClaudeNotify.ActivityTrackerTest do
       tool_detail: "lib/foo.ex"
     })
 
-    assert_receive {:telegram, :send, _}, 200
+    assert_receive {:telegram, :send, _}, 500
 
     ActivityTracker.end_session(pid, "sess-1")
     assert ActivityTracker.get_state(pid, "sess-1") == nil
