@@ -124,9 +124,12 @@ defmodule ClaudeNotify.TelegramPoller do
 
       state
     else
-      # Guard: only handle text messages
-      case message["text"] do
-        nil ->
+      case message do
+        %{"text" => text, "reply_to_message" => %{"message_id" => reply_mid}}
+        when is_binary(text) and text != "" ->
+          handle_reply_to(chat_id, String.trim(text), reply_mid, state)
+
+        %{"text" => nil} ->
           Telegram.send_message(
             MessageFormatter.escape_full(
               "Only text messages are supported. Use /help for commands."
@@ -135,9 +138,43 @@ defmodule ClaudeNotify.TelegramPoller do
 
           state
 
-        text ->
+        %{"text" => text} when is_binary(text) ->
           handle_text_command(chat_id, text, state)
+
+        _ ->
+          state
       end
+    end
+  end
+
+  defp handle_reply_to(chat_id, text, reply_message_id, state) do
+    case SessionStore.lookup_session_by_message(reply_message_id) do
+      nil ->
+        # Not a tracked message, treat as regular text command
+        handle_text_command(chat_id, text, state)
+
+      session_id ->
+        session = SessionStore.get_session(session_id)
+
+        if session do
+          tty_path = session[:tty_path]
+          project = Path.basename(session[:working_dir] || "unknown")
+
+          case TerminalInjector.send_text(tty_path, text) do
+            :ok ->
+              Telegram.send_message(MessageFormatter.escape_full("✓ Sent to #{project}"))
+
+            {:error, reason} ->
+              Logger.warning("TelegramPoller: reply inject failed: #{inspect(reason)}")
+
+              Telegram.send_message(MessageFormatter.escape_full("Failed to send to #{project}"))
+          end
+
+          state
+        else
+          # Session expired, fall back to text command
+          handle_text_command(chat_id, text, state)
+        end
     end
   end
 
