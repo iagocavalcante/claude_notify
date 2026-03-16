@@ -11,6 +11,7 @@ defmodule ClaudeNotify.Application do
     children =
       [
         ClaudeNotify.SessionStore,
+        ClaudeNotify.ActivityTracker,
         ClaudeNotify.Dashboard,
         {Task.Supervisor,
          name: ClaudeNotify.EventTaskSupervisor, max_children: max_event_concurrency},
