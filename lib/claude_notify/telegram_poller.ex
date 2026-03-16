@@ -388,18 +388,14 @@ defmodule ClaudeNotify.TelegramPoller do
       [
         "*Commands*",
         "",
-        MessageFormatter.escape_full("/dashboard - Show live session dashboard"),
         MessageFormatter.escape_full("/sessions - List and select active sessions"),
-        MessageFormatter.escape_full("/switch or /s - Quick session switch"),
         MessageFormatter.escape_full("/approve - Send Yes to selected session"),
         MessageFormatter.escape_full("/cancel - Send Escape to selected session"),
+        MessageFormatter.escape_full("/dashboard - Show live session dashboard"),
         MessageFormatter.escape_full("/help - Show this help"),
         "",
-        MessageFormatter.escape_full(
-          "After selecting a session, type any text to send it as a prompt."
-        ),
-        MessageFormatter.escape_full("If only one session is active, it's auto-selected."),
-        MessageFormatter.escape_full("Button responses (Yes/No) work on notification messages.")
+        MessageFormatter.escape_full("Reply to any message to send text to that session."),
+        MessageFormatter.escape_full("If only one session is active, it's auto-selected.")
       ]
       |> Enum.join("\n")
 

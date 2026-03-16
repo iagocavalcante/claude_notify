@@ -4,12 +4,13 @@ Elixir app that sends interactive Telegram notifications for Claude Code session
 
 ## Features
 
-- **Session tracking** — see when Claude Code sessions start, update, and stop
-- **Tool use monitoring** — get formatted messages for each tool Claude uses (Read, Write, Bash, etc.)
+- **Quiet mode** — ~7 messages per session instead of 50+; no per-tool spam
+- **Edit-in-place activity** — a single message is updated silently showing what Claude is currently doing (tool name, file paths)
+- **Consolidated diffs** — `git diff` shown inline before permission prompts and at session end so you see exactly what changed
+- **Reply-to-session** — reply to any message to send text to that session's terminal (no need to `/select` first)
+- **Compact session lifecycle** — minimal start/end messages with project name and session ID
 - **Interactive approvals** — respond to permission prompts with Yes / No / Yes (don't ask) / Esc directly from Telegram
 - **Numbered option support** — for multi-choice prompts, choose options `1..9` from inline buttons
-- **Remote prompting** — list active sessions, select one, and type prompts from Telegram
-- **Last response context** — see Claude's final response/summary in Telegram before permission prompts and on session end
 - **Safer terminal injection** — text input is sent via clipboard paste with TTY validation
 - **Security hardening** — signed hook events (HMAC), replay protection, Telegram chat authorization, and debug endpoint protection
 
@@ -120,11 +121,13 @@ source .env && iex -S mix
 
 | Command | Description |
 |---------|-------------|
-| `/sessions` | List active Claude Code sessions with selection buttons |
-| `/select` | Alias for `/sessions` |
+| `/sessions` | List and select active sessions |
+| `/approve` | Send Yes to the selected session |
+| `/cancel` | Send Escape to the selected session |
+| `/dashboard` | Show live session dashboard |
 | `/help` | Show available commands |
 
-After selecting a session, any text you type in Telegram gets sent as input to that terminal session.
+Reply to any message to send text to that session. If only one session is active, it is auto-selected.
 
 ## Security Model
 
