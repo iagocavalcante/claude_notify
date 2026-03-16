@@ -54,6 +54,22 @@ defmodule ClaudeNotify.SessionStoreTest do
     assert map_size(sessions) == 2
   end
 
+  test "register_message and lookup_session_by_message work" do
+    SessionStore.register_prompt("sess-1", "hello", "/tmp/test")
+    SessionStore.register_message(12345, "sess-1")
+
+    assert SessionStore.lookup_session_by_message(12345) == "sess-1"
+    assert SessionStore.lookup_session_by_message(99999) == nil
+  end
+
+  test "message mappings are cleaned up when session is removed" do
+    SessionStore.register_prompt("sess-1", "hello", "/tmp/test")
+    SessionStore.register_message(12345, "sess-1")
+    SessionStore.register_stop("sess-1", "user_quit")
+
+    assert SessionStore.lookup_session_by_message(12345) == nil
+  end
+
   test "update_session_metadata does not increment prompt_count" do
     SessionStore.register_prompt("sess-1", "hello", "/tmp/project")
 

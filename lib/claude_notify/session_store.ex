@@ -4,7 +4,7 @@ defmodule ClaudeNotify.SessionStore do
   @stale_interval :timer.minutes(30)
   @stale_threshold :timer.hours(2)
 
-  defstruct sessions: %{}
+  defstruct sessions: %{}, message_map: %{}
 
   # Client API
 
@@ -34,6 +34,14 @@ defmodule ClaudeNotify.SessionStore do
 
   def all_sessions do
     GenServer.call(__MODULE__, :all_sessions)
+  end
+
+  def register_message(message_id, session_id) do
+    GenServer.cast(__MODULE__, {:register_message, message_id, session_id})
+  end
+
+  def lookup_session_by_message(message_id) do
+    GenServer.call(__MODULE__, {:lookup_message, message_id})
   end
 
   def clear do
@@ -170,7 +178,17 @@ defmodule ClaudeNotify.SessionStore do
             last_activity: now
           })
 
-        new_state = %{state | sessions: Map.delete(state.sessions, session_id)}
+        cleaned_messages =
+          state.message_map
+          |> Enum.reject(fn {_mid, sid} -> sid == session_id end)
+          |> Map.new()
+
+        new_state = %{
+          state
+          | sessions: Map.delete(state.sessions, session_id),
+            message_map: cleaned_messages
+        }
+
         {:reply, {:stopped, session}, new_state}
     end
   end
@@ -186,8 +204,18 @@ defmodule ClaudeNotify.SessionStore do
   end
 
   @impl true
+  def handle_call({:lookup_message, message_id}, _from, state) do
+    {:reply, Map.get(state.message_map, message_id), state}
+  end
+
+  @impl true
   def handle_call(:clear, _from, _state) do
     {:reply, :ok, %__MODULE__{}}
+  end
+
+  @impl true
+  def handle_cast({:register_message, message_id, session_id}, state) do
+    {:noreply, %{state | message_map: Map.put(state.message_map, message_id, session_id)}}
   end
 
   @impl true
@@ -200,8 +228,15 @@ defmodule ClaudeNotify.SessionStore do
       |> Enum.reject(fn {_id, session} -> now - session.last_activity > threshold end)
       |> Map.new()
 
+    remaining_ids = MapSet.new(Map.keys(cleaned))
+
+    cleaned_messages =
+      state.message_map
+      |> Enum.filter(fn {_mid, sid} -> MapSet.member?(remaining_ids, sid) end)
+      |> Map.new()
+
     schedule_cleanup()
-    {:noreply, %{state | sessions: cleaned}}
+    {:noreply, %{state | sessions: cleaned, message_map: cleaned_messages}}
   end
 
   defp schedule_cleanup do
