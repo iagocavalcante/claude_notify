@@ -16,6 +16,14 @@ defmodule ClaudeNotify.MessageFormatter do
     |> Enum.join("\n")
   end
 
+  @doc """
+  Format a user prompt echo message.
+  """
+  def prompt_echo(prompt) do
+    truncated = truncate(prompt, 500)
+    "💬 *You*\n> #{escape(truncated)}"
+  end
+
   defp project_name(dir) when is_binary(dir), do: Path.basename(dir)
   defp project_name(_), do: "unknown"
 
