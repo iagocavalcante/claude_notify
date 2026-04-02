@@ -94,4 +94,19 @@ defmodule ClaudeNotify.SessionStoreTest do
     result = SessionStore.set_prompt_message_id("nonexistent", 42)
     assert result == :not_found
   end
+
+  test "get_prompt_message_id returns stored id" do
+    SessionStore.register_prompt("sess-1", "hello", "/tmp/project")
+    SessionStore.set_prompt_message_id("sess-1", 42)
+    assert SessionStore.get_prompt_message_id("sess-1") == 42
+  end
+
+  test "get_prompt_message_id returns nil for unknown session" do
+    assert SessionStore.get_prompt_message_id("nonexistent") == nil
+  end
+
+  test "get_prompt_message_id returns nil when not set" do
+    SessionStore.register_prompt("sess-1", "hello", "/tmp/project")
+    assert SessionStore.get_prompt_message_id("sess-1") == nil
+  end
 end

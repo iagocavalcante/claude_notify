@@ -40,6 +40,13 @@ defmodule ClaudeNotify.SessionStore do
     GenServer.call(__MODULE__, {:set_prompt_message_id, session_id, message_id})
   end
 
+  def get_prompt_message_id(session_id) do
+    case get_session(session_id) do
+      %{prompt_message_id: mid} -> mid
+      _ -> nil
+    end
+  end
+
   def register_message(message_id, session_id) do
     GenServer.cast(__MODULE__, {:register_message, message_id, session_id})
   end
