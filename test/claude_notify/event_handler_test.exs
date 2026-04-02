@@ -132,10 +132,8 @@ defmodule ClaudeNotify.EventHandlerTest do
   end
 
   test "stop event reads transcript and sends Claude response" do
-    transcript_dir = System.tmp_dir!()
-
     transcript_path =
-      Path.join(transcript_dir, "test_transcript_#{System.unique_integer([:positive])}.jsonl")
+      Path.join("/tmp", "test_transcript_#{System.unique_integer([:positive])}.jsonl")
 
     assistant_msg =
       Jason.encode!(%{
