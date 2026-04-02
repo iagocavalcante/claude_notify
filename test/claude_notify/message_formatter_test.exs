@@ -120,4 +120,67 @@ defmodule ClaudeNotify.MessageFormatterTest do
     assert message =~ "user\\.name"
     assert message =~ "\\[config\\]"
   end
+
+  # Rich tool card tests
+
+  test "skill_card formats skill invocation" do
+    message =
+      MessageFormatter.skill_card("brainstorming", "Exploring requirements before implementation")
+
+    assert message =~ "🎯"
+    assert message =~ "brainstorming"
+    assert message =~ "Exploring requirements"
+  end
+
+  test "skill_card with nil description" do
+    message = MessageFormatter.skill_card("commit", nil)
+    assert message =~ "🎯"
+    assert message =~ "commit"
+  end
+
+  test "agent_delegation_card formats agent spawn" do
+    message = MessageFormatter.agent_delegation_card("Explore", "Find all auth middleware files")
+    assert message =~ "🤖"
+    assert message =~ "Explore"
+    assert message =~ "Find all auth middleware"
+  end
+
+  test "agent_delegation_card with nil description" do
+    message = MessageFormatter.agent_delegation_card("general-purpose", nil)
+    assert message =~ "🤖"
+    assert message =~ "general\\-purpose"
+  end
+
+  test "plan_mode_card formats plan entry" do
+    message = MessageFormatter.plan_mode_card(:enter)
+    assert message =~ "📝"
+    assert message =~ "plan"
+  end
+
+  test "plan_mode_card formats plan exit" do
+    message = MessageFormatter.plan_mode_card(:exit)
+    assert message =~ "📝"
+  end
+
+  test "task_checklist formats task list" do
+    tasks = [
+      %{subject: "Read existing auth code", status: :completed},
+      %{subject: "Write integration tests", status: :in_progress},
+      %{subject: "Update API docs", status: :pending}
+    ]
+
+    message = MessageFormatter.task_checklist(tasks)
+    assert message =~ "📋"
+    assert message =~ "✅"
+    assert message =~ "🔄"
+    assert message =~ "⬜"
+    assert message =~ "Read existing auth code"
+    assert message =~ "Write integration tests"
+    assert message =~ "Update API docs"
+  end
+
+  test "task_checklist with empty list" do
+    message = MessageFormatter.task_checklist([])
+    assert message =~ "📋"
+  end
 end

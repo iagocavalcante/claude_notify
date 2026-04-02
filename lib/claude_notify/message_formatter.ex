@@ -39,6 +39,59 @@ defmodule ClaudeNotify.MessageFormatter do
     end
   end
 
+  @doc """
+  Format a skill invocation card.
+  """
+  def skill_card(skill_name, description) do
+    desc_line =
+      if description && description != "",
+        do: "\n   #{escape(truncate(description, 100))}",
+        else: ""
+
+    "🎯 *Using skill:* #{escape(skill_name)}#{desc_line}"
+  end
+
+  @doc """
+  Format an agent delegation card.
+  """
+  def agent_delegation_card(agent_type, description) do
+    desc_line =
+      if description && description != "",
+        do: "\n   \"#{escape(truncate(description, 100))}\"",
+        else: ""
+
+    "🤖 → *#{escape(agent_type)}* agent#{desc_line}"
+  end
+
+  @doc """
+  Format a plan mode entry/exit card.
+  """
+  def plan_mode_card(:enter), do: "📝 *Entering plan mode*"
+  def plan_mode_card(:exit), do: "📝 *Exiting plan mode*"
+
+  @doc """
+  Format a task checklist for edit-in-place display.
+  """
+  def task_checklist(tasks) do
+    if tasks == [] do
+      "📋 *Tasks*\n   _No tasks yet_"
+    else
+      lines =
+        Enum.map(tasks, fn task ->
+          icon =
+            case task.status do
+              :completed -> "✅"
+              :in_progress -> "🔄"
+              _ -> "⬜"
+            end
+
+          "   #{icon} #{escape(truncate(task.subject, 60))}"
+        end)
+
+      "📋 *Tasks*\n#{Enum.join(lines, "\n")}"
+    end
+  end
+
   defp project_name(dir) when is_binary(dir), do: Path.basename(dir)
   defp project_name(_), do: "unknown"
 
