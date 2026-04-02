@@ -100,6 +100,37 @@ defmodule ClaudeNotify.EventHandlerTest do
     assert session.status == :waiting_input
   end
 
+  test "prompt event sends prompt echo message" do
+    params = %{
+      "event" => "prompt",
+      "session_id" => "echo-sess",
+      "prompt" => "Add error handling",
+      "working_dir" => "/tmp/test"
+    }
+
+    EventHandler.handle_event(params)
+
+    session = SessionStore.get_session("echo-sess")
+    assert session != nil
+    assert session.prompt_count == 1
+  end
+
+  test "subsequent prompt events also send prompt echo" do
+    SessionStore.register_prompt("echo-sess", "first", "/tmp/test")
+
+    params = %{
+      "event" => "prompt",
+      "session_id" => "echo-sess",
+      "prompt" => "second prompt",
+      "working_dir" => "/tmp/test"
+    }
+
+    EventHandler.handle_event(params)
+
+    session = SessionStore.get_session("echo-sess")
+    assert session.prompt_count == 2
+  end
+
   test "stop event with git_diff sends diff before session ended" do
     SessionStore.register_prompt("test-sess", "hello", "/tmp/test")
 

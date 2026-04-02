@@ -27,6 +27,9 @@ defmodule ClaudeNotify.EventHandler do
         Dashboard.refresh()
         :ok
     end
+
+    # Send prompt echo on every prompt (not just new sessions)
+    send_prompt_echo(session_id, prompt)
   end
 
   def handle_event(%{"event" => "stop"} = params) do
@@ -208,6 +211,22 @@ defmodule ClaudeNotify.EventHandler do
 
   defp project_name(dir) when is_binary(dir), do: Path.basename(dir)
   defp project_name(_), do: "unknown"
+
+  defp send_prompt_echo(session_id, prompt) when is_binary(prompt) and prompt != "" do
+    message = MessageFormatter.prompt_echo(prompt)
+
+    case Telegram.send_message_with_retry(message) do
+      {:ok, %{"result" => %{"message_id" => mid}}} ->
+        SessionStore.register_message(mid, session_id)
+        SessionStore.set_prompt_message_id(session_id, mid)
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp send_prompt_echo(_session_id, _prompt), do: :ok
 
   # -- Tool detail extraction --
 
