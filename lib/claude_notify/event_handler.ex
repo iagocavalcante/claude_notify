@@ -6,6 +6,7 @@ defmodule ClaudeNotify.EventHandler do
     MessageFormatter,
     Telegram,
     ActivityTracker,
+    TaskTracker,
     Dashboard
   }
 
@@ -40,6 +41,7 @@ defmodule ClaudeNotify.EventHandler do
     transcript_path = params["transcript_path"]
 
     ActivityTracker.end_session(session_id)
+    TaskTracker.end_session(session_id)
 
     # React 👍 or 😱 based on stop reason
     react_on_stop(session_id, stop_reason)
@@ -318,6 +320,20 @@ defmodule ClaudeNotify.EventHandler do
   defp maybe_send_structural_card("ExitPlanMode", _tool_input, session_id) do
     message = MessageFormatter.plan_mode_card(:exit)
     notify_and_register(message, session_id)
+  end
+
+  defp maybe_send_structural_card("TaskCreate", tool_input, session_id) do
+    subject = extract_json_value(tool_input, "subject") || "Unknown task"
+    TaskTracker.track_create(session_id, %{subject: subject})
+  end
+
+  defp maybe_send_structural_card("TaskUpdate", tool_input, session_id) do
+    subject = extract_json_value(tool_input, "subject")
+    status = extract_json_value(tool_input, "status")
+
+    if subject && status do
+      TaskTracker.track_update(session_id, %{subject: subject, status: status})
+    end
   end
 
   defp maybe_send_structural_card(_tool_name, _tool_input, _session_id), do: :ok
