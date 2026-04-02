@@ -236,4 +236,48 @@ defmodule ClaudeNotify.EventHandlerTest do
 
     assert SessionStore.get_session("test-sess") == nil
   end
+
+  test "prompt event attempts to set 👀 reaction" do
+    params = %{
+      "event" => "prompt",
+      "session_id" => "reaction-sess",
+      "prompt" => "Fix the bug",
+      "working_dir" => "/tmp/test"
+    }
+
+    EventHandler.handle_event(params)
+    session = SessionStore.get_session("reaction-sess")
+    assert session != nil
+  end
+
+  test "tool_use event attempts 🔥 reaction when prompt_message_id exists" do
+    SessionStore.register_prompt("react-tool-sess", "hello", "/tmp/test")
+    SessionStore.set_prompt_message_id("react-tool-sess", 99)
+
+    EventHandler.handle_event(%{
+      "event" => "tool_use",
+      "session_id" => "react-tool-sess",
+      "working_dir" => "/tmp/test",
+      "tool_name" => "Read",
+      "tool_input" => ~s({"file_path":"lib/foo.ex"}),
+      "tool_output" => ""
+    })
+
+    session = SessionStore.get_session("react-tool-sess")
+    assert session.status == :active
+  end
+
+  test "stop event attempts 👍 reaction on normal stop" do
+    SessionStore.register_prompt("react-stop-sess", "hello", "/tmp/test")
+    SessionStore.set_prompt_message_id("react-stop-sess", 88)
+
+    EventHandler.handle_event(%{
+      "event" => "stop",
+      "session_id" => "react-stop-sess",
+      "stop_reason" => "end_turn",
+      "working_dir" => "/tmp/test"
+    })
+
+    assert SessionStore.get_session("react-stop-sess") == nil
+  end
 end

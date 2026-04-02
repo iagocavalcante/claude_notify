@@ -41,6 +41,9 @@ defmodule ClaudeNotify.EventHandler do
 
     ActivityTracker.end_session(session_id)
 
+    # React 👍 or 😱 based on stop reason
+    react_on_stop(session_id, stop_reason)
+
     # Resolve transcript path: from params or from session store
     resolved_transcript = resolve_transcript_path(transcript_path, session_id)
 
@@ -85,6 +88,9 @@ defmodule ClaudeNotify.EventHandler do
 
     update_session_tty(session_id, working_dir, opts)
     SessionStore.update_status(session_id, :active, %{last_tool: tool_name})
+
+    # React 🔥 on prompt message to show Claude is working
+    maybe_react_tool(session_id)
 
     detail = extract_tool_detail(tool_name, tool_input)
     project = project_name(working_dir)
@@ -226,6 +232,7 @@ defmodule ClaudeNotify.EventHandler do
       {:ok, %{"result" => %{"message_id" => mid}}} ->
         SessionStore.register_message(mid, session_id)
         SessionStore.set_prompt_message_id(session_id, mid)
+        Telegram.set_message_reaction(mid, "👀")
         :ok
 
       _ ->
@@ -234,6 +241,24 @@ defmodule ClaudeNotify.EventHandler do
   end
 
   defp send_prompt_echo(_session_id, _prompt), do: :ok
+
+  defp maybe_react_tool(session_id) do
+    case SessionStore.get_prompt_message_id(session_id) do
+      nil -> :ok
+      mid -> Telegram.set_message_reaction(mid, "🔥")
+    end
+  end
+
+  defp react_on_stop(session_id, stop_reason) do
+    case SessionStore.get_prompt_message_id(session_id) do
+      nil ->
+        :ok
+
+      mid ->
+        emoji = if stop_reason in ["error", "crash"], do: "😱", else: "👍"
+        Telegram.set_message_reaction(mid, emoji)
+    end
+  end
 
   defp resolve_transcript_path(path, _session_id) when is_binary(path) and path != "" do
     ClaudeNotify.PathSafety.sanitize_transcript_path(path)
