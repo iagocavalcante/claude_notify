@@ -166,6 +166,63 @@ defmodule ClaudeNotify.EventHandlerTest do
     File.rm(transcript_path)
   end
 
+  test "full turn flow: prompt echo → tool tracking → claude response → session end" do
+    transcript_path = Path.join("/tmp", "flow_test_#{System.unique_integer([:positive])}.jsonl")
+
+    assistant_msg =
+      Jason.encode!(%{
+        "message" => %{
+          "role" => "assistant",
+          "content" => [%{"type" => "text", "text" => "Done! I added error handling."}]
+        }
+      })
+
+    File.write!(transcript_path, assistant_msg <> "\n")
+
+    # 1. Prompt
+    EventHandler.handle_event(%{
+      "event" => "prompt",
+      "session_id" => "flow-sess",
+      "prompt" => "Add error handling",
+      "working_dir" => "/tmp/test"
+    })
+
+    session = SessionStore.get_session("flow-sess")
+    assert session.prompt_count == 1
+
+    # 2. Tool use
+    EventHandler.handle_event(%{
+      "event" => "tool_use",
+      "session_id" => "flow-sess",
+      "working_dir" => "/tmp/test",
+      "tool_name" => "Edit",
+      "tool_input" => ~s({"file_path":"lib/auth.ex"}),
+      "tool_output" => ""
+    })
+
+    session = SessionStore.get_session("flow-sess")
+    assert session.status == :active
+
+    # 3. Store transcript path (simulating tool hook sending it)
+    SessionStore.update_session_metadata("flow-sess", "/tmp/test", %{
+      "transcript_path" => transcript_path
+    })
+
+    # 4. Stop — should read transcript and send Claude's response
+    EventHandler.handle_event(%{
+      "event" => "stop",
+      "session_id" => "flow-sess",
+      "stop_reason" => "end_turn",
+      "working_dir" => "/tmp/test",
+      "transcript_path" => transcript_path
+    })
+
+    # Session should be cleaned up
+    assert SessionStore.get_session("flow-sess") == nil
+
+    File.rm(transcript_path)
+  end
+
   test "stop event with git_diff sends diff before session ended" do
     SessionStore.register_prompt("test-sess", "hello", "/tmp/test")
 
