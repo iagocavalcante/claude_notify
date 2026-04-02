@@ -76,4 +76,48 @@ defmodule ClaudeNotify.MessageFormatterTest do
     assert MessageFormatter.diff_summary("") == nil
     assert MessageFormatter.diff_summary(nil) == nil
   end
+
+  test "prompt_echo formats user prompt as quoted message" do
+    message = MessageFormatter.prompt_echo("Add error handling to the login endpoint")
+    assert message =~ "💬"
+    assert message =~ "You"
+    assert message =~ "Add error handling to the login endpoint"
+  end
+
+  test "prompt_echo truncates long prompts" do
+    long_prompt = String.duplicate("a", 600)
+    message = MessageFormatter.prompt_echo(long_prompt)
+    assert message =~ "\\.\\.\\."
+    assert String.length(message) < 700
+  end
+
+  test "prompt_echo escapes MarkdownV2 special chars" do
+    message = MessageFormatter.prompt_echo("fix the user.name [field]")
+    assert message =~ "user\\.name"
+    assert message =~ "\\[field\\]"
+  end
+
+  test "claude_response formats assistant message" do
+    message = MessageFormatter.claude_response("I'll add try-catch blocks around the endpoint.")
+    assert message =~ "🤖"
+    assert message =~ "Claude"
+    assert message =~ "try\\-catch"
+  end
+
+  test "claude_response truncates at 2000 chars and shows truncation notice" do
+    long_text = String.duplicate("word ", 500)
+    message = MessageFormatter.claude_response(long_text)
+    assert message =~ "_…truncated"
+  end
+
+  test "claude_response does not show truncation for short messages" do
+    message = MessageFormatter.claude_response("Short response.")
+    refute message =~ "truncated"
+  end
+
+  test "claude_response escapes MarkdownV2 special chars" do
+    message = MessageFormatter.claude_response("Check user.name in [config]")
+    assert message =~ "user\\.name"
+    assert message =~ "\\[config\\]"
+  end
 end

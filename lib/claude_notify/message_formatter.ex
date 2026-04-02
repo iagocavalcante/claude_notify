@@ -24,6 +24,21 @@ defmodule ClaudeNotify.MessageFormatter do
     "💬 *You*\n> #{escape(truncated)}"
   end
 
+  @max_response_chars 2000
+
+  @doc """
+  Format Claude's response message for Telegram.
+  """
+  def claude_response(text) do
+    if String.length(text) > @max_response_chars do
+      truncated = String.slice(text, 0, @max_response_chars)
+      remaining = String.length(text) - @max_response_chars
+      "🤖 *Claude*\n#{escape(truncated)}\n\n_…truncated \\(#{remaining} more chars\\)_"
+    else
+      "🤖 *Claude*\n#{escape(text)}"
+    end
+  end
+
   defp project_name(dir) when is_binary(dir), do: Path.basename(dir)
   defp project_name(_), do: "unknown"
 

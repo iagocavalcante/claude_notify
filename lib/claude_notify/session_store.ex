@@ -36,6 +36,10 @@ defmodule ClaudeNotify.SessionStore do
     GenServer.call(__MODULE__, :all_sessions)
   end
 
+  def set_prompt_message_id(session_id, message_id) do
+    GenServer.call(__MODULE__, {:set_prompt_message_id, session_id, message_id})
+  end
+
   def register_message(message_id, session_id) do
     GenServer.cast(__MODULE__, {:register_message, message_id, session_id})
   end
@@ -206,6 +210,19 @@ defmodule ClaudeNotify.SessionStore do
   @impl true
   def handle_call({:lookup_message, message_id}, _from, state) do
     {:reply, Map.get(state.message_map, message_id), state}
+  end
+
+  @impl true
+  def handle_call({:set_prompt_message_id, session_id, message_id}, _from, state) do
+    case Map.get(state.sessions, session_id) do
+      nil ->
+        {:reply, :not_found, state}
+
+      session ->
+        updated = Map.put(session, :prompt_message_id, message_id)
+        new_state = %{state | sessions: Map.put(state.sessions, session_id, updated)}
+        {:reply, :ok, new_state}
+    end
   end
 
   @impl true

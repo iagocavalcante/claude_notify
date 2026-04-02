@@ -81,4 +81,17 @@ defmodule ClaudeNotify.SessionStoreTest do
     assert updated.prompt_count == 1
     assert updated.tty_path == "/dev/ttys001"
   end
+
+  test "set_prompt_message_id and get it back from session" do
+    SessionStore.register_prompt("sess-1", "hello", "/tmp/project")
+    SessionStore.set_prompt_message_id("sess-1", 42)
+
+    session = SessionStore.get_session("sess-1")
+    assert session.prompt_message_id == 42
+  end
+
+  test "set_prompt_message_id for unknown session is a no-op" do
+    result = SessionStore.set_prompt_message_id("nonexistent", 42)
+    assert result == :not_found
+  end
 end
