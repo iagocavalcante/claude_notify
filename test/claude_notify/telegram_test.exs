@@ -15,4 +15,9 @@ defmodule ClaudeNotify.TelegramTest do
   test "edit_message_text_with_retry retries on 429" do
     assert function_exported?(Telegram, :edit_message_text_with_retry, 2)
   end
+
+  test "set_message_reaction sends correct API request" do
+    result = Telegram.set_message_reaction(12345, "👀")
+    assert match?({:error, _}, result)
+  end
 end

@@ -117,6 +117,21 @@ defmodule ClaudeNotify.Telegram do
   end
 
   @doc """
+  Sets an emoji reaction on a message. Uses the setMessageReaction API.
+  `emoji` should be a single emoji string like "👀", "🔥", "👍".
+  """
+  def set_message_reaction(message_id, emoji) do
+    body = %{
+      chat_id: chat_id(),
+      message_id: message_id,
+      reaction: [%{type: "emoji", emoji: emoji}],
+      is_big: false
+    }
+
+    api_post("setMessageReaction", body)
+  end
+
+  @doc """
   Polls for updates using long polling. Returns the list of updates.
   """
   def get_updates(offset, timeout \\ 30) do
