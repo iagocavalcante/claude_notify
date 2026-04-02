@@ -131,6 +131,43 @@ defmodule ClaudeNotify.EventHandlerTest do
     assert session.prompt_count == 2
   end
 
+  test "stop event reads transcript and sends Claude response" do
+    transcript_dir = System.tmp_dir!()
+
+    transcript_path =
+      Path.join(transcript_dir, "test_transcript_#{System.unique_integer([:positive])}.jsonl")
+
+    assistant_msg =
+      Jason.encode!(%{
+        "message" => %{
+          "role" => "assistant",
+          "content" => [%{"type" => "text", "text" => "I added the error handling."}]
+        }
+      })
+
+    File.write!(transcript_path, assistant_msg <> "\n")
+
+    # Register session with transcript_path
+    SessionStore.register_prompt("transcript-sess", "hello", "/tmp/test")
+
+    SessionStore.update_session_metadata("transcript-sess", "/tmp/test", %{
+      "transcript_path" => transcript_path
+    })
+
+    params = %{
+      "event" => "stop",
+      "session_id" => "transcript-sess",
+      "stop_reason" => "end_turn",
+      "working_dir" => "/tmp/test",
+      "transcript_path" => transcript_path
+    }
+
+    EventHandler.handle_event(params)
+    assert SessionStore.get_session("transcript-sess") == nil
+
+    File.rm(transcript_path)
+  end
+
   test "stop event with git_diff sends diff before session ended" do
     SessionStore.register_prompt("test-sess", "hello", "/tmp/test")
 

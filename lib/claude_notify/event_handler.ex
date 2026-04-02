@@ -37,8 +37,15 @@ defmodule ClaudeNotify.EventHandler do
     stop_reason = params["stop_reason"] || "unknown"
     working_dir = params["working_dir"] || "unknown"
     git_diff = params["git_diff"]
+    transcript_path = params["transcript_path"]
 
     ActivityTracker.end_session(session_id)
+
+    # Resolve transcript path: from params or from session store
+    resolved_transcript = resolve_transcript_path(transcript_path, session_id)
+
+    # Send Claude's response before the session-ended message
+    send_claude_response(resolved_transcript, session_id)
 
     case SessionStore.get_session(session_id) do
       nil ->
@@ -227,6 +234,33 @@ defmodule ClaudeNotify.EventHandler do
   end
 
   defp send_prompt_echo(_session_id, _prompt), do: :ok
+
+  defp resolve_transcript_path(path, _session_id) when is_binary(path) and path != "" do
+    ClaudeNotify.PathSafety.sanitize_transcript_path(path)
+  end
+
+  defp resolve_transcript_path(_, session_id) do
+    case SessionStore.get_session(session_id) do
+      %{transcript_path: path} when is_binary(path) and path != "" ->
+        ClaudeNotify.PathSafety.sanitize_transcript_path(path)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp send_claude_response(nil, _session_id), do: :ok
+
+  defp send_claude_response(transcript_path, session_id) do
+    case ClaudeNotify.TranscriptReader.last_assistant_message(transcript_path) do
+      {:ok, text} ->
+        message = MessageFormatter.claude_response(text)
+        notify_and_register(message, session_id)
+
+      :error ->
+        :ok
+    end
+  end
 
   # -- Tool detail extraction --
 
