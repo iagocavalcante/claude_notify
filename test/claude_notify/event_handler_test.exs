@@ -223,6 +223,71 @@ defmodule ClaudeNotify.EventHandlerTest do
     File.rm(transcript_path)
   end
 
+  test "Skill tool_use sends skill card message" do
+    SessionStore.register_prompt("skill-sess", "hello", "/tmp/test")
+
+    EventHandler.handle_event(%{
+      "event" => "tool_use",
+      "session_id" => "skill-sess",
+      "working_dir" => "/tmp/test",
+      "tool_name" => "Skill",
+      "tool_input" => ~s({"skill":"brainstorming","args":""}),
+      "tool_output" => ""
+    })
+
+    session = SessionStore.get_session("skill-sess")
+    assert session.status == :active
+  end
+
+  test "Task tool_use with subagent_type sends agent delegation card" do
+    SessionStore.register_prompt("agent-sess", "hello", "/tmp/test")
+
+    EventHandler.handle_event(%{
+      "event" => "tool_use",
+      "session_id" => "agent-sess",
+      "working_dir" => "/tmp/test",
+      "tool_name" => "Task",
+      "tool_input" => ~s({"subagent_type":"Explore","description":"Find auth files"}),
+      "tool_output" => ""
+    })
+
+    session = SessionStore.get_session("agent-sess")
+    assert session.status == :active
+  end
+
+  test "EnterPlanMode tool_use sends plan mode card" do
+    SessionStore.register_prompt("plan-sess", "hello", "/tmp/test")
+
+    EventHandler.handle_event(%{
+      "event" => "tool_use",
+      "session_id" => "plan-sess",
+      "working_dir" => "/tmp/test",
+      "tool_name" => "EnterPlanMode",
+      "tool_input" => "{}",
+      "tool_output" => ""
+    })
+
+    session = SessionStore.get_session("plan-sess")
+    assert session.status == :active
+  end
+
+  test "regular tools do not send rich card messages" do
+    SessionStore.register_prompt("regular-sess", "hello", "/tmp/test")
+
+    # Read tool should NOT produce a rich card, only activity tracking
+    EventHandler.handle_event(%{
+      "event" => "tool_use",
+      "session_id" => "regular-sess",
+      "working_dir" => "/tmp/test",
+      "tool_name" => "Read",
+      "tool_input" => ~s({"file_path":"lib/foo.ex"}),
+      "tool_output" => ""
+    })
+
+    session = SessionStore.get_session("regular-sess")
+    assert session.status == :active
+  end
+
   test "stop event with git_diff sends diff before session ended" do
     SessionStore.register_prompt("test-sess", "hello", "/tmp/test")
 

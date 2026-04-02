@@ -92,6 +92,9 @@ defmodule ClaudeNotify.EventHandler do
     # React 🔥 on prompt message to show Claude is working
     maybe_react_tool(session_id)
 
+    # Send rich card for structural tools
+    maybe_send_structural_card(tool_name, tool_input, session_id)
+
     detail = extract_tool_detail(tool_name, tool_input)
     project = project_name(working_dir)
 
@@ -286,6 +289,38 @@ defmodule ClaudeNotify.EventHandler do
         :ok
     end
   end
+
+  # -- Structural tool cards --
+
+  defp maybe_send_structural_card("Skill", tool_input, session_id) do
+    skill_name = extract_json_value(tool_input, "skill") || "unknown"
+    args = extract_json_value(tool_input, "args")
+    message = MessageFormatter.skill_card(skill_name, args)
+    notify_and_register(message, session_id)
+  end
+
+  defp maybe_send_structural_card("Task", tool_input, session_id) do
+    # Only send card if it's an agent delegation (has subagent_type)
+    agent_type = extract_json_value(tool_input, "subagent_type")
+
+    if agent_type do
+      description = extract_json_value(tool_input, "description")
+      message = MessageFormatter.agent_delegation_card(agent_type, description)
+      notify_and_register(message, session_id)
+    end
+  end
+
+  defp maybe_send_structural_card("EnterPlanMode", _tool_input, session_id) do
+    message = MessageFormatter.plan_mode_card(:enter)
+    notify_and_register(message, session_id)
+  end
+
+  defp maybe_send_structural_card("ExitPlanMode", _tool_input, session_id) do
+    message = MessageFormatter.plan_mode_card(:exit)
+    notify_and_register(message, session_id)
+  end
+
+  defp maybe_send_structural_card(_tool_name, _tool_input, _session_id), do: :ok
 
   # -- Tool detail extraction --
 
