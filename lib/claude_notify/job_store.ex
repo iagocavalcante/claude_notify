@@ -2,9 +2,10 @@ defmodule ClaudeNotify.JobStore do
   @moduledoc """
   Persistent store for dispatcher jobs (one job = one worktree + engine run).
 
-  Backed by a `:dets` table so job state (and the worktree/branch it belongs
-  to) survives an app restart. All reads and mutations are serialized through
-  this GenServer so that status transitions can be validated atomically.
+  Job state (and the worktree/branch it belongs to) is written through to
+  disk on every mutation, so it survives a process or app restart. All reads
+  and mutations are serialized through this GenServer so that status
+  transitions can be validated atomically.
 
   Does not supervise the underlying job (see the JobRunner story) and does
   not format Telegram messages — this module only owns job CRUD and status.
@@ -41,6 +42,8 @@ defmodule ClaudeNotify.JobStore do
     ]
   end
 
+  defstruct jobs: %{}, next_id: 1, path: nil
+
   # Client API
 
   def start_link(opts \\ []) do
@@ -75,21 +78,8 @@ defmodule ClaudeNotify.JobStore do
 
   @impl true
   def init(opts) do
-    table = opts[:name] || __MODULE__
     path = opts[:path] || default_path()
-
-    File.mkdir_p!(Path.dirname(path))
-    {:ok, table} = :dets.open_file(table, file: String.to_charlist(path), type: :set)
-
-    next_id = :dets.foldl(fn {id, _job}, acc -> max(id, acc) end, 0, table) + 1
-
-    {:ok, %{table: table, next_id: next_id}}
-  end
-
-  @impl true
-  def terminate(_reason, state) do
-    :dets.close(state.table)
-    :ok
+    {:ok, %{load(path) | path: path}}
   end
 
   @impl true
@@ -111,13 +101,14 @@ defmodule ClaudeNotify.JobStore do
       updated_at: now
     }
 
-    :dets.insert(state.table, {id, job})
-    {:reply, {:ok, job}, %{state | next_id: id + 1}}
+    new_state = %{state | jobs: Map.put(state.jobs, id, job), next_id: id + 1}
+    persist(new_state)
+    {:reply, {:ok, job}, new_state}
   end
 
   @impl true
   def handle_call({:get, id}, _from, state) do
-    {:reply, fetch(state.table, id), state}
+    {:reply, Map.get(state.jobs, id), state}
   end
 
   @impl true
@@ -126,14 +117,15 @@ defmodule ClaudeNotify.JobStore do
       Map.has_key?(attrs, :status) ->
         {:reply, {:error, :use_update_status}, state}
 
-      fetch(state.table, id) == nil ->
+      not Map.has_key?(state.jobs, id) ->
         {:reply, {:error, :not_found}, state}
 
       true ->
-        job = fetch(state.table, id)
+        job = state.jobs[id]
         updated = struct!(job, Map.put(attrs, :updated_at, System.system_time(:second)))
-        :dets.insert(state.table, {id, updated})
-        {:reply, {:ok, updated}, state}
+        new_state = %{state | jobs: Map.put(state.jobs, id, updated)}
+        persist(new_state)
+        {:reply, {:ok, updated}, new_state}
     end
   end
 
@@ -146,11 +138,11 @@ defmodule ClaudeNotify.JobStore do
       status not in @valid_statuses ->
         {:reply, {:error, {:invalid_status, status}}, state}
 
-      fetch(state.table, id) == nil ->
+      not Map.has_key?(state.jobs, id) ->
         {:reply, {:error, :not_found}, state}
 
       true ->
-        job = fetch(state.table, id)
+        job = state.jobs[id]
         allowed = Map.fetch!(@transitions, job.status)
 
         if MapSet.member?(allowed, status) do
@@ -160,8 +152,9 @@ defmodule ClaudeNotify.JobStore do
             |> Map.put(:status, status)
             |> Map.put(:updated_at, System.system_time(:second))
 
-          :dets.insert(state.table, {id, updated})
-          {:reply, {:ok, updated}, state}
+          new_state = %{state | jobs: Map.put(state.jobs, id, updated)}
+          persist(new_state)
+          {:reply, {:ok, updated}, new_state}
         else
           {:reply, {:error, {:invalid_transition, job.status, status}}, state}
         end
@@ -171,8 +164,8 @@ defmodule ClaudeNotify.JobStore do
   @impl true
   def handle_call({:list, filters}, _from, state) do
     jobs =
-      state.table
-      |> all_jobs()
+      state.jobs
+      |> Map.values()
       |> maybe_filter_by_status(filters[:status])
       |> Enum.sort_by(& &1.id)
 
@@ -181,23 +174,43 @@ defmodule ClaudeNotify.JobStore do
 
   @impl true
   def handle_call(:clear, _from, state) do
-    :dets.delete_all_objects(state.table)
-    {:reply, :ok, %{state | next_id: 1}}
-  end
-
-  defp fetch(table, id) do
-    case :dets.lookup(table, id) do
-      [{^id, job}] -> job
-      [] -> nil
-    end
-  end
-
-  defp all_jobs(table) do
-    :dets.foldl(fn {_id, job}, acc -> [job | acc] end, [], table)
+    new_state = %{state | jobs: %{}, next_id: 1}
+    persist(new_state)
+    {:reply, :ok, new_state}
   end
 
   defp maybe_filter_by_status(jobs, nil), do: jobs
   defp maybe_filter_by_status(jobs, status), do: Enum.filter(jobs, &(&1.status == status))
+
+  # Writes to a temp file and renames over the real path, so a crash mid-write
+  # never leaves a partially-written store file behind.
+  defp persist(state) do
+    data = :erlang.term_to_binary(%{jobs: state.jobs, next_id: state.next_id})
+    tmp_path = state.path <> ".tmp"
+
+    File.mkdir_p!(Path.dirname(state.path))
+    File.write!(tmp_path, data)
+    File.rename!(tmp_path, state.path)
+    :ok
+  end
+
+  defp load(path) do
+    with true <- File.exists?(path),
+         {:ok, binary} <- File.read(path),
+         {:ok, %{jobs: jobs, next_id: next_id}} <- safe_decode(binary) do
+      %__MODULE__{jobs: jobs, next_id: next_id}
+    else
+      _ -> %__MODULE__{}
+    end
+  end
+
+  # :safe rejects data that would create new atoms, so a corrupted or
+  # tampered store file can't be used to exhaust the atom table.
+  defp safe_decode(binary) do
+    {:ok, :erlang.binary_to_term(binary, [:safe])}
+  rescue
+    ArgumentError -> :error
+  end
 
   defp default_path do
     Application.get_env(
