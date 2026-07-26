@@ -14,6 +14,9 @@ defmodule ClaudeNotify.Application do
         ClaudeNotify.ActivityTracker,
         ClaudeNotify.TaskTracker,
         ClaudeNotify.Dashboard,
+        ClaudeNotify.JobStore,
+        ClaudeNotify.JobSupervisor,
+        ClaudeNotify.JobSupervisor.Dispatcher,
         {Task.Supervisor,
          name: ClaudeNotify.EventTaskSupervisor, max_children: max_event_concurrency},
         {Bandit, plug: ClaudeNotify.Router, port: port}
