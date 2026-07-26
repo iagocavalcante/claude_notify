@@ -15,6 +15,7 @@ defmodule ClaudeNotify.Application do
         ClaudeNotify.TaskTracker,
         ClaudeNotify.Dashboard,
         ClaudeNotify.JobStore,
+        ClaudeNotify.JobTranscript,
         ClaudeNotify.JobSupervisor,
         ClaudeNotify.JobSupervisor.Dispatcher
       ] ++
