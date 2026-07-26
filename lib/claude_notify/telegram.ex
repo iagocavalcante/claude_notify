@@ -50,6 +50,31 @@ defmodule ClaudeNotify.Telegram do
   end
 
   @doc """
+  Edits an existing message's text and inline keyboard together, in one
+  editMessageText call - mirrors `send_with_buttons/2`'s `buttons` shape
+  (a list of `[label, callback_data]` pairs, laid out in one row). Pass
+  `[]` to clear a message's buttons (e.g. once its actions are no longer
+  valid) rather than leaving stale ones in place.
+  """
+  def edit_message_text_with_buttons(message_id, text, buttons) do
+    body = %{
+      chat_id: chat_id(),
+      message_id: message_id,
+      text: text,
+      parse_mode: "MarkdownV2",
+      reply_markup: %{inline_keyboard: inline_keyboard(buttons)}
+    }
+
+    api_post("editMessageText", body)
+  end
+
+  defp inline_keyboard([]), do: []
+
+  defp inline_keyboard(buttons) do
+    [Enum.map(buttons, fn [label, data] -> %{text: label, callback_data: data} end)]
+  end
+
+  @doc """
   Edits a message with automatic retry on 429 (rate limit) responses.
   """
   def edit_message_text_with_retry(message_id, text, retries \\ @max_retries) do

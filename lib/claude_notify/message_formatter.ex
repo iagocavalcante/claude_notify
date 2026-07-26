@@ -218,6 +218,63 @@ defmodule ClaudeNotify.MessageFormatter do
   defp tool_action_label(tool), do: escape(tool)
 
   @doc """
+  Format a dispatcher job's completion report: a completed header, the
+  engine's own final summary (or a placeholder if it didn't report one),
+  and the worktree's diffstat since the job branched off (or nothing, if
+  there's nothing to diff). Buttons (Show diff / Create PR / Discard) are
+  built and attached by the caller - this only returns the message text.
+  """
+  def job_completed(job, diffstat, summary) do
+    [
+      "✅ #{escape("Job ##{job.id} (#{job.project}, #{job.engine}) completed")}",
+      "━━━━━━━━━━━━━━━",
+      summary_line(summary),
+      diffstat_block(diffstat)
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  @doc """
+  Format a dispatcher job's failure report: a failed header and the tail of
+  the engine's own output - never a green-washed success-shaped message.
+  `error_text` is the job's persisted `error_tail` (the engine's own error
+  message if it reported one, otherwise the tail of its raw stdout).
+  Buttons (Show output / Discard) are built and attached by the caller.
+  """
+  def job_failed(job, error_text) do
+    [
+      "❌ #{escape("Job ##{job.id} (#{job.project}, #{job.engine}) failed")}",
+      "━━━━━━━━━━━━━━━",
+      error_block(error_text)
+    ]
+    |> Enum.join("\n")
+  end
+
+  @doc """
+  Format raw job output/error text for the "Show output" button, using the
+  same pre-block convention as `diff_summary/1`. Returns a placeholder
+  (never nil) since this always renders as its own standalone message.
+  """
+  def job_output_block(text), do: pre_block(text) || escape("No output captured.")
+
+  defp summary_line(nil), do: escape("(no summary reported)")
+  defp summary_line(""), do: escape("(no summary reported)")
+  defp summary_line(text), do: escape(truncate(text, 500))
+
+  defp diffstat_block(text), do: pre_block(text)
+
+  defp error_block(text), do: pre_block(text) || escape("(no output captured)")
+
+  defp pre_block(nil), do: nil
+  defp pre_block(""), do: nil
+
+  defp pre_block(text) when is_binary(text) do
+    safe = text |> truncate(@max_diff_chars) |> escape_pre()
+    "```\n#{safe}\n```"
+  end
+
+  @doc """
   Public escape for MarkdownV2 plain text (outside entities).
   """
   def escape_full(text), do: escape(text)

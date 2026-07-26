@@ -39,8 +39,11 @@ defmodule ClaudeNotify.TelegramPoller do
     Dashboard,
     JobStore,
     JobSupervisor,
-    ProjectRegistry
+    ProjectRegistry,
+    WorktreeManager
   }
+
+  alias ClaudeNotify.WorktreeManager.Worktree
 
   @poll_timeout 30
   @retry_delay 5_000
@@ -62,7 +65,8 @@ defmodule ClaudeNotify.TelegramPoller do
        telegram: Keyword.get(opts, :telegram, Telegram),
        job_store: Keyword.get(opts, :job_store, JobStore),
        project_registry: Keyword.get(opts, :project_registry),
-       job_launch_opts: Keyword.get(opts, :job_launch_opts, [])
+       job_launch_opts: Keyword.get(opts, :job_launch_opts, []),
+       cmd_runner: Keyword.get(opts, :cmd_runner, &default_cmd_runner/3)
      }}
   end
 
@@ -144,6 +148,22 @@ defmodule ClaudeNotify.TelegramPoller do
           Telegram.answer_callback_query(callback_id, response_label(response))
           inject_response(session_id, response)
           state
+
+        {:job_diff, job_id} ->
+          Telegram.answer_callback_query(callback_id, "Fetching diff...")
+          handle_job_diff(job_id, state)
+
+        {:job_show_output, job_id} ->
+          Telegram.answer_callback_query(callback_id, "Fetching output...")
+          handle_job_show_output(job_id, state)
+
+        {:job_create_pr, job_id} ->
+          Telegram.answer_callback_query(callback_id, "Creating PR...")
+          handle_job_create_pr(job_id, state)
+
+        {:job_discard, job_id} ->
+          Telegram.answer_callback_query(callback_id, "Discarding...")
+          handle_job_discard(job_id, state)
 
         :error ->
           Telegram.answer_callback_query(callback_id, "Invalid action")
@@ -284,6 +304,7 @@ defmodule ClaudeNotify.TelegramPoller do
       state.job_launch_opts
       |> Keyword.put_new(:job_store, job_store)
       |> Keyword.put_new(:project_registry, registry(state))
+      |> Keyword.put_new(:notifier, default_job_notifier(state))
       |> Keyword.put(:resume_session_id, session_id)
 
     JobSupervisor.start_job(new_job, opts)
@@ -616,6 +637,7 @@ defmodule ClaudeNotify.TelegramPoller do
           state.job_launch_opts
           |> Keyword.put_new(:job_store, job_store)
           |> Keyword.put_new(:project_registry, registry)
+          |> Keyword.put_new(:notifier, default_job_notifier(state))
 
         JobSupervisor.start_job(job, opts)
         state
@@ -729,9 +751,311 @@ defmodule ClaudeNotify.TelegramPoller do
 
   defp registry(state), do: state.project_registry || ProjectRegistry.load()
 
+  # --- Job progress/completion reporting (ClaudeNotify.JobRunner's notifier) ---
+
+  # Builds the `opts[:notifier]` fun a launched JobRunner calls back into -
+  # see ClaudeNotify.JobRunner's moduledoc for the event shapes. Captures
+  # `state` as of launch time; `state.telegram`/`state.job_store` don't
+  # change over a job's lifetime in practice, and `registry/1` re-resolves
+  # a fresh ProjectRegistry on every call when `state.project_registry` is
+  # nil (production default), so this stays correct even if the registry is
+  # edited between launch and completion.
+  defp default_job_notifier(state) do
+    fn
+      {:progress, job_id, progress} -> handle_job_progress(state, job_id, progress)
+      {:completed, job_id, result} -> handle_job_completed(state, job_id, result)
+    end
+  end
+
+  defp handle_job_progress(state, job_id, progress) do
+    case JobStore.get(state.job_store, job_id) do
+      %{telegram_message_ids: [message_id | _]} = job ->
+        text =
+          MessageFormatter.activity_message(%{
+            project: "Job ##{job.id} (#{job.project}, #{job.engine})",
+            action_count: progress.action_count,
+            files_touched: progress.files_touched,
+            current_tool: progress.current_tool,
+            current_detail: progress.current_detail
+          })
+
+        state.telegram.edit_message_text(message_id, text)
+        :ok
+
+      _no_tracked_message ->
+        :ok
+    end
+  end
+
+  defp handle_job_completed(state, job_id, %{status: status, summary: summary}) do
+    case JobStore.get(state.job_store, job_id) do
+      nil -> :ok
+      job -> deliver_completion_report(state, job, status, summary)
+    end
+  end
+
+  defp deliver_completion_report(state, job, :completed, summary) do
+    diffstat = job_diffstat(state, job)
+    text = MessageFormatter.job_completed(job, diffstat, summary)
+
+    buttons = [
+      ["Show diff", "jobdiff:#{job.id}"],
+      ["Create PR", "jobpr:#{job.id}"],
+      ["Discard", "jobdiscard:#{job.id}"]
+    ]
+
+    edit_job_report(state, job, text, buttons)
+  end
+
+  defp deliver_completion_report(state, job, :failed, _summary) do
+    text = MessageFormatter.job_failed(job, job.error_tail)
+
+    buttons = [
+      ["Show output", "jobshowoutput:#{job.id}"],
+      ["Discard", "jobdiscard:#{job.id}"]
+    ]
+
+    edit_job_report(state, job, text, buttons)
+  end
+
+  defp edit_job_report(_state, %{telegram_message_ids: []}, _text, _buttons), do: :ok
+
+  defp edit_job_report(state, %{telegram_message_ids: [message_id | _]}, text, buttons) do
+    state.telegram.edit_message_text_with_buttons(message_id, text, buttons)
+    :ok
+  end
+
+  # --- Job callback handlers (Show diff / Show output / Create PR / Discard) ---
+
+  defp handle_job_diff(job_id, state) do
+    case JobStore.get(state.job_store, job_id) do
+      nil ->
+        state.telegram.send_message(MessageFormatter.escape_full("Job ##{job_id} not found."))
+
+      job ->
+        case MessageFormatter.diff_summary(job_diff(state, job, [])) do
+          nil -> state.telegram.send_message(MessageFormatter.escape_full("No changes to show."))
+          text -> state.telegram.send_message(text)
+        end
+    end
+
+    state
+  end
+
+  defp handle_job_show_output(job_id, state) do
+    case JobStore.get(state.job_store, job_id) do
+      nil ->
+        state.telegram.send_message(MessageFormatter.escape_full("Job ##{job_id} not found."))
+
+      job ->
+        state.telegram.send_message(MessageFormatter.job_output_block(job.error_tail))
+    end
+
+    state
+  end
+
+  defp handle_job_create_pr(job_id, state) do
+    case JobStore.get(state.job_store, job_id) do
+      nil ->
+        state.telegram.send_message(MessageFormatter.escape_full("Job ##{job_id} not found."))
+
+      job ->
+        cond do
+          job.status != :completed ->
+            state.telegram.send_message(
+              MessageFormatter.escape_full(
+                "Job ##{job.id} is #{job.status}; only a completed job can open a PR."
+              )
+            )
+
+          not (is_binary(job.worktree_path) and File.dir?(job.worktree_path)) ->
+            state.telegram.send_message(
+              MessageFormatter.escape_full("Job ##{job.id}'s worktree is gone; nothing to push.")
+            )
+
+          true ->
+            create_pr(state, job)
+        end
+    end
+
+    state
+  end
+
+  # The ONLY place that ever pushes or opens a PR - see the module doc's
+  # "Job commands" section. Both the push and `gh pr create` go through
+  # `state.cmd_runner`, an injectable `(cmd, args, opts) -> {output, exit_code}`
+  # function defaulting to `default_cmd_runner/3` (a thin `System.cmd/3`
+  # wrapper), so tests can prove this path is never reached before the
+  # callback fires without ever shelling out to a real `git push`/`gh`.
+  defp create_pr(state, job) do
+    case state.cmd_runner.("git", ["push", "-u", "origin", job.branch], cwd: job.worktree_path) do
+      {_output, 0} ->
+        run_gh_pr_create(state, job)
+
+      {output, code} ->
+        Logger.error(
+          "TelegramPoller: git push failed for job #{job.id} (exit #{code}): #{output}"
+        )
+
+        state.telegram.send_message(
+          MessageFormatter.escape_full("Job ##{job.id}: git push failed.")
+        )
+    end
+  end
+
+  defp run_gh_pr_create(state, job) do
+    args = ["pr", "create", "--title", pr_title(job), "--body", pr_body(job)]
+
+    case state.cmd_runner.("gh", args, cwd: job.worktree_path) do
+      {output, 0} ->
+        url = output |> String.trim() |> String.split("\n") |> List.last()
+        state.telegram.send_message(MessageFormatter.escape_full("Job ##{job.id}: PR - #{url}"))
+
+      {output, code} ->
+        Logger.error(
+          "TelegramPoller: gh pr create failed for job #{job.id} (exit #{code}): #{output}"
+        )
+
+        state.telegram.send_message(
+          MessageFormatter.escape_full(
+            "Job ##{job.id}: git push succeeded but gh pr create failed."
+          )
+        )
+    end
+  end
+
+  defp pr_title(job), do: "Job ##{job.id}: #{String.slice(job.prompt, 0, 72)}"
+
+  defp pr_body(job) do
+    "Automated PR for dispatcher job ##{job.id} (#{job.project}, #{job.engine}).\n\nPrompt:\n#{job.prompt}"
+  end
+
+  defp handle_job_discard(job_id, state) do
+    case JobStore.get(state.job_store, job_id) do
+      nil ->
+        state.telegram.send_message(MessageFormatter.escape_full("Job ##{job_id} not found."))
+
+      job ->
+        discard_job(state, job)
+    end
+
+    state
+  end
+
+  # A job still in one of these statuses can genuinely transition to
+  # :discarded (see JobStore's @transitions) - drive that transition too, not
+  # just the worktree cleanup, mirroring the existing /cancel handler.
+  defp discard_job(state, %{status: status} = job)
+       when status in [:queued, :running, :awaiting_input] do
+    case JobStore.update_status(state.job_store, job.id, :discarded, %{}) do
+      {:ok, updated_job} ->
+        discard_worktree_and_report(state, updated_job)
+
+      {:error, reason} ->
+        Logger.warning("TelegramPoller: could not discard job #{job.id}: #{inspect(reason)}")
+
+        state.telegram.send_message(
+          MessageFormatter.escape_full("Job ##{job.id} could not be discarded.")
+        )
+    end
+  end
+
+  # :completed/:failed/:discarded have no valid transition to :discarded
+  # (JobStore's @transitions map is empty for all three - they're terminal).
+  # For an already-completed job, "Discard" cannot mean "change its status":
+  # the job DID complete: what the user is discarding is its now-unwanted
+  # worktree/branch, not the historical fact that it ran and finished. So
+  # this only tears down the worktree and edits the report to say so,
+  # leaving `status` exactly as it was.
+  defp discard_job(state, job), do: discard_worktree_and_report(state, job)
+
+  defp discard_worktree_and_report(state, job) do
+    text = MessageFormatter.escape_full("Job ##{job.id}: worktree discarded.")
+
+    case worktree_for(state, job) do
+      nil ->
+        edit_job_report(state, job, text, [])
+
+      worktree ->
+        case WorktreeManager.discard(worktree) do
+          :ok ->
+            edit_job_report(state, job, text, [])
+
+          {:error, reason} ->
+            Logger.warning(
+              "TelegramPoller: worktree discard failed for job #{job.id}: #{inspect(reason)}"
+            )
+
+            edit_job_report(
+              state,
+              job,
+              MessageFormatter.escape_full("Job ##{job.id}: failed to discard worktree."),
+              []
+            )
+        end
+    end
+  end
+
+  defp worktree_for(_state, %{worktree_path: nil}), do: nil
+
+  defp worktree_for(state, job) do
+    case ProjectRegistry.lookup(registry(state), job.project) do
+      {:ok, repo_path} ->
+        %Worktree{
+          repo_path: repo_path,
+          job_id: to_string(job.id),
+          path: job.worktree_path,
+          branch: job.branch
+        }
+
+      {:error, _reason} ->
+        nil
+    end
+  end
+
+  # --- Job diff/diffstat (read-only `git diff`, no DI needed - only the
+  # push/PR path in create_pr/2 needs to be faked in tests) ---
+
+  defp job_diffstat(state, job), do: job_diff(state, job, ["--stat"])
+
+  defp job_diff(_state, %{worktree_path: nil}, _extra_args), do: nil
+
+  defp job_diff(state, job, extra_args) do
+    with {:ok, repo_path} <- ProjectRegistry.lookup(registry(state), job.project),
+         {:ok, base_branch} <- current_branch(repo_path) do
+      args = ["diff"] ++ extra_args ++ ["#{base_branch}...HEAD"]
+
+      case System.cmd("git", args, cd: job.worktree_path, stderr_to_stdout: true) do
+        {output, 0} -> output
+        {_output, _code} -> nil
+      end
+    else
+      _ -> nil
+    end
+  end
+
+  defp current_branch(repo_path) do
+    case System.cmd("git", ["rev-parse", "--abbrev-ref", "HEAD"],
+           cd: repo_path,
+           stderr_to_stdout: true
+         ) do
+      {output, 0} -> {:ok, String.trim(output)}
+      {_output, code} -> {:error, code}
+    end
+  end
+
+  defp default_cmd_runner(cmd, args, opts) do
+    cwd = Keyword.fetch!(opts, :cwd)
+    System.cmd(cmd, args, cd: cwd, stderr_to_stdout: true)
+  end
+
   # --- Helpers ---
 
   defp parse_callback_data("dash:refresh"), do: {:dash_refresh}
+  defp parse_callback_data("jobdiff:" <> id), do: parse_job_callback(:job_diff, id)
+  defp parse_callback_data("jobshowoutput:" <> id), do: parse_job_callback(:job_show_output, id)
+  defp parse_callback_data("jobpr:" <> id), do: parse_job_callback(:job_create_pr, id)
+  defp parse_callback_data("jobdiscard:" <> id), do: parse_job_callback(:job_discard, id)
 
   defp parse_callback_data(data) when is_binary(data) do
     case String.split(data, ":", parts: 2) do
@@ -747,6 +1071,13 @@ defmodule ClaudeNotify.TelegramPoller do
   end
 
   defp parse_callback_data(_), do: :error
+
+  defp parse_job_callback(tag, id_str) do
+    case Integer.parse(id_str) do
+      {id, ""} -> {tag, id}
+      _ -> :error
+    end
+  end
 
   defp inject_response(session_id, response) do
     case SessionStore.get_session(session_id) do
