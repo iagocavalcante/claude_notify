@@ -19,6 +19,23 @@ defmodule ClaudeNotify.JobRunner do
 
   Deliberately does not tear down the worktree on completion - the commit it
   holds is the input to a later PR-creation story.
+
+  ## Resuming (`opts[:resume_session_id]`)
+
+  When `opts[:resume_session_id]` is set, `launch_engine/2` calls
+  `engine.resume_command/3` instead of `engine.build_command/2`, so the
+  engine CLI is told to continue an earlier conversation. This job still
+  gets its own brand-new worktree cut from the repo's current default
+  branch (see `create_worktree/1`), same as any other job - it does NOT
+  check out the original job's branch. That's a real limitation: the
+  engine's own memory of the earlier turn may reference files that only
+  exist on the *original* job's branch, not on this fresh one. It's an
+  acceptable starting point only because the job rules already require the
+  engine to commit and leave its worktree clean before finishing, so in the
+  common case there's nothing left uncommitted to lose - but a resumed run
+  that expects to see uncommitted state from its earlier turn will not find
+  it here. See `ClaudeNotify.TelegramPoller`'s reply-to-job handling, which
+  is the only current caller of this option.
   """
 
   use GenServer, restart: :temporary
@@ -36,6 +53,7 @@ defmodule ClaudeNotify.JobRunner do
     :worktree,
     :port,
     :session_id,
+    :resume_session_id,
     engine_opts: [],
     buffer: "",
     finalized: false
@@ -58,6 +76,9 @@ defmodule ClaudeNotify.JobRunner do
   @doc "Prepends the job rules (worktree isolation, commit-at-end, no push) to `prompt`."
   def wrap_prompt(prompt), do: @job_rules <> prompt
 
+  @doc "Test/introspection helper: the job id this runner is driving."
+  def job_id(pid), do: GenServer.call(pid, :job_id)
+
   # -- Server callbacks --
 
   @impl true
@@ -69,10 +90,16 @@ defmodule ClaudeNotify.JobRunner do
       prompt: Keyword.fetch!(opts, :prompt),
       job_store: Keyword.get(opts, :job_store, JobStore),
       slug: Keyword.get(opts, :slug, "run"),
-      engine_opts: Keyword.get(opts, :engine_opts, [])
+      engine_opts: Keyword.get(opts, :engine_opts, []),
+      resume_session_id: Keyword.get(opts, :resume_session_id)
     }
 
     {:ok, state, {:continue, :launch}}
+  end
+
+  @impl true
+  def handle_call(:job_id, _from, state) do
+    {:reply, state.job_id, state}
   end
 
   @impl true
@@ -134,7 +161,14 @@ defmodule ClaudeNotify.JobRunner do
   defp launch_engine(state, worktree) do
     wrapped_prompt = wrap_prompt(state.prompt)
     engine_opts = Keyword.put(state.engine_opts, :cwd, worktree.path)
-    {cmd, args} = state.engine.build_command(wrapped_prompt, engine_opts)
+
+    {cmd, args} =
+      if state.resume_session_id do
+        state.engine.resume_command(state.resume_session_id, wrapped_prompt, engine_opts)
+      else
+        state.engine.build_command(wrapped_prompt, engine_opts)
+      end
+
     open_port(cmd, args, worktree.path)
   end
 

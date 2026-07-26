@@ -96,6 +96,7 @@ defmodule ClaudeNotify.JobRunnerTest do
     #!/usr/bin/env bash
     prompt="$1"
     echo "$prompt" > .received-prompt
+    echo "$@" > .received-args
     pwd > .engine-cwd
 
     if [[ "$prompt" == *"FIXTURE_SLOW"* ]]; then
@@ -359,6 +360,38 @@ defmodule ClaudeNotify.JobRunnerTest do
       final = wait_for_status(store, job.id, :completed)
       assert final.engine_session_id == "session-event-fixture-1"
     end
+
+    test "job_id/1 exposes the job id this runner is driving", %{
+      repo_path: repo_path,
+      store: store,
+      script: script
+    } do
+      {:ok, job} = JobStore.create(store, job_attrs())
+      {:ok, _} = JobStore.update_status(store, job.id, :running, %{})
+
+      pid = start_runner(job, repo_path, script, job_store: store)
+
+      assert JobRunner.job_id(pid) == job.id
+
+      wait_for_status(store, job.id, :completed)
+    end
+
+    test "opts[:resume_session_id] makes the engine's resume_command run instead of build_command",
+         %{repo_path: repo_path, store: store, script: script} do
+      {:ok, job} = JobStore.create(store, job_attrs(%{prompt: "continue the work"}))
+      {:ok, _} = JobStore.update_status(store, job.id, :running, %{})
+
+      start_runner(job, repo_path, script,
+        job_store: store,
+        resume_session_id: "fixture-original-session"
+      )
+
+      final = wait_for_status(store, job.id, :completed)
+
+      args = final.worktree_path |> Path.join(".received-args") |> File.read!() |> String.trim()
+      assert String.starts_with?(args, "--resume fixture-original-session")
+      assert args =~ "continue the work"
+    end
   end
 
   # -- JobSupervisor: concurrency cap, queueing, crash isolation --
@@ -379,7 +412,7 @@ defmodule ClaudeNotify.JobRunnerTest do
 
       registry = %ProjectRegistry{projects: %{"fixture-project" => repo_path}, aliases: %{}}
 
-      %{dispatcher: dispatcher_name, registry: registry}
+      %{dispatcher: dispatcher_name, dyn_sup: dyn_name, registry: registry}
     end
 
     defp common_opts(store, script, registry, dispatcher) do
@@ -439,6 +472,31 @@ defmodule ClaudeNotify.JobRunnerTest do
       wait_for_status(store, ok_job.id, :completed)
 
       assert Process.alive?(Process.whereis(dispatcher))
+    end
+
+    test "stop_job/2 terminates a running job's runner process", %{
+      store: store,
+      script: script,
+      dispatcher: dispatcher,
+      dyn_sup: dyn_sup,
+      registry: registry
+    } do
+      {:ok, job} = JobStore.create(store, job_attrs(%{prompt: "FIXTURE_SLOW do the thing"}))
+      opts = common_opts(store, script, registry, dispatcher)
+
+      assert :started = JobSupervisor.start_job(job, opts)
+      assert [{_, pid, :worker, _}] = DynamicSupervisor.which_children(dyn_sup)
+
+      assert :stopped = JobSupervisor.stop_job(job.id, dynamic_supervisor: dyn_sup)
+
+      refute Process.alive?(pid)
+      assert DynamicSupervisor.which_children(dyn_sup) == []
+    end
+
+    test "stop_job/2 returns :not_found when no runner is running for that job id", %{
+      dyn_sup: dyn_sup
+    } do
+      assert :not_found = JobSupervisor.stop_job(999_999, dynamic_supervisor: dyn_sup)
     end
   end
 end

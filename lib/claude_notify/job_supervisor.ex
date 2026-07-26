@@ -55,6 +55,59 @@ defmodule ClaudeNotify.JobSupervisor do
     Dispatcher.start_job(dispatcher, job, opts)
   end
 
+  @doc """
+  Stops `job_id`'s runner process, if one is currently alive under this
+  supervisor. Does not touch `ClaudeNotify.JobStore` - callers own the
+  status transition (see `ClaudeNotify.TelegramPoller`'s `/cancel` handler,
+  which drives the job to `:discarded` in the store itself and calls this
+  only to actually terminate the underlying engine process).
+
+  Returns `:stopped` if a live runner was found and terminated, or
+  `:not_found` if no runner is currently running for that job id (e.g. the
+  job was still `:queued`, or had already finished on its own).
+
+  Options:
+
+    * `:dynamic_supervisor` - defaults to `ClaudeNotify.JobSupervisor`.
+  """
+  def stop_job(job_id, opts \\ []) do
+    dynamic_supervisor = Keyword.get(opts, :dynamic_supervisor, __MODULE__)
+
+    case find_runner(dynamic_supervisor, job_id) do
+      {:ok, pid} ->
+        DynamicSupervisor.terminate_child(dynamic_supervisor, pid)
+        :stopped
+
+      :not_found ->
+        :not_found
+    end
+  end
+
+  # Scans this supervisor's children for the one JobRunner driving `job_id`.
+  # There's no registry keyed by job id (yet) - which_children/1 plus a tiny
+  # per-child GenServer.call is the simplest mechanism the current code
+  # supports for a supervisor that, at any moment, holds at most a handful
+  # of running jobs (the concurrency cap defaults to 3).
+  defp find_runner(dynamic_supervisor, job_id) do
+    dynamic_supervisor
+    |> DynamicSupervisor.which_children()
+    |> Enum.find_value(:not_found, fn
+      {_, pid, :worker, _} when is_pid(pid) ->
+        if runner_job_id(pid) == job_id, do: {:ok, pid}
+
+      _ ->
+        nil
+    end)
+  end
+
+  # A runner can finish (and stop) between which_children/1 listing it and
+  # this call - treated the same as "not this job's runner", not a crash.
+  defp runner_job_id(pid) do
+    ClaudeNotify.JobRunner.job_id(pid)
+  catch
+    :exit, _ -> nil
+  end
+
   defmodule Dispatcher do
     @moduledoc """
     Owns the concurrency-cap and FIFO queue decision for `JobSupervisor` -
@@ -206,7 +259,8 @@ defmodule ClaudeNotify.JobSupervisor do
        prompt: job.prompt,
        job_store: job_store,
        slug: Keyword.get(opts, :slug, "run"),
-       engine_opts: Keyword.get(opts, :engine_opts, [])}
+       engine_opts: Keyword.get(opts, :engine_opts, []),
+       resume_session_id: Keyword.get(opts, :resume_session_id)}
     end
 
     defp resolve_engine(opts, job) do
