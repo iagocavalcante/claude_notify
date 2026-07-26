@@ -6,9 +6,10 @@ defmodule ClaudeNotify.Engine do
   An implementation turns a job's (already rule-wrapped) prompt into a
   concrete OS command, and turns that command's stdout - one JSON object per
   line, e.g. Claude Code's `--output-format stream-json` - into the internal
-  event shape `JobRunner` consumes: `:tool_use`, `:text`, `:result`, or
-  `:ignore` for engine-internal lines that carry no job-relevant
-  information (system/init chatter, rate-limit telemetry, hook echoes, ...).
+  event shape `JobRunner` consumes: `:tool_use`, `:text`, `:result`,
+  `:session`, or `:ignore` for engine-internal lines that carry no
+  job-relevant information (system/init chatter, rate-limit telemetry, hook
+  echoes, ...).
 
   `parse_event/1` must never raise - malformed or unrecognized lines should
   come back as `{:error, reason}` so `JobRunner` can log and skip them
@@ -31,6 +32,7 @@ defmodule ClaudeNotify.Engine do
           {:tool_use, tool_use_event()}
           | {:text, String.t()}
           | {:result, result_event()}
+          | {:session, String.t()}
 
   @doc """
   Builds `{executable, args}` to launch a fresh run of this engine for
@@ -52,6 +54,15 @@ defmodule ClaudeNotify.Engine do
 
   Returns `:ignore` for lines that parse fine but carry nothing job-relevant,
   or `{:error, reason}` for a line that couldn't be parsed at all.
+
+  `{:session, session_id}` and a `{:result, %{session_id: session_id}}` with
+  a non-nil `session_id` are both legal ways to report the engine's
+  session/thread id - `JobRunner` stores it from either. Use `:session` when
+  an engine reports its id separately from, and before, the outcome of the
+  run (e.g. Codex's `thread.started`, which precedes any `turn.completed`/
+  `turn.failed`); use the `:result` event's `session_id` field when an
+  engine's outcome event already carries the id itself (e.g. Claude Code's
+  `result` event, which needs no separate `:session` event).
   """
   @callback parse_event(line :: String.t()) :: {:ok, event()} | :ignore | {:error, term()}
 end

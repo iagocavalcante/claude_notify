@@ -96,8 +96,8 @@ defmodule ClaudeNotify.Engine.CodexTest do
   end
 
   describe "parse_event/1" do
-    test "thread.started surfaces the thread id as an early :result event" do
-      assert {:ok, {:result, %{session_id: "thread-xyz", status: :ok, summary: nil}}} =
+    test "thread.started becomes a :session event carrying the thread id" do
+      assert {:ok, {:session, "thread-xyz"}} =
                Engine.Codex.parse_event(~s({"type":"thread.started","thread_id":"thread-xyz"}))
     end
 

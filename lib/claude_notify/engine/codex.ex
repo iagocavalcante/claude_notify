@@ -88,22 +88,19 @@ defmodule ClaudeNotify.Engine.Codex do
       already captured it from `thread.started`); this module does not
       assume they do - see the note on `thread.started` below.
 
-  ## Why `thread.started` is surfaced as a `:result` event
+  ## Why `thread.started` is a `:session` event, not a `:result`
 
-  `JobRunner.process_line/2` only threads an engine's session/thread id
-  into `JobStore` when it sees a `{:result, %{session_id: id}}` event (see
-  `maybe_store_session_id/2`) - and receiving one is purely informational
-  to `JobRunner`: only the port's `:exit_status` message ever changes a
-  job's status. Codex reports identity (`thread.started`, at turn start)
-  and outcome (`turn.completed`/`turn.failed`, at turn end) as two separate
-  events, unlike Claude Code's `result` event which carries both at once.
-  To get the durable thread id captured before assuming anything about
-  `turn.completed`'s payload, `thread.started` is surfaced here as an early
-  `:result` event: `status: :ok` is a neutral placeholder (not a claim that
-  the turn has succeeded) and `summary: nil`. The turn's real outcome is
-  reported by a second `:result` event, from `turn.completed`/`turn.failed`,
-  with `session_id: nil` (a no-op for `maybe_store_session_id/2`, which
-  already holds the id from the first event).
+  Codex reports identity (`thread.started`, at turn start) and outcome
+  (`turn.completed`/`turn.failed`, at turn end) as two separate events,
+  unlike Claude Code's `result` event which carries both at once. Rather
+  than stretching `:result` to also mean "here's the id, no outcome yet"
+  (which would put a misleading `status: :ok` in the event stream before
+  the turn has done anything - a real problem for any future consumer of
+  these events, e.g. a job-completion report), `thread.started` maps to the
+  `Engine` behaviour's dedicated `{:session, session_id}` event instead.
+  `turn.completed`/`turn.failed` remain the only `:result` events this
+  module emits, each with `session_id: nil` (the id was already captured
+  from `:session`) and a real, truthful `status`/`summary`.
   """
 
   @behaviour ClaudeNotify.Engine
@@ -136,7 +133,7 @@ defmodule ClaudeNotify.Engine.Codex do
   end
 
   defp parse_decoded(%{"type" => "thread.started", "thread_id" => thread_id}) do
-    {:ok, {:result, %{session_id: thread_id, status: :ok, summary: nil}}}
+    {:ok, {:session, thread_id}}
   end
 
   defp parse_decoded(%{"type" => "item.completed", "item" => %{"type" => "agent_message"} = item}) do

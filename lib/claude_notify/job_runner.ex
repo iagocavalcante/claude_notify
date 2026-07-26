@@ -186,6 +186,9 @@ defmodule ClaudeNotify.JobRunner do
         Logger.info("JobRunner: job #{state.job_id} result: #{inspect(result)}")
         maybe_store_session_id(state, session_id)
 
+      {:ok, {:session, session_id}} ->
+        maybe_store_session_id(state, session_id)
+
       {:ok, {:tool_use, _detail}} ->
         state
 
