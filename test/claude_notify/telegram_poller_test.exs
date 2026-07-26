@@ -28,6 +28,27 @@ defmodule ClaudeNotify.TelegramPollerTest do
       {:ok, %{"result" => %{"message_id" => System.unique_integer([:positive, :monotonic])}}}
     end
 
+    # Retry-safe counterpart adopted by every job/watch call site (story
+    # #241) - real chunking behavior (via the actual
+    # `ClaudeNotify.Telegram.chunk/2`, a pure function safe to reuse here),
+    # each resulting piece forwarded as its own `{:telegram_send, text}` so
+    # a chunked "Show diff"/"Show output" shows up as multiple ordered
+    # messages in tests, exactly like it does in production. 429-retry
+    # itself is exercised at the unit level against the real
+    # `ClaudeNotify.Telegram` module (see telegram_test.exs) - this double
+    # only needs to reproduce the OBSERVABLE chunking/ordering behavior.
+    def send_message_with_retry(text) do
+      case ClaudeNotify.Telegram.chunk(text) do
+        [single] ->
+          send_message(single)
+
+        [first | rest] ->
+          result = send_message(first)
+          Enum.each(rest, &send_message/1)
+          result
+      end
+    end
+
     # Forwards as the SAME {:telegram_send, text} tuple as send_message/1
     # above (buttons intentionally not part of the observable tuple, same
     # observability level send_message/1 itself has) - this keeps every
@@ -43,19 +64,49 @@ defmodule ClaudeNotify.TelegramPollerTest do
       {:ok, %{"result" => %{"message_id" => System.unique_integer([:positive, :monotonic])}}}
     end
 
+    # Same chunking rationale as send_message_with_retry/1 above - leading
+    # chunks (if any) are plain sends, buttons stay attached to the last.
+    def send_with_buttons_retry(text, buttons) do
+      case ClaudeNotify.Telegram.chunk(text) do
+        [single] ->
+          send_with_buttons(single, buttons)
+
+        chunks ->
+          {leading, [last]} = Enum.split(chunks, length(chunks) - 1)
+          Enum.each(leading, &send_message/1)
+          send_with_buttons(last, buttons)
+      end
+    end
+
     def edit_message_text(message_id, text) do
       forward({:telegram_edit, message_id, text})
       {:ok, %{"result" => %{"message_id" => message_id}}}
     end
+
+    # Edits are never chunked (a single Telegram message can't be split
+    # into several while staying one edit target) - a plain passthrough is
+    # enough to prove call-site adoption.
+    def edit_message_text_with_retry(message_id, text), do: edit_message_text(message_id, text)
 
     def edit_message_text_with_buttons(message_id, text, buttons) do
       forward({:telegram_edit_buttons, message_id, text, buttons})
       {:ok, %{"result" => %{"message_id" => message_id}}}
     end
 
+    def edit_message_text_with_buttons_with_retry(message_id, text, buttons),
+      do: edit_message_text_with_buttons(message_id, text, buttons)
+
     def edit_message_reply_markup(message_id, buttons) do
       forward({:telegram_edit_markup, message_id, buttons})
       {:ok, %{"result" => %{"message_id" => message_id}}}
+    end
+
+    def edit_message_reply_markup_with_retry(message_id, buttons),
+      do: edit_message_reply_markup(message_id, buttons)
+
+    def send_chat_action(chat_id, action) do
+      forward({:telegram_chat_action, chat_id, action})
+      {:ok, %{"result" => true}}
     end
 
     defp forward(message) do
@@ -279,6 +330,27 @@ defmodule ClaudeNotify.TelegramPollerTest do
       path
     end
 
+    # Same shape as write_failing_fixture_engine/1, but with a caller-supplied
+    # `error_message` long enough to exceed Telegram's 4096-char limit once
+    # formatted - for proving Show output chunks instead of truncating (story
+    # #241). No literal newlines/quotes in `error_message`: it's spliced
+    # directly into a single-line JSON string.
+    defp write_failing_fixture_engine_with_long_error(tmp_dir, error_message) do
+      path = Path.join(tmp_dir, "fake_engine_fail_long.sh")
+
+      File.write!(path, """
+      #!/usr/bin/env bash
+      cat <<'JSON'
+      {"type":"system","subtype":"init","cwd":"ignored","session_id":"fixture-session-fail-long"}
+      {"type":"result","subtype":"error","is_error":true,"result":"#{error_message}","session_id":"fixture-session-fail-long"}
+      JSON
+      exit 1
+      """)
+
+      File.chmod!(path, 0o755)
+      path
+    end
+
     # Fakes the push/`gh pr create` commands `create_pr/2` shells out to via
     # `state.cmd_runner`, so the "no push before the Create PR callback"
     # tests never touch a real remote or the `gh` CLI. Runs in the test
@@ -344,6 +416,20 @@ defmodule ClaudeNotify.TelegramPollerTest do
         true ->
           Process.sleep(20)
           wait_for_status(store, job_id, status, attempts - 1)
+      end
+    end
+
+    # Drains every pending `{:telegram_send, text}` already in the test
+    # process's mailbox, in receive order - for proving a chunked send
+    # (story #241) arrived as several ordered messages instead of one. A
+    # short timeout is enough: by the time a job/watch handler call
+    # returns, every one of its (synchronous, in-process) FakeTelegram
+    # sends has already been delivered.
+    defp collect_telegram_sends(timeout \\ 200) do
+      receive do
+        {:telegram_send, text} -> [text | collect_telegram_sends(timeout)]
+      after
+        timeout -> []
       end
     end
 
@@ -653,6 +739,20 @@ defmodule ClaudeNotify.TelegramPollerTest do
       assert ["Discard", "jobdiscard:" <> _] = Enum.at(buttons, 2)
     end
 
+    test "a job completion report fires a typing indicator before the card is edited in", %{
+      state: state,
+      store: store
+    } do
+      TelegramPoller.handle_update(text_message("/run trainer fix the widget"), state)
+      assert_receive {:telegram_send, _starting}
+      assert [job] = JobStore.list(store)
+
+      wait_for_status(store, job.id, :completed)
+
+      assert_receive {:telegram_chat_action, @chat_id, "typing"}, 2000
+      assert_receive {:telegram_edit_buttons, _message_id, _text, _buttons}, 2000
+    end
+
     test "Show diff sends the consolidated diff of the job's own commit", %{
       state: state,
       store: store
@@ -672,6 +772,59 @@ defmodule ClaudeNotify.TelegramPollerTest do
 
       assert_receive {:telegram_send, diff_text}
       assert diff_text =~ "new_file.txt"
+    end
+
+    # Story #241: chunking replaces the old silent-truncation behavior.
+    test "Show diff longer than Telegram's limit arrives as multiple ordered, size-bounded messages instead of being silently truncated",
+         %{state: state, store: store} do
+      TelegramPoller.handle_update(text_message("/run trainer fix the widget"), state)
+      assert_receive {:telegram_send, _starting}
+      assert [job] = JobStore.list(store)
+      completed = wait_for_status(store, job.id, :completed)
+
+      # A synthetic diff whose formatted (pre-blocked) size comfortably
+      # exceeds Telegram's 4096-char limit, so `MessageFormatter.diff_summary/1`
+      # not truncating internally actually gets exercised end to end
+      # through the retry-safe chunking send.
+      lines = Enum.map(1..700, &"line#{String.pad_leading(to_string(&1), 6, "0")}")
+      big_content = Enum.join(lines, "\n") <> "\n"
+      File.write!(Path.join(completed.worktree_path, "big_file.txt"), big_content)
+      {_, 0} = System.cmd("git", ["add", "."], cd: completed.worktree_path)
+
+      {_, 0} =
+        System.cmd("git", ["commit", "-q", "-m", "big commit"], cd: completed.worktree_path)
+
+      TelegramPoller.handle_update(callback_update("jobdiff:#{job.id}"), state)
+
+      assert_receive {:telegram_chat_action, @chat_id, "upload_document"}
+
+      messages = collect_telegram_sends()
+      assert length(messages) > 1
+      assert Enum.all?(messages, &(byte_size(&1) <= 4096))
+      # Order, not chunk boundaries, is what matters: `Telegram.chunk/2`
+      # decides paragraph/line packing on its own, so assert the FIRST line
+      # appears strictly before the LAST line once every chunk is stitched
+      # back together in receive order - proving nothing was reordered or
+      # dropped by the chunking/sending itself.
+      full_text = Enum.join(messages)
+      {first_idx, _} = :binary.match(full_text, "line000001")
+      {last_idx, _} = :binary.match(full_text, "line000700")
+      assert first_idx < last_idx
+    end
+
+    test "Show diff fires a typing/upload indicator before the diff is prepared", %{
+      state: state,
+      store: store
+    } do
+      TelegramPoller.handle_update(text_message("/run trainer fix the widget"), state)
+      assert_receive {:telegram_send, _starting}
+      assert [job] = JobStore.list(store)
+      wait_for_status(store, job.id, :completed)
+
+      TelegramPoller.handle_update(callback_update("jobdiff:#{job.id}"), state)
+
+      assert_receive {:telegram_chat_action, @chat_id, "upload_document"}
+      assert_receive {:telegram_send, _diff_text}
     end
 
     test "Create PR is the only path that pushes, and only after the callback fires", %{
@@ -768,8 +921,42 @@ defmodule ClaudeNotify.TelegramPollerTest do
       refute Enum.any?(buttons, fn [label, _] -> label == "Create PR" end)
 
       TelegramPoller.handle_update(callback_update("jobshowoutput:#{job.id}"), state)
+
+      assert_receive {:telegram_chat_action, @chat_id, "upload_document"}
       assert_receive {:telegram_send, output_text}
       assert output_text =~ "boom: something broke"
+    end
+
+    # Story #241: chunking replaces the old silent-truncation behavior for
+    # Show output too, same as Show diff above.
+    test "Show output longer than Telegram's limit arrives as multiple ordered, size-bounded messages",
+         %{state: state, store: store, tmp_dir: tmp_dir} do
+      huge_error =
+        Enum.map_join(1..700, " ", &"errline#{String.pad_leading(to_string(&1), 6, "0")}")
+
+      script = write_failing_fixture_engine_with_long_error(tmp_dir, huge_error)
+
+      state = %{
+        state
+        | job_launch_opts: Keyword.put(state.job_launch_opts, :engine_opts, script: script)
+      }
+
+      TelegramPoller.handle_update(text_message("/run trainer break something"), state)
+      assert_receive {:telegram_send, _starting}
+      assert [job] = JobStore.list(store)
+      wait_for_status(store, job.id, :failed)
+
+      assert_receive {:telegram_edit_buttons, _message_id, _text, _buttons}
+
+      TelegramPoller.handle_update(callback_update("jobshowoutput:#{job.id}"), state)
+
+      messages = collect_telegram_sends()
+      assert length(messages) > 1
+      assert Enum.all?(messages, &(byte_size(&1) <= 4096))
+      full_text = Enum.join(messages)
+      {first_idx, _} = :binary.match(full_text, "errline000001")
+      {last_idx, _} = :binary.match(full_text, "errline000700")
+      assert first_idx < last_idx
     end
 
     # -- Watch mode (story #238) --
@@ -1046,6 +1233,31 @@ defmodule ClaudeNotify.TelegramPollerTest do
       assert TelegramPoller.shortcut_response("hello world") == nil
       assert TelegramPoller.shortcut_response("") == nil
       assert TelegramPoller.shortcut_response("0") == nil
+    end
+  end
+
+  # Convention check (story #241): every `state.telegram` call in the
+  # job/watch paths must go through a retry-safe wrapper, never the raw
+  # send/edit. A source-text regex is a deliberately blunt instrument, but
+  # it catches a future call site sneaking in `state.telegram.send_message(`
+  # (or an edit/buttons/markup equivalent) unnoticed - the class of
+  # regression example-based tests on individual handlers can't rule out.
+  test "no raw (non-retry) state.telegram send/edit calls remain in the job/watch paths" do
+    source =
+      File.read!(Path.join([__DIR__, "..", "..", "lib", "claude_notify", "telegram_poller.ex"]))
+
+    raw_call_patterns = [
+      ~r/state\.telegram\.send_message\(/,
+      ~r/state\.telegram\.send_with_buttons\(/,
+      ~r/state\.telegram\.edit_message_text\(/,
+      ~r/state\.telegram\.edit_message_text_with_buttons\(/,
+      ~r/state\.telegram\.edit_message_reply_markup\(/
+    ]
+
+    for pattern <- raw_call_patterns do
+      refute source =~ pattern,
+             "found a raw (non-retry) state.telegram call matching #{inspect(pattern)} - " <>
+               "job/watch paths must use the _with_retry/_retry wrapper instead"
     end
   end
 end

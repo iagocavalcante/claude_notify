@@ -438,7 +438,7 @@ defmodule ClaudeNotify.TelegramPoller do
   defp resume_job(%{status: status} = job, text, state) when status in [:completed, :failed] do
     case job.engine_session_id do
       nil ->
-        state.telegram.send_message(
+        state.telegram.send_message_with_retry(
           MessageFormatter.escape_full("Job ##{job.id} has no recorded session to resume from.")
         )
 
@@ -450,7 +450,7 @@ defmodule ClaudeNotify.TelegramPoller do
   end
 
   defp resume_job(job, _text, state) do
-    state.telegram.send_message(
+    state.telegram.send_message_with_retry(
       MessageFormatter.escape_full(
         "Job ##{job.id} is #{job.status} and can't be resumed right now."
       )
@@ -697,7 +697,10 @@ defmodule ClaudeNotify.TelegramPoller do
             handle_job_watch(job_id, state)
 
           :error ->
-            state.telegram.send_message(MessageFormatter.escape_full("Usage: /watch <job id>"))
+            state.telegram.send_message_with_retry(
+              MessageFormatter.escape_full("Usage: /watch <job id>")
+            )
+
             state
         end
 
@@ -707,7 +710,10 @@ defmodule ClaudeNotify.TelegramPoller do
             handle_job_unwatch(job_id, state)
 
           :error ->
-            state.telegram.send_message(MessageFormatter.escape_full("Usage: /unwatch <job id>"))
+            state.telegram.send_message_with_retry(
+              MessageFormatter.escape_full("Usage: /unwatch <job id>")
+            )
+
             state
         end
 
@@ -1015,7 +1021,7 @@ defmodule ClaudeNotify.TelegramPoller do
 
   defp handle_jobs_command(state) do
     jobs = JobStore.list(state.job_store)
-    state.telegram.send_message(jobs_text(jobs))
+    state.telegram.send_message_with_retry(jobs_text(jobs))
     state
   end
 
@@ -1040,21 +1046,24 @@ defmodule ClaudeNotify.TelegramPoller do
 
         JobSupervisor.stop_job(job_id, dynamic_supervisor: dynamic_supervisor)
 
-        state.telegram.send_message(
+        state.telegram.send_message_with_retry(
           MessageFormatter.escape_full("Job ##{job_id} (#{job.project}) cancelled.")
         )
 
         state
 
       {:error, {:invalid_transition, from, :discarded}} ->
-        state.telegram.send_message(
+        state.telegram.send_message_with_retry(
           MessageFormatter.escape_full("Job ##{job_id} is #{from} and can't be cancelled.")
         )
 
         state
 
       {:error, :not_found} ->
-        state.telegram.send_message(MessageFormatter.escape_full("Job ##{job_id} not found."))
+        state.telegram.send_message_with_retry(
+          MessageFormatter.escape_full("Job ##{job_id} not found.")
+        )
+
         state
     end
   end
@@ -1071,7 +1080,7 @@ defmodule ClaudeNotify.TelegramPoller do
           Enum.join(["*Projects*", ""] ++ Enum.map(names, &MessageFormatter.escape_full/1), "\n")
       end
 
-    state.telegram.send_message(text)
+    state.telegram.send_message_with_retry(text)
     state
   end
 
@@ -1088,7 +1097,7 @@ defmodule ClaudeNotify.TelegramPoller do
       ]
       |> Enum.join("\n")
 
-    state.telegram.send_message(text)
+    state.telegram.send_message_with_retry(text)
   end
 
   defp send_unknown_project(state, known_projects) do
@@ -1098,7 +1107,7 @@ defmodule ClaudeNotify.TelegramPoller do
         names -> Enum.join(names, ", ")
       end
 
-    state.telegram.send_message(
+    state.telegram.send_message_with_retry(
       MessageFormatter.escape_full("Unknown project. Known projects: #{known_text}")
     )
   end
@@ -1120,7 +1129,7 @@ defmodule ClaudeNotify.TelegramPoller do
   defp send_and_track_activity_message(state, job_id, text) do
     buttons = [["Watch", "jobwatch:#{job_id}"]]
 
-    case state.telegram.send_with_buttons(MessageFormatter.escape_full(text), buttons) do
+    case state.telegram.send_with_buttons_retry(MessageFormatter.escape_full(text), buttons) do
       {:ok, %{"result" => %{"message_id" => message_id}}} ->
         JobStore.update(state.job_store, job_id, %{telegram_message_ids: [message_id]})
 
@@ -1175,7 +1184,7 @@ defmodule ClaudeNotify.TelegramPoller do
             current_detail: progress.current_detail
           })
 
-        state.telegram.edit_message_text(message_id, text)
+        state.telegram.edit_message_text_with_retry(message_id, text)
         :ok
 
       _no_tracked_message ->
@@ -1191,6 +1200,7 @@ defmodule ClaudeNotify.TelegramPoller do
   end
 
   defp deliver_completion_report(state, job, :completed, summary) do
+    notify_preparing(state, "typing")
     diffstat = job_diffstat(state, job)
     text = MessageFormatter.job_completed(job, diffstat, summary)
 
@@ -1204,6 +1214,7 @@ defmodule ClaudeNotify.TelegramPoller do
   end
 
   defp deliver_completion_report(state, job, :failed, _summary) do
+    notify_preparing(state, "typing")
     text = MessageFormatter.job_failed(job, job.error_tail)
 
     buttons = [
@@ -1217,7 +1228,25 @@ defmodule ClaudeNotify.TelegramPoller do
   defp edit_job_report(_state, %{telegram_message_ids: []}, _text, _buttons), do: :ok
 
   defp edit_job_report(state, %{telegram_message_ids: [message_id | _]}, text, buttons) do
-    state.telegram.edit_message_text_with_buttons(message_id, text, buttons)
+    state.telegram.edit_message_text_with_buttons_with_retry(message_id, text, buttons)
+    :ok
+  end
+
+  # Best-effort "typing…"/"sending a file…" indicator while a job
+  # report/diff/output is being formatted and sent - Telegram shows it for
+  # ~5s or until the next message from the bot. A failed chat action isn't
+  # worth acting on (see `ClaudeNotify.Telegram.send_chat_action/2`), so
+  # its result is discarded here exactly like the pre-existing
+  # `acknowledge_inbound/2` call does for inbound messages. This app only
+  # ever talks to the one chat configured via `:telegram_chat_id` - no
+  # per-callback chat_id is threaded through these job handlers, mirroring
+  # `handle_see_more/3`'s identical `Application.get_env/2` read.
+  defp notify_preparing(state, action) do
+    state.telegram.send_chat_action(
+      Application.get_env(:claude_notify, :telegram_chat_id),
+      action
+    )
+
     :ok
   end
 
@@ -1226,12 +1255,21 @@ defmodule ClaudeNotify.TelegramPoller do
   defp handle_job_diff(job_id, state) do
     case JobStore.get(state.job_store, job_id) do
       nil ->
-        state.telegram.send_message(MessageFormatter.escape_full("Job ##{job_id} not found."))
+        state.telegram.send_message_with_retry(
+          MessageFormatter.escape_full("Job ##{job_id} not found.")
+        )
 
       job ->
+        notify_preparing(state, "upload_document")
+
         case MessageFormatter.diff_summary(job_diff(state, job, [])) do
-          nil -> state.telegram.send_message(MessageFormatter.escape_full("No changes to show."))
-          text -> state.telegram.send_message(text)
+          nil ->
+            state.telegram.send_message_with_retry(
+              MessageFormatter.escape_full("No changes to show.")
+            )
+
+          text ->
+            state.telegram.send_message_with_retry(text)
         end
     end
 
@@ -1241,10 +1279,13 @@ defmodule ClaudeNotify.TelegramPoller do
   defp handle_job_show_output(job_id, state) do
     case JobStore.get(state.job_store, job_id) do
       nil ->
-        state.telegram.send_message(MessageFormatter.escape_full("Job ##{job_id} not found."))
+        state.telegram.send_message_with_retry(
+          MessageFormatter.escape_full("Job ##{job_id} not found.")
+        )
 
       job ->
-        state.telegram.send_message(MessageFormatter.job_output_block(job.error_tail))
+        notify_preparing(state, "upload_document")
+        state.telegram.send_message_with_retry(MessageFormatter.job_output_block(job.error_tail))
     end
 
     state
@@ -1253,19 +1294,21 @@ defmodule ClaudeNotify.TelegramPoller do
   defp handle_job_create_pr(job_id, state) do
     case JobStore.get(state.job_store, job_id) do
       nil ->
-        state.telegram.send_message(MessageFormatter.escape_full("Job ##{job_id} not found."))
+        state.telegram.send_message_with_retry(
+          MessageFormatter.escape_full("Job ##{job_id} not found.")
+        )
 
       job ->
         cond do
           job.status != :completed ->
-            state.telegram.send_message(
+            state.telegram.send_message_with_retry(
               MessageFormatter.escape_full(
                 "Job ##{job.id} is #{job.status}; only a completed job can open a PR."
               )
             )
 
           not (is_binary(job.worktree_path) and File.dir?(job.worktree_path)) ->
-            state.telegram.send_message(
+            state.telegram.send_message_with_retry(
               MessageFormatter.escape_full("Job ##{job.id}'s worktree is gone; nothing to push.")
             )
 
@@ -1293,7 +1336,7 @@ defmodule ClaudeNotify.TelegramPoller do
           "TelegramPoller: git push failed for job #{job.id} (exit #{code}): #{output}"
         )
 
-        state.telegram.send_message(
+        state.telegram.send_message_with_retry(
           MessageFormatter.escape_full("Job ##{job.id}: git push failed.")
         )
     end
@@ -1305,14 +1348,17 @@ defmodule ClaudeNotify.TelegramPoller do
     case state.cmd_runner.("gh", args, cwd: job.worktree_path) do
       {output, 0} ->
         url = output |> String.trim() |> String.split("\n") |> List.last()
-        state.telegram.send_message(MessageFormatter.escape_full("Job ##{job.id}: PR - #{url}"))
+
+        state.telegram.send_message_with_retry(
+          MessageFormatter.escape_full("Job ##{job.id}: PR - #{url}")
+        )
 
       {output, code} ->
         Logger.error(
           "TelegramPoller: gh pr create failed for job #{job.id} (exit #{code}): #{output}"
         )
 
-        state.telegram.send_message(
+        state.telegram.send_message_with_retry(
           MessageFormatter.escape_full(
             "Job ##{job.id}: git push succeeded but gh pr create failed."
           )
@@ -1329,7 +1375,9 @@ defmodule ClaudeNotify.TelegramPoller do
   defp handle_job_discard(job_id, state) do
     case JobStore.get(state.job_store, job_id) do
       nil ->
-        state.telegram.send_message(MessageFormatter.escape_full("Job ##{job_id} not found."))
+        state.telegram.send_message_with_retry(
+          MessageFormatter.escape_full("Job ##{job_id} not found.")
+        )
 
       job ->
         discard_job(state, job)
@@ -1350,7 +1398,7 @@ defmodule ClaudeNotify.TelegramPoller do
       {:error, reason} ->
         Logger.warning("TelegramPoller: could not discard job #{job.id}: #{inspect(reason)}")
 
-        state.telegram.send_message(
+        state.telegram.send_message_with_retry(
           MessageFormatter.escape_full("Job ##{job.id} could not be discarded.")
         )
     end
@@ -1414,7 +1462,10 @@ defmodule ClaudeNotify.TelegramPoller do
   defp handle_job_watch(job_id, state) do
     case JobStore.get(state.job_store, job_id) do
       nil ->
-        state.telegram.send_message(MessageFormatter.escape_full("Job ##{job_id} not found."))
+        state.telegram.send_message_with_retry(
+          MessageFormatter.escape_full("Job ##{job_id} not found.")
+        )
+
         state
 
       job ->
@@ -1425,7 +1476,7 @@ defmodule ClaudeNotify.TelegramPoller do
   defp start_watch(state, job) do
     cond do
       Map.has_key?(state.watches, job.id) ->
-        state.telegram.send_message(
+        state.telegram.send_message_with_retry(
           MessageFormatter.escape_full("Already watching job ##{job.id}.")
         )
 
@@ -1450,7 +1501,7 @@ defmodule ClaudeNotify.TelegramPoller do
     entries = JobTranscript.transcript(state.job_transcript, job.id)
     text = MessageFormatter.transcript_message(job, entries)
 
-    case state.telegram.send_message(text) do
+    case state.telegram.send_message_with_retry(text) do
       {:ok, %{"result" => %{"message_id" => message_id}}} ->
         set_activity_button(state, job, "Unwatch", "jobunwatch:#{job.id}")
         watch = %{message_id: message_id, dirty: false, timer_ref: nil}
@@ -1469,15 +1520,18 @@ defmodule ClaudeNotify.TelegramPoller do
   # `ClaudeNotify.JobTranscript`'s moduledoc) an honest "it's gone" reply.
   defp send_terminal_snapshot(state, job) do
     case JobTranscript.transcript(state.job_transcript, job.id) do
-      [] -> state.telegram.send_message(MessageFormatter.transcript_unavailable(job))
-      entries -> state.telegram.send_message(MessageFormatter.transcript_message(job, entries))
+      [] ->
+        state.telegram.send_message_with_retry(MessageFormatter.transcript_unavailable(job))
+
+      entries ->
+        state.telegram.send_message_with_retry(MessageFormatter.transcript_message(job, entries))
     end
   end
 
   defp handle_job_unwatch(job_id, state) do
     case Map.get(state.watches, job_id) do
       nil ->
-        state.telegram.send_message(
+        state.telegram.send_message_with_retry(
           MessageFormatter.escape_full("Job ##{job_id} is not being watched.")
         )
 
@@ -1501,7 +1555,7 @@ defmodule ClaudeNotify.TelegramPoller do
       job ->
         entries = JobTranscript.transcript(state.job_transcript, job_id)
         text = MessageFormatter.transcript_message(job, entries)
-        state.telegram.edit_message_text(watch.message_id, text)
+        state.telegram.edit_message_text_with_retry(watch.message_id, text)
         set_activity_button(state, job, "Watch", "jobwatch:#{job.id}")
     end
 
@@ -1531,7 +1585,7 @@ defmodule ClaudeNotify.TelegramPoller do
 
           job ->
             text = MessageFormatter.transcript_message(job, transcript)
-            state.telegram.edit_message_text(watch.message_id, text)
+            state.telegram.edit_message_text_with_retry(watch.message_id, text)
         end
 
         %{state | watches: Map.delete(state.watches, job_id)}
@@ -1583,7 +1637,7 @@ defmodule ClaudeNotify.TelegramPoller do
       job ->
         entries = JobTranscript.transcript(state.job_transcript, job_id)
         text = MessageFormatter.transcript_message(job, entries)
-        state.telegram.edit_message_text(watch.message_id, text)
+        state.telegram.edit_message_text_with_retry(watch.message_id, text)
     end
   end
 
@@ -1599,7 +1653,7 @@ defmodule ClaudeNotify.TelegramPoller do
   # the caller doesn't know (and shouldn't need to reconstruct) whatever
   # progress text is currently displayed there.
   defp set_activity_button(state, %{telegram_message_ids: [message_id | _]}, label, data) do
-    state.telegram.edit_message_reply_markup(message_id, [[label, data]])
+    state.telegram.edit_message_reply_markup_with_retry(message_id, [[label, data]])
   end
 
   defp set_activity_button(_state, _job, _label, _data), do: :ok

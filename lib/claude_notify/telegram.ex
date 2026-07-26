@@ -121,6 +121,32 @@ defmodule ClaudeNotify.Telegram do
     retry_429(fn -> edit_message_text(message_id, text) end, retries, "edit")
   end
 
+  @doc """
+  Edits a message's text and inline keyboard together, with automatic
+  retry on 429 responses - the buttons-carrying counterpart to
+  `edit_message_text_with_retry/3`.
+  """
+  def edit_message_text_with_buttons_with_retry(
+        message_id,
+        text,
+        buttons,
+        retries \\ @max_retries
+      ) do
+    retry_429(
+      fn -> edit_message_text_with_buttons(message_id, text, buttons) end,
+      retries,
+      "edit"
+    )
+  end
+
+  @doc """
+  Edits only a message's inline keyboard, with automatic retry on 429
+  responses - the retry-safe counterpart to `edit_message_reply_markup/2`.
+  """
+  def edit_message_reply_markup_with_retry(message_id, buttons, retries \\ @max_retries) do
+    retry_429(fn -> edit_message_reply_markup(message_id, buttons) end, retries, "edit")
+  end
+
   defp retry_429(fun, retries, label \\ "send") do
     case fun.() do
       {:error, {429, body}} when retries > 0 ->
