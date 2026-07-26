@@ -26,6 +26,35 @@ defmodule ClaudeNotify.Engine.Fixture do
   defdelegate parse_event(line), to: ClaudeNotify.Engine.Claude
 end
 
+defmodule ClaudeNotify.Engine.SessionEventFixture do
+  @moduledoc """
+  Test-only `ClaudeNotify.Engine` implementation whose `parse_event/1`
+  reports a session id via the dedicated `{:session, id}` event (a plain
+  `"SESSION:<id>"` line) rather than folding it into a `:result` event, to
+  prove `JobRunner` stores a session id reported either way. See
+  `ClaudeNotify.Engine.Codex`, whose `thread.started` uses `:session` for
+  the same reason: it reports identity before it knows the run's outcome.
+  """
+
+  @behaviour ClaudeNotify.Engine
+
+  @impl true
+  def build_command(prompt, opts) do
+    script = Keyword.fetch!(opts, :script)
+    {script, [prompt]}
+  end
+
+  @impl true
+  def resume_command(session_id, prompt, opts) do
+    {cmd, args} = build_command(prompt, opts)
+    {cmd, ["--resume", session_id | args]}
+  end
+
+  @impl true
+  def parse_event("SESSION:" <> session_id), do: {:ok, {:session, session_id}}
+  def parse_event(_line), do: :ignore
+end
+
 defmodule ClaudeNotify.JobRunnerTest do
   use ExUnit.Case, async: false
 
@@ -304,6 +333,31 @@ defmodule ClaudeNotify.JobRunnerTest do
 
       final = wait_for_status(store, job.id, :failed)
       assert final.status == :failed
+    end
+
+    test "a {:session, id} event (not carried by a :result) stores the session id too", %{
+      repo_path: repo_path,
+      store: store,
+      tmp_dir: tmp_dir
+    } do
+      script = Path.join(tmp_dir, "session_event_fixture.sh")
+
+      File.write!(script, """
+      #!/usr/bin/env bash
+      echo "SESSION:session-event-fixture-1"
+      echo "some other line the fixture engine ignores"
+      exit 0
+      """)
+
+      File.chmod!(script, 0o755)
+
+      {:ok, job} = JobStore.create(store, job_attrs())
+      {:ok, _} = JobStore.update_status(store, job.id, :running, %{})
+
+      start_runner(job, repo_path, script, job_store: store, engine: Engine.SessionEventFixture)
+
+      final = wait_for_status(store, job.id, :completed)
+      assert final.engine_session_id == "session-event-fixture-1"
     end
   end
 
