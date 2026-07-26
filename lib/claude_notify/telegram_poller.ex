@@ -80,6 +80,29 @@ defmodule ClaudeNotify.TelegramPoller do
   @known_engines ["claude", "codex"]
   @max_retry_delay 15_000
 
+  # Single source of truth for the bot's command surface: both
+  # `register_bot_commands/1` (Telegram's native "/" menu, via
+  # `Telegram.set_my_commands/2`) and `send_help/1` (the `/help` text) render
+  # from this list, so the two can't drift out of sync. Mirrors the command
+  # table in README.md - keep both in step when a command's behavior changes.
+  #
+  # `/cancel` has dual behavior (bare = session escape, with a job id =
+  # dispatcher job cancel - see the "Job commands" moduledoc section above);
+  # Telegram only allows one description per command name, so its entry
+  # covers both briefly instead of getting two menu rows.
+  @bot_commands [
+    {"sessions", "List and select active sessions"},
+    {"approve", "Send Yes to the selected session"},
+    {"cancel", "Send Escape to the selected session, or cancel a job by id"},
+    {"dashboard", "Show live session dashboard"},
+    {"run", "Launch a dispatcher job: [claude|codex] <project> <prompt>"},
+    {"jobs", "List known dispatcher jobs and their status"},
+    {"projects", "List registered dispatcher projects"},
+    {"watch", "Watch a dispatcher job's live transcript"},
+    {"unwatch", "Stop watching a dispatcher job"},
+    {"help", "Show available commands"}
+  ]
+
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
@@ -116,7 +139,7 @@ defmodule ClaudeNotify.TelegramPoller do
 
   @impl true
   def handle_info(:register_commands, state) do
-    case register_bot_commands() do
+    case register_bot_commands(state.telegram) do
       {:ok, _} ->
         :ok
 
@@ -219,6 +242,13 @@ defmodule ClaudeNotify.TelegramPoller do
   end
 
   def handle_update(_update, state), do: state
+
+  # Public (but undocumented) for the same reason handle_update/2 above is:
+  # lets tests assert register_bot_commands/1 and send_help/1 both render
+  # from this exact list without duplicating it or reaching into a private
+  # module attribute.
+  @doc false
+  def bot_commands, do: @bot_commands
 
   # --- Callback query handling (button presses) ---
 
@@ -906,30 +936,23 @@ defmodule ClaudeNotify.TelegramPoller do
   end
 
   defp send_help(chat_id) do
+    command_lines =
+      Enum.map(@bot_commands, fn {command, description} ->
+        MessageFormatter.escape_full("/#{command} - #{description}")
+      end)
+
     text =
-      [
-        "*Commands*",
-        "",
-        MessageFormatter.escape_full("/sessions - List and select active sessions"),
-        MessageFormatter.escape_full("/approve - Send Yes to selected session"),
-        MessageFormatter.escape_full("/cancel - Send Escape to selected session"),
-        MessageFormatter.escape_full("/dashboard - Show live session dashboard"),
-        MessageFormatter.escape_full("/run [claude|codex] <project> <prompt> - launch a job"),
-        MessageFormatter.escape_full("/jobs - List jobs"),
-        MessageFormatter.escape_full("/cancel <id> - Cancel a job"),
-        MessageFormatter.escape_full("/projects - List registered projects"),
-        MessageFormatter.escape_full("/watch <id> - Watch a job's live transcript"),
-        MessageFormatter.escape_full("/unwatch <id> - Stop watching a job"),
-        MessageFormatter.escape_full("/status - Show pairing and active session count"),
-        MessageFormatter.escape_full("/help - Show this help"),
-        "",
-        MessageFormatter.escape_full("Reply to any message to send text to that session."),
-        MessageFormatter.escape_full("Reply to a job's message to resume it."),
-        MessageFormatter.escape_full(
-          "Send a photo or document to save it locally — the bot replies with the path so you can ask Claude to read it."
-        ),
-        MessageFormatter.escape_full("If only one session is active, it's auto-selected.")
-      ]
+      (["*Commands*", ""] ++
+         command_lines ++
+         [
+           "",
+           MessageFormatter.escape_full("Reply to any message to send text to that session."),
+           MessageFormatter.escape_full("Reply to a job's message to resume it."),
+           MessageFormatter.escape_full(
+             "Send a photo or document to save it locally — the bot replies with the path so you can ask Claude to read it."
+           ),
+           MessageFormatter.escape_full("If only one session is active, it's auto-selected.")
+         ])
       |> Enum.join("\n")
 
     body = %{chat_id: chat_id, text: text, parse_mode: "MarkdownV2"}
@@ -1760,16 +1783,13 @@ defmodule ClaudeNotify.TelegramPoller do
     Telegram.api_post_public("sendMessage", body)
   end
 
-  defp register_bot_commands do
-    Telegram.set_my_commands([
-      %{command: "start", description: "What this bot does"},
-      %{command: "help", description: "List commands"},
-      %{command: "status", description: "Pairing and active session count"},
-      %{command: "sessions", description: "List and select sessions"},
-      %{command: "dashboard", description: "Show live session dashboard"},
-      %{command: "approve", description: "Send Yes to selected session"},
-      %{command: "cancel", description: "Send Escape to selected session"}
-    ])
+  defp register_bot_commands(telegram) do
+    commands =
+      Enum.map(@bot_commands, fn {command, description} ->
+        %{command: command, description: description}
+      end)
+
+    telegram.set_my_commands(commands)
   end
 
   # --- Helpers ---
