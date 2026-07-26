@@ -203,6 +203,13 @@ defmodule ClaudeNotify.MessageFormatter do
 
   @doc """
   Format a git diff summary message. Returns nil for empty/nil input.
+
+  Never truncates: the full diff is wrapped in a fenced pre block, however
+  large. Splitting oversized output into multiple Telegram messages is the
+  sending layer's job (see `ClaudeNotify.Telegram.chunk/2`, used by
+  `send_message_with_retry/2`) - silently cutting the diff here would hide
+  real changes from the "Show diff" button instead of showing all of them
+  across more than one message.
   """
   def diff_summary(nil), do: nil
   def diff_summary(""), do: nil
@@ -213,15 +220,8 @@ defmodule ClaudeNotify.MessageFormatter do
   end
 
   defp format_diff(diff_text) do
-    if byte_size(diff_text) > @max_diff_chars do
-      stat_line = diff_text |> String.split("\n") |> Enum.take(3) |> Enum.join("\n")
-      safe = escape_pre(String.slice(stat_line, 0, @max_diff_chars))
-
-      "📋 *Changes since last checkpoint*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n```\n#{safe}\n```\n\n_Diff too large, showing summary only_"
-    else
-      safe = escape_pre(diff_text)
-      "📋 *Changes since last checkpoint*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n```\n#{safe}\n```"
-    end
+    safe = pre_block_full(diff_text)
+    "📋 *Changes since last checkpoint*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n#{safe}"
   end
 
   defp format_current_tool(nil, _), do: nil
@@ -276,10 +276,13 @@ defmodule ClaudeNotify.MessageFormatter do
 
   @doc """
   Format raw job output/error text for the "Show output" button, using the
-  same pre-block convention as `diff_summary/1`. Returns a placeholder
-  (never nil) since this always renders as its own standalone message.
+  same pre-block convention as `diff_summary/1` - unbounded, like
+  `diff_summary/1`, so the sending layer's chunking (not this function)
+  decides how a long error tail is split across messages. Returns a
+  placeholder (never nil) since this always renders as its own standalone
+  message.
   """
-  def job_output_block(text), do: pre_block(text) || escape("No output captured.")
+  def job_output_block(text), do: pre_block_full(text) || escape("No output captured.")
 
   @doc """
   Format the reply for watching an already-terminal job whose transcript
@@ -404,6 +407,20 @@ defmodule ClaudeNotify.MessageFormatter do
 
   defp pre_block(text) when is_binary(text) do
     safe = text |> truncate(@max_diff_chars) |> escape_pre()
+    "```\n#{safe}\n```"
+  end
+
+  # Same fenced-pre-block rendering as `pre_block/1`, but without its
+  # `@max_diff_chars` cap - for content whose length is bounded by the
+  # sending layer's chunking instead of by this formatter (`diff_summary/1`,
+  # `job_output_block/1`). `pre_block/1` itself stays capped: it backs
+  # `job_completed/3`/`job_failed/2`, which are edited in place alongside
+  # buttons - a single Telegram message that can't be split into chunks.
+  defp pre_block_full(nil), do: nil
+  defp pre_block_full(""), do: nil
+
+  defp pre_block_full(text) when is_binary(text) do
+    safe = escape_pre(text)
     "```\n#{safe}\n```"
   end
 

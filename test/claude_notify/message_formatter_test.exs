@@ -65,11 +65,12 @@ defmodule ClaudeNotify.MessageFormatterTest do
     assert message =~ "new line"
   end
 
-  test "diff_summary truncates large diffs" do
+  test "diff_summary never truncates - splitting oversized diffs into multiple messages is the sending layer's job" do
     huge_diff = String.duplicate("+ added line\n", 500)
     message = MessageFormatter.diff_summary(huge_diff)
-    assert byte_size(message) <= 4096
-    assert message =~ "Diff too large"
+    assert byte_size(message) > 4096
+    assert message =~ String.trim_trailing(huge_diff)
+    refute message =~ "Diff too large"
   end
 
   test "diff_summary returns nil for empty diff" do
@@ -304,6 +305,77 @@ defmodule ClaudeNotify.MessageFormatterTest do
     assert message =~ "NEWESTMARKER"
     assert message =~ "truncated"
     refute message =~ "OLDESTMARKER"
+  end
+
+  # Hostile-content escaping for the job/watch rich cards (story #241).
+  #
+  # Two different escaping rules apply depending on where content lands:
+  # outside a MarkdownV2 entity (headers, summaries, tool/file names) every
+  # special character in `escape/1`'s list must be backslash-escaped, but
+  # INSIDE a fenced ``` pre block (diffstat/error/diff/transcript-diff
+  # content) only backtick and backslash need it - Telegram treats
+  # everything else in a code span/block literally. Getting this wrong in
+  # either direction either breaks Telegram's parser (`can't parse
+  # entities`) or double-escapes/mangles legitimate code content.
+  describe "hostile content escaping (story #241 rich cards)" do
+    @hostile_job %{id: 9, project: "trainer_*app*", engine: "claude[v2]"}
+
+    test "job_completed fully escapes the header/summary but only backtick/backslash inside the diffstat's pre block" do
+      diffstat = "-old`code`\n+new_code(v2)"
+      summary = "Fixed the *login* bug in [auth].ex!"
+
+      message = MessageFormatter.job_completed(@hostile_job, diffstat, summary)
+
+      assert message =~ "trainer\\_\\*app\\*"
+      assert message =~ "claude\\[v2\\]"
+      assert message =~ "Fixed the \\*login\\* bug in \\[auth\\]\\.ex\\!"
+      assert message =~ "```\n-old\\`code\\`\n+new_code(v2)\n```"
+    end
+
+    test "job_failed fully escapes the header but only backtick/backslash inside the error pre block" do
+      error_text = "panic: nil.foo() at `lib/bar.ex:10` [uncaught]"
+
+      message = MessageFormatter.job_failed(@hostile_job, error_text)
+
+      assert message =~ "trainer\\_\\*app\\*"
+      assert message =~ "```\npanic: nil.foo() at \\`lib/bar.ex:10\\` [uncaught]\n```"
+    end
+
+    test "job_output_block escapes only backtick/backslash, preserving every other metacharacter literally, never truncated" do
+      hostile =
+        "line1 with * and _ and [brackets]\nline2 with a `backtick` and a \\backslash"
+
+      message = MessageFormatter.job_output_block(hostile)
+
+      assert message =~ "```"
+      assert message =~ "line1 with * and _ and [brackets]"
+      assert message =~ "\\`backtick\\`"
+      assert message =~ "\\\\backslash"
+    end
+
+    test "diff_summary escapes only backtick/backslash inside its pre block, never truncated" do
+      hostile_diff = "-old\n+new `code` with *stars* and [brackets] and a \\backslash"
+      message = MessageFormatter.diff_summary(hostile_diff)
+
+      assert message =~ "```"
+      assert message =~ "+new \\`code\\` with *stars* and [brackets] and a \\\\backslash"
+    end
+
+    test "transcript_message escapes hostile tool names/file paths outside entities, and hostile diffs only backtick/backslash inside their pre block" do
+      entry = %{
+        type: :tool_use,
+        name: "Edit[v2]",
+        file_path: "lib/foo_bar.ex",
+        diff: "-old `code`\n+new_code",
+        at: 1
+      }
+
+      message = MessageFormatter.transcript_message(@hostile_job, [entry])
+
+      assert message =~ "Edit\\[v2\\]"
+      assert message =~ "foo\\_bar\\.ex"
+      assert message =~ "```\n-old \\`code\\`\n+new_code\n```"
+    end
   end
 
   describe "notification_truncated?/1" do
