@@ -4,7 +4,7 @@ defmodule ClaudeNotify.SessionStore do
   @stale_interval :timer.minutes(30)
   @stale_threshold :timer.hours(2)
 
-  defstruct sessions: %{}, message_map: %{}
+  defstruct sessions: %{}, message_map: %{}, notification_text: %{}
 
   # Client API
 
@@ -53,6 +53,18 @@ defmodule ClaudeNotify.SessionStore do
 
   def lookup_session_by_message(message_id) do
     GenServer.call(__MODULE__, {:lookup_message, message_id})
+  end
+
+  @doc """
+  Records the full notification text against a message_id, used by the
+  See more button to expand truncated permission prompts back to full size.
+  """
+  def register_notification_text(message_id, full_text) do
+    GenServer.cast(__MODULE__, {:register_notification_text, message_id, full_text})
+  end
+
+  def get_notification_text(message_id) do
+    GenServer.call(__MODULE__, {:get_notification_text, message_id})
   end
 
   def clear do
@@ -189,15 +201,19 @@ defmodule ClaudeNotify.SessionStore do
             last_activity: now
           })
 
-        cleaned_messages =
+        owned_mids =
           state.message_map
-          |> Enum.reject(fn {_mid, sid} -> sid == session_id end)
-          |> Map.new()
+          |> Enum.filter(fn {_mid, sid} -> sid == session_id end)
+          |> Enum.map(fn {mid, _sid} -> mid end)
+
+        cleaned_messages = Map.drop(state.message_map, owned_mids)
+        cleaned_notif_text = Map.drop(state.notification_text, owned_mids)
 
         new_state = %{
           state
           | sessions: Map.delete(state.sessions, session_id),
-            message_map: cleaned_messages
+            message_map: cleaned_messages,
+            notification_text: cleaned_notif_text
         }
 
         {:reply, {:stopped, session}, new_state}
@@ -233,6 +249,11 @@ defmodule ClaudeNotify.SessionStore do
   end
 
   @impl true
+  def handle_call({:get_notification_text, message_id}, _from, state) do
+    {:reply, Map.get(state.notification_text, message_id), state}
+  end
+
+  @impl true
   def handle_call(:clear, _from, _state) do
     {:reply, :ok, %__MODULE__{}}
   end
@@ -240,6 +261,12 @@ defmodule ClaudeNotify.SessionStore do
   @impl true
   def handle_cast({:register_message, message_id, session_id}, state) do
     {:noreply, %{state | message_map: Map.put(state.message_map, message_id, session_id)}}
+  end
+
+  @impl true
+  def handle_cast({:register_notification_text, message_id, full_text}, state) do
+    {:noreply,
+     %{state | notification_text: Map.put(state.notification_text, message_id, full_text)}}
   end
 
   @impl true

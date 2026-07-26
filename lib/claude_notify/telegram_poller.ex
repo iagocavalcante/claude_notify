@@ -77,8 +77,8 @@ defmodule ClaudeNotify.TelegramPoller do
   alias ClaudeNotify.WorktreeManager.Worktree
 
   @poll_timeout 30
-  @retry_delay 5_000
   @known_engines ["claude", "codex"]
+  @max_retry_delay 15_000
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -87,6 +87,8 @@ defmodule ClaudeNotify.TelegramPoller do
   @impl true
   def init(opts) do
     Logger.info("TelegramPoller: starting with long polling")
+    pid_file = ensure_pid_lock()
+    send(self(), :register_commands)
     send(self(), :poll)
 
     {:ok,
@@ -99,29 +101,49 @@ defmodule ClaudeNotify.TelegramPoller do
        project_registry: Keyword.get(opts, :project_registry),
        job_launch_opts: Keyword.get(opts, :job_launch_opts, []),
        cmd_runner: Keyword.get(opts, :cmd_runner, &default_cmd_runner/3),
-       watches: %{}
+       watches: %{},
+       attempt: 0,
+       pid_file: pid_file
      }}
   end
 
   @impl true
+  def terminate(reason, state) do
+    Logger.info("TelegramPoller: terminating (#{inspect(reason)})")
+    release_pid_lock(state[:pid_file])
+    :ok
+  end
+
+  @impl true
+  def handle_info(:register_commands, state) do
+    case register_bot_commands() do
+      {:ok, _} ->
+        :ok
+
+      other ->
+        Logger.warning("TelegramPoller: setMyCommands failed: #{inspect(other)}")
+    end
+
+    {:noreply, state}
+  end
+
   def handle_info(:poll, state) do
     case Telegram.get_updates(state.offset, @poll_timeout) do
       {:ok, []} ->
         send(self(), :poll)
-        {:noreply, state}
+        {:noreply, %{state | attempt: 0}}
 
       {:ok, updates} ->
         {new_offset, new_state} = process_updates(updates, state)
         send(self(), :poll)
-        {:noreply, %{new_state | offset: new_offset}}
+        {:noreply, %{new_state | offset: new_offset, attempt: 0}}
 
       {:error, reason} ->
-        Logger.warning(
-          "TelegramPoller: poll failed: #{inspect(reason)}, retrying in #{@retry_delay}ms"
-        )
-
-        Process.send_after(self(), :poll, @retry_delay)
-        {:noreply, state}
+        attempt = state.attempt + 1
+        delay = min(1_000 * attempt, @max_retry_delay)
+        log_poll_error(reason, attempt, delay)
+        Process.send_after(self(), :poll, delay)
+        {:noreply, %{state | attempt: attempt}}
     end
   end
 
@@ -153,6 +175,28 @@ defmodule ClaudeNotify.TelegramPoller do
     {:noreply, flush_watch(state, job_id)}
   end
 
+  defp log_poll_error({409, _body}, attempt, delay), do: log_409(attempt, delay)
+
+  defp log_poll_error(reason, attempt, delay) do
+    Logger.warning(
+      "TelegramPoller: poll failed: #{inspect(reason)}, " <>
+        "attempt #{attempt}, retrying in #{div(delay, 1_000)}s"
+    )
+  end
+
+  defp log_409(attempt, delay) do
+    hint =
+      if attempt == 1,
+        do:
+          " — another poller is holding the bot token (zombie session, or a second instance running?)",
+        else: ""
+
+    Logger.warning(
+      "TelegramPoller: 409 Conflict#{hint}. " <>
+        "attempt #{attempt}, retrying in #{div(delay, 1_000)}s"
+    )
+  end
+
   defp process_updates(updates, state) do
     Enum.reduce(updates, {state.offset, state}, fn update, {max_offset, acc_state} ->
       update_id = update["update_id"]
@@ -182,6 +226,7 @@ defmodule ClaudeNotify.TelegramPoller do
     callback_id = callback_query["id"]
     data = callback_query["data"]
     chat_id = get_in(callback_query, ["message", "chat", "id"])
+    message_id = get_in(callback_query, ["message", "message_id"])
 
     if not authorized_chat?(chat_id) do
       Logger.warning(
@@ -203,6 +248,10 @@ defmodule ClaudeNotify.TelegramPoller do
         {:dash_refresh} ->
           Telegram.answer_callback_query(callback_id, "Refreshing...")
           Dashboard.refresh()
+          state
+
+        {:see_more, session_id} ->
+          handle_see_more(callback_id, message_id, session_id)
           state
 
         {:response, session_id, response} ->
@@ -241,6 +290,41 @@ defmodule ClaudeNotify.TelegramPoller do
     end
   end
 
+  defp handle_see_more(callback_id, message_id, session_id) do
+    case message_id && SessionStore.get_notification_text(message_id) do
+      nil ->
+        Telegram.answer_callback_query(callback_id, "Full text no longer available")
+
+      full_text ->
+        # Re-render with the original action buttons (no See more this time).
+        buttons =
+          [
+            ["Yes", "#{session_id}:yes"],
+            ["Yes (don't ask)", "#{session_id}:yes_dont_ask"],
+            ["No", "#{session_id}:no"],
+            ["Esc", "#{session_id}:escape"]
+          ]
+          |> Enum.map(fn [label, data] -> %{text: label, callback_data: data} end)
+
+        body = %{
+          chat_id: Application.get_env(:claude_notify, :telegram_chat_id),
+          message_id: message_id,
+          text: full_text,
+          parse_mode: "MarkdownV2",
+          reply_markup: %{inline_keyboard: [buttons]}
+        }
+
+        case Telegram.api_post_public("editMessageText", body) do
+          {:ok, _} ->
+            Telegram.answer_callback_query(callback_id, "Expanded")
+
+          other ->
+            Logger.warning("TelegramPoller: See more edit failed: #{inspect(other)}")
+            Telegram.answer_callback_query(callback_id, "Edit failed")
+        end
+    end
+  end
+
   # --- Text message handling ---
 
   defp handle_message(message, state) do
@@ -255,26 +339,48 @@ defmodule ClaudeNotify.TelegramPoller do
 
       state
     else
+      acknowledge_inbound(chat_id, message)
+
       case message do
         %{"text" => text, "reply_to_message" => %{"message_id" => reply_mid}}
         when is_binary(text) and text != "" ->
           handle_reply_to(chat_id, String.trim(text), reply_mid, state)
 
-        %{"text" => nil} ->
-          Telegram.send_message(
-            MessageFormatter.escape_full(
-              "Only text messages are supported. Use /help for commands."
-            )
-          )
+        %{"photo" => photos} when is_list(photos) and photos != [] ->
+          handle_photo(chat_id, message, state)
 
-          state
+        %{"document" => doc} when is_map(doc) ->
+          handle_document(chat_id, message, state)
 
         %{"text" => text} when is_binary(text) ->
           handle_text_command(chat_id, text, state)
 
         _ ->
+          Telegram.send_message(
+            MessageFormatter.escape_full(
+              "Unsupported message type. Send text, photos, or documents."
+            )
+          )
+
           state
       end
+    end
+  end
+
+  # Fires typing indicator + optional ack reaction on every gated inbound
+  # message. Telegram displays "typing…" for ~5s or until our next message.
+  defp acknowledge_inbound(chat_id, message) do
+    Telegram.send_chat_action(chat_id, "typing")
+
+    case Application.get_env(:claude_notify, :telegram_ack_reaction) do
+      emoji when is_binary(emoji) and emoji != "" ->
+        case message["message_id"] do
+          mid when is_integer(mid) -> Telegram.set_message_reaction(mid, emoji)
+          _ -> :ok
+        end
+
+      _ ->
+        :ok
     end
   end
 
@@ -288,17 +394,18 @@ defmodule ClaudeNotify.TelegramPoller do
         session = SessionStore.get_session(session_id)
 
         if session do
-          tty_path = session[:tty_path]
-          project = Path.basename(session[:working_dir] || "unknown")
+          case shortcut_response(text) do
+            nil ->
+              inject_reply_text(text, session)
 
-          case TerminalInjector.send_text(tty_path, text) do
-            :ok ->
-              Telegram.send_message(MessageFormatter.escape_full("✓ Sent to #{project}"))
+            response ->
+              inject_response(session_id, response)
 
-            {:error, reason} ->
-              Logger.warning("TelegramPoller: reply inject failed: #{inspect(reason)}")
+              short = String.slice(session_id, 0, 8)
 
-              Telegram.send_message(MessageFormatter.escape_full("Failed to send to #{project}"))
+              Telegram.send_message(
+                MessageFormatter.escape_full("#{response_label(response)} (#{short})")
+              )
           end
 
           state
@@ -381,6 +488,163 @@ defmodule ClaudeNotify.TelegramPoller do
     state
   end
 
+  defp inject_reply_text(text, session) do
+    tty_path = session[:tty_path]
+    project = Path.basename(session[:working_dir] || "unknown")
+
+    case TerminalInjector.send_text(tty_path, text) do
+      :ok ->
+        Telegram.send_message(MessageFormatter.escape_full("✓ Sent to #{project}"))
+
+      {:error, reason} ->
+        Logger.warning("TelegramPoller: reply inject failed: #{inspect(reason)}")
+        Telegram.send_message(MessageFormatter.escape_full("Failed to send to #{project}"))
+    end
+  end
+
+  # Maps a reply text to a button-equivalent response code, or nil for free text.
+  # Recognized: yes/y/approve, no/n/deny, esc/escape/cancel, yes!/yda (don't ask),
+  # and bare numerics 1-9 for numbered options. Match is case-insensitive after
+  # trimming whitespace.
+  @doc false
+  def shortcut_response(text) when is_binary(text) do
+    case text |> String.trim() |> String.downcase() do
+      v when v in ~w(y yes approve ok) -> "yes"
+      v when v in ~w(yes! yda) -> "yes_dont_ask"
+      v when v in ~w(n no deny) -> "no"
+      v when v in ~w(esc escape cancel quit) -> "escape"
+      <<digit>> when digit in ?1..?9 -> "opt_#{<<digit>>}"
+      _ -> nil
+    end
+  end
+
+  def shortcut_response(_), do: nil
+
+  # --- Attachment handling ---
+  #
+  # Telegram caps bot downloads at 20MB. We save to ~/.claude_notify/inbox/
+  # and reply with the local path, so the user can ask Claude to read it.
+  # We deliberately don't auto-inject — the user knows what they want Claude
+  # to do with the file.
+
+  defp handle_photo(chat_id, message, state) do
+    photos = message["photo"] || []
+    # Last element is the largest size.
+    case List.last(photos) do
+      %{"file_id" => file_id, "file_unique_id" => unique} ->
+        case download_attachment(file_id, unique, "jpg") do
+          {:ok, path} ->
+            send_inbox_reply(chat_id, path, message["caption"])
+
+          {:error, reason} ->
+            Logger.warning("TelegramPoller: photo download failed: #{inspect(reason)}")
+
+            Telegram.send_message(
+              MessageFormatter.escape_full("Failed to download photo: #{inspect(reason)}")
+            )
+        end
+
+      _ ->
+        :ok
+    end
+
+    state
+  end
+
+  defp handle_document(chat_id, message, state) do
+    case message["document"] do
+      %{"file_id" => file_id} = doc ->
+        unique = doc["file_unique_id"] || "dl"
+        ext = ext_from_filename(doc["file_name"]) || "bin"
+
+        case download_attachment(file_id, unique, ext) do
+          {:ok, path} ->
+            send_inbox_reply(chat_id, path, message["caption"])
+
+          {:error, reason} ->
+            Logger.warning("TelegramPoller: document download failed: #{inspect(reason)}")
+
+            Telegram.send_message(
+              MessageFormatter.escape_full("Failed to download document: #{inspect(reason)}")
+            )
+        end
+
+      _ ->
+        :ok
+    end
+
+    state
+  end
+
+  defp download_attachment(file_id, unique_id, fallback_ext) do
+    with {:ok, %{"file_path" => remote_path}} <- Telegram.get_file(file_id),
+         {:ok, body} <- Telegram.download_file(remote_path) do
+      ext = ext_from_remote_path(remote_path) || sanitize_segment(fallback_ext) || "bin"
+      safe_unique = sanitize_segment(unique_id) || "dl"
+      filename = "#{System.system_time(:millisecond)}-#{safe_unique}.#{ext}"
+      path = Path.join(inbox_dir(), filename)
+      File.mkdir_p!(inbox_dir())
+      File.write!(path, body)
+      {:ok, path}
+    end
+  end
+
+  defp send_inbox_reply(chat_id, path, caption) do
+    caption_line =
+      case caption do
+        c when is_binary(c) and c != "" ->
+          "\n\nCaption: #{MessageFormatter.escape_full(c)}"
+
+        _ ->
+          ""
+      end
+
+    text =
+      "📎 *Saved attachment*\n\n" <>
+        "Path: `#{MessageFormatter.escape_code_public(path)}`" <>
+        caption_line <>
+        "\n\n" <>
+        MessageFormatter.escape_full(
+          "Reply to a session message asking Claude to read this path."
+        )
+
+    body = %{chat_id: chat_id, text: text, parse_mode: "MarkdownV2"}
+    Telegram.api_post_public("sendMessage", body)
+  end
+
+  defp inbox_dir do
+    Application.get_env(:claude_notify, :inbox_dir) ||
+      Path.expand("~/.claude_notify/inbox")
+  end
+
+  defp ext_from_filename(name) when is_binary(name) do
+    case Path.extname(name) do
+      "" -> nil
+      "." <> ext -> sanitize_segment(ext)
+    end
+  end
+
+  defp ext_from_filename(_), do: nil
+
+  defp ext_from_remote_path(path) when is_binary(path) do
+    case Path.extname(path) do
+      "" -> nil
+      "." <> ext -> sanitize_segment(ext)
+    end
+  end
+
+  defp ext_from_remote_path(_), do: nil
+
+  # Strips anything that isn't a-z, A-Z, 0-9, _, -. Returns nil for empty strings.
+  defp sanitize_segment(nil), do: nil
+
+  defp sanitize_segment(segment) when is_binary(segment) do
+    case Regex.replace(~r/[^a-zA-Z0-9_-]/, segment, "") do
+      "" -> nil
+      clean -> clean
+    end
+  end
+
   defp handle_text_command(chat_id, text, state) do
     trimmed = String.trim(text)
 
@@ -446,6 +710,14 @@ defmodule ClaudeNotify.TelegramPoller do
             state.telegram.send_message(MessageFormatter.escape_full("Usage: /unwatch <job id>"))
             state
         end
+
+      String.starts_with?(trimmed, "/start") ->
+        send_start(chat_id)
+        state
+
+      String.starts_with?(trimmed, "/status") ->
+        send_status(chat_id, state)
+        state
 
       String.starts_with?(trimmed, "/help") ->
         send_help(chat_id)
@@ -642,10 +914,14 @@ defmodule ClaudeNotify.TelegramPoller do
         MessageFormatter.escape_full("/projects - List registered projects"),
         MessageFormatter.escape_full("/watch <id> - Watch a job's live transcript"),
         MessageFormatter.escape_full("/unwatch <id> - Stop watching a job"),
+        MessageFormatter.escape_full("/status - Show pairing and active session count"),
         MessageFormatter.escape_full("/help - Show this help"),
         "",
         MessageFormatter.escape_full("Reply to any message to send text to that session."),
         MessageFormatter.escape_full("Reply to a job's message to resume it."),
+        MessageFormatter.escape_full(
+          "Send a photo or document to save it locally — the bot replies with the path so you can ask Claude to read it."
+        ),
         MessageFormatter.escape_full("If only one session is active, it's auto-selected.")
       ]
       |> Enum.join("\n")
@@ -1375,6 +1651,73 @@ defmodule ClaudeNotify.TelegramPoller do
     System.cmd(cmd, args, cd: cwd, stderr_to_stdout: true)
   end
 
+  defp send_start(chat_id) do
+    text =
+      [
+        "*Claude Notify*",
+        "",
+        MessageFormatter.escape_full(
+          "This bot bridges Claude Code hooks to Telegram. You'll get notifications when sessions need input, finish, or error out — and you can reply here to control them."
+        ),
+        "",
+        MessageFormatter.escape_full(
+          "Reply to any notification to type into that Claude session. Tap inline buttons to approve/deny prompts."
+        ),
+        "",
+        MessageFormatter.escape_full("Type /help for commands.")
+      ]
+      |> Enum.join("\n")
+
+    body = %{chat_id: chat_id, text: text, parse_mode: "MarkdownV2"}
+    Telegram.api_post_public("sendMessage", body)
+  end
+
+  defp send_status(chat_id, state) do
+    active =
+      SessionStore.all_sessions()
+      |> Enum.reject(fn {id, _} -> id == "unknown" end)
+      |> length()
+
+    selected = Map.get(state.selected_sessions, chat_id)
+
+    selected_line =
+      case selected && SessionStore.get_session(selected) do
+        nil ->
+          MessageFormatter.escape_full("Selected session: none")
+
+        session ->
+          project = Path.basename(session[:working_dir] || "unknown")
+          short = String.slice(selected, 0, 8)
+
+          "Selected: `#{MessageFormatter.escape_code_public(project)}` \\(`#{MessageFormatter.escape_code_public(short)}`\\)"
+      end
+
+    text =
+      [
+        "*Status*",
+        "",
+        MessageFormatter.escape_full("Authorized: yes"),
+        MessageFormatter.escape_full("Active sessions: #{active}"),
+        selected_line
+      ]
+      |> Enum.join("\n")
+
+    body = %{chat_id: chat_id, text: text, parse_mode: "MarkdownV2"}
+    Telegram.api_post_public("sendMessage", body)
+  end
+
+  defp register_bot_commands do
+    Telegram.set_my_commands([
+      %{command: "start", description: "What this bot does"},
+      %{command: "help", description: "List commands"},
+      %{command: "status", description: "Pairing and active session count"},
+      %{command: "sessions", description: "List and select sessions"},
+      %{command: "dashboard", description: "Show live session dashboard"},
+      %{command: "approve", description: "Send Yes to selected session"},
+      %{command: "cancel", description: "Send Escape to selected session"}
+    ])
+  end
+
   # --- Helpers ---
 
   defp parse_callback_data("dash:refresh"), do: {:dash_refresh}
@@ -1389,6 +1732,9 @@ defmodule ClaudeNotify.TelegramPoller do
     case String.split(data, ":", parts: 2) do
       ["select", session_id] when session_id != "" ->
         {:select, session_id}
+
+      ["more", session_id] when session_id != "" ->
+        {:see_more, session_id}
 
       [session_id, response] when session_id != "" and response != "" ->
         {:response, session_id, response}
@@ -1444,5 +1790,76 @@ defmodule ClaudeNotify.TelegramPoller do
   def authorized_chat?(chat_id) do
     configured = Application.get_env(:claude_notify, :telegram_chat_id)
     to_string(chat_id) == to_string(configured)
+  end
+
+  # --- PID file lock ---
+  #
+  # Telegram allows exactly one getUpdates consumer per token. If a previous
+  # BEAM crashed (terminal closed, SIGKILL) while polling, its long-poll
+  # request can keep the slot held until Telegram times it out. Recording our
+  # OS pid here lets a fresh start detect that case and ask the stale process
+  # to release the slot.
+
+  defp ensure_pid_lock do
+    case pid_file_path() do
+      nil ->
+        nil
+
+      path ->
+        File.mkdir_p!(Path.dirname(path))
+        File.chmod(Path.dirname(path), 0o700)
+        maybe_evict_stale_holder(path)
+        File.write!(path, current_os_pid())
+        File.chmod(path, 0o600)
+        path
+    end
+  end
+
+  defp release_pid_lock(nil), do: :ok
+
+  defp release_pid_lock(path) do
+    case File.read(path) do
+      {:ok, content} ->
+        if String.trim(content) == current_os_pid() do
+          File.rm(path)
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp maybe_evict_stale_holder(path) do
+    with {:ok, content} <- File.read(path),
+         {pid, _} <- Integer.parse(String.trim(content)),
+         true <- pid > 1,
+         true <- to_string(pid) != current_os_pid(),
+         true <- process_alive?(pid) do
+      Logger.warning(
+        "TelegramPoller: replacing stale poller pid=#{pid} (sending SIGTERM to release Telegram long-poll slot)"
+      )
+
+      System.cmd("kill", ["-TERM", to_string(pid)], stderr_to_stdout: true)
+      # Give Telegram's server-side long poll a moment to drop the previous
+      # connection so our first getUpdates doesn't immediately 409.
+      Process.sleep(500)
+    end
+  end
+
+  defp process_alive?(pid) when is_integer(pid) do
+    case System.cmd("kill", ["-0", to_string(pid)], stderr_to_stdout: true) do
+      {_, 0} -> true
+      _ -> false
+    end
+  end
+
+  defp current_os_pid, do: System.pid()
+
+  defp pid_file_path do
+    case Application.get_env(:claude_notify, :poller_pid_file, :default) do
+      false -> nil
+      :default -> Path.expand("~/.claude_notify/poller.pid")
+      path when is_binary(path) -> path
+    end
   end
 end

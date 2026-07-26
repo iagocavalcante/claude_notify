@@ -1008,4 +1008,44 @@ defmodule ClaudeNotify.TelegramPollerTest do
       refute Map.has_key?(new_state.watches, job.id)
     end
   end
+
+  describe "shortcut_response/1" do
+    test "recognizes affirmative variants" do
+      assert TelegramPoller.shortcut_response("yes") == "yes"
+      assert TelegramPoller.shortcut_response("y") == "yes"
+      assert TelegramPoller.shortcut_response("Y") == "yes"
+      assert TelegramPoller.shortcut_response("approve") == "yes"
+      assert TelegramPoller.shortcut_response("  ok  ") == "yes"
+    end
+
+    test "recognizes don't-ask variants" do
+      assert TelegramPoller.shortcut_response("yes!") == "yes_dont_ask"
+      assert TelegramPoller.shortcut_response("yda") == "yes_dont_ask"
+    end
+
+    test "recognizes negative variants" do
+      assert TelegramPoller.shortcut_response("no") == "no"
+      assert TelegramPoller.shortcut_response("n") == "no"
+      assert TelegramPoller.shortcut_response("DENY") == "no"
+    end
+
+    test "recognizes escape variants" do
+      assert TelegramPoller.shortcut_response("esc") == "escape"
+      assert TelegramPoller.shortcut_response("escape") == "escape"
+      assert TelegramPoller.shortcut_response("cancel") == "escape"
+    end
+
+    test "recognizes single digits 1-9 as numbered options" do
+      assert TelegramPoller.shortcut_response("1") == "opt_1"
+      assert TelegramPoller.shortcut_response("9") == "opt_9"
+      assert TelegramPoller.shortcut_response(" 5 ") == "opt_5"
+    end
+
+    test "returns nil for free-form text" do
+      assert TelegramPoller.shortcut_response("yes please continue") == nil
+      assert TelegramPoller.shortcut_response("hello world") == nil
+      assert TelegramPoller.shortcut_response("") == nil
+      assert TelegramPoller.shortcut_response("0") == nil
+    end
+  end
 end

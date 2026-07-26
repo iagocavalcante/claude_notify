@@ -124,6 +124,7 @@ defmodule ClaudeNotify.EventHandler do
     maybe_send_diff(git_diff, session_id)
 
     text = MessageFormatter.notification_question(message, session_id)
+    truncated? = MessageFormatter.notification_truncated?(message)
 
     # Detect numbered options (multi-choice) vs simple yes/no
     options = parse_numbered_options(message)
@@ -135,7 +136,16 @@ defmodule ClaudeNotify.EventHandler do
         notification_buttons(session_id)
       end
 
-    notify_with_buttons_and_register(text, buttons, session_id)
+    buttons =
+      if truncated?,
+        do: [["📄 See more", "more:#{session_id}"] | buttons],
+        else: buttons
+
+    notify_with_buttons_and_register(text, buttons, session_id,
+      full_text:
+        if(truncated?, do: MessageFormatter.notification_question_full(message, session_id))
+    )
+
     Dashboard.refresh()
   end
 
@@ -209,10 +219,16 @@ defmodule ClaudeNotify.EventHandler do
     end
   end
 
-  defp notify_with_buttons_and_register(text, buttons, session_id) do
+  defp notify_with_buttons_and_register(text, buttons, session_id, opts) do
     case Telegram.send_with_buttons_retry(text, buttons) do
       {:ok, %{"result" => %{"message_id" => mid}}} ->
         SessionStore.register_message(mid, session_id)
+
+        case Keyword.get(opts, :full_text) do
+          full when is_binary(full) -> SessionStore.register_notification_text(mid, full)
+          _ -> :ok
+        end
+
         :ok
 
       {:ok, _} ->
