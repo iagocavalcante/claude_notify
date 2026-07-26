@@ -58,7 +58,7 @@ end
 defmodule ClaudeNotify.JobRunnerTest do
   use ExUnit.Case, async: false
 
-  alias ClaudeNotify.{Engine, JobRunner, JobStore, JobSupervisor, ProjectRegistry}
+  alias ClaudeNotify.{Engine, JobRunner, JobStore, JobSupervisor, JobTranscript, ProjectRegistry}
 
   @moduletag :tmp_dir
 
@@ -391,6 +391,85 @@ defmodule ClaudeNotify.JobRunnerTest do
       args = final.worktree_path |> Path.join(".received-args") |> File.read!() |> String.trim()
       assert String.starts_with?(args, "--resume fixture-original-session")
       assert args =~ "continue the work"
+    end
+
+    test "feeds a fixture run's text/tool_use events into ClaudeNotify.JobTranscript, and hands the completion notifier a snapshot",
+         %{repo_path: repo_path, store: store, script: script} do
+      transcript_name = :"job_transcript_#{System.unique_integer([:positive])}"
+      transcript = start_supervised!({JobTranscript, name: transcript_name})
+
+      {:ok, job} = JobStore.create(store, job_attrs())
+      {:ok, _} = JobStore.update_status(store, job.id, :running, %{})
+
+      test_pid = self()
+      notifier = fn event -> send(test_pid, event) end
+
+      start_runner(job, repo_path, script,
+        job_store: store,
+        job_transcript: transcript,
+        notifier: notifier
+      )
+
+      wait_for_status(store, job.id, :completed)
+
+      assert_receive {:completed, job_id, %{transcript: entries}}, 2_000
+      assert job_id == job.id
+
+      # Fixture engine (write_fixture_engine/1) emits one :text then one
+      # :tool_use (a Bash call with no file_path) before its :result.
+      assert [
+               %{type: :text, text: "working on it"},
+               %{type: :tool_use, name: "Bash", file_path: nil, diff: nil}
+             ] = entries
+
+      # Discarded right after the notifier received its snapshot - see
+      # ClaudeNotify.JobTranscript's moduledoc cleanup policy.
+      assert JobTranscript.transcript(transcript, job.id) == []
+    end
+
+    test "a file-editing tool_use is enriched with a git diff for that file in the job's worktree",
+         %{repo_path: repo_path, store: store, tmp_dir: tmp_dir} do
+      script = Path.join(tmp_dir, "diff_fixture_engine.sh")
+
+      File.write!(script, """
+      #!/usr/bin/env bash
+      echo "extra line" >> README.md
+      cat <<'JSON'
+      {"type":"system","subtype":"init","cwd":"ignored","session_id":"fixture-session-diff"}
+      {"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Edit","input":{"file_path":"README.md"}}]}}
+      {"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"fixture-session-diff"}
+      JSON
+      exit 0
+      """)
+
+      File.chmod!(script, 0o755)
+
+      transcript_name = :"job_transcript_#{System.unique_integer([:positive])}"
+      transcript = start_supervised!({JobTranscript, name: transcript_name})
+
+      {:ok, job} = JobStore.create(store, job_attrs())
+      {:ok, _} = JobStore.update_status(store, job.id, :running, %{})
+
+      test_pid = self()
+      notifier = fn event -> send(test_pid, event) end
+
+      start_runner(job, repo_path, script,
+        job_store: store,
+        job_transcript: transcript,
+        notifier: notifier
+      )
+
+      wait_for_status(store, job.id, :completed)
+
+      assert_receive {:completed, _job_id,
+                      %{
+                        transcript: [
+                          %{type: :tool_use, name: "Edit", file_path: "README.md", diff: diff}
+                        ]
+                      }},
+                     2_000
+
+      assert diff =~ "extra line"
     end
   end
 

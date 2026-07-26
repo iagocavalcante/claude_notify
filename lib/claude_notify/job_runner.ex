@@ -29,11 +29,14 @@ defmodule ClaudeNotify.JobRunner do
       `ClaudeNotify.ActivityTracker`/`ClaudeNotify.MessageFormatter.activity_message/1`
       already use for terminal sessions, so a caller can reuse that
       formatter as-is.
-    * `{:completed, job_id, %{status: :completed | :failed, summary:}}` once,
-      right after the job's terminal `JobStore` transition actually
-      succeeds (a transition that's rejected - e.g. the job was already
-      `:discarded` by a racing `/cancel` - is not reported here, since
-      nothing about the job's real outcome changed).
+    * `{:completed, job_id, %{status: :completed | :failed, summary:,
+      transcript:}}` once, right after the job's terminal `JobStore`
+      transition actually succeeds (a transition that's rejected - e.g. the
+      job was already `:discarded` by a racing `/cancel` - is not reported
+      here, since nothing about the job's real outcome changed). `transcript:`
+      is the job's full `ClaudeNotify.JobTranscript.transcript/2` snapshot
+      at completion time - see the `JobTranscript` hook below for why it's
+      handed over here instead of read separately.
 
   This module only aggregates the raw counters/labels and calls the
   notifier with them - it does not format any Telegram text itself (see
@@ -50,6 +53,19 @@ defmodule ClaudeNotify.JobRunner do
   so a later action against the job (e.g. a Telegram button pressed after
   this process has already exited) needs the error text to live in
   `JobStore`, not in this process's memory.
+
+  ## Transcript hook (`ClaudeNotify.JobTranscript`)
+
+  Alongside the counters above, every `:text` and `:tool_use` event is also
+  recorded into `opts[:job_transcript]` (defaults to the supervised
+  `ClaudeNotify.JobTranscript` singleton, see its moduledoc for the ring
+  buffer/diff-capture details) under this job's id - a second, additive
+  hook that does not change what the `:notifier` above receives on
+  `:progress`, only on `:completed` (see above). Right after the terminal
+  notifier call, this `JobTranscript` entry is `discard/2`'d - by then the
+  notifier already received the full snapshot it needed, and discarding
+  keeps `JobTranscript`'s memory bounded to currently-running jobs (see its
+  moduledoc's cleanup policy).
 
   ## Resuming (`opts[:resume_session_id]`)
 
@@ -72,7 +88,7 @@ defmodule ClaudeNotify.JobRunner do
   use GenServer, restart: :temporary
   require Logger
 
-  alias ClaudeNotify.{JobStore, WorktreeManager}
+  alias ClaudeNotify.{JobStore, JobTranscript, WorktreeManager}
 
   # Bounded tail of raw engine stdout lines, kept regardless of whether they
   # parsed into a recognized event - the only source for a failed job's
@@ -87,6 +103,7 @@ defmodule ClaudeNotify.JobRunner do
     :repo_path,
     :prompt,
     :job_store,
+    :job_transcript,
     :slug,
     :worktree,
     :port,
@@ -134,6 +151,7 @@ defmodule ClaudeNotify.JobRunner do
       repo_path: Keyword.fetch!(opts, :repo_path),
       prompt: Keyword.fetch!(opts, :prompt),
       job_store: Keyword.get(opts, :job_store, JobStore),
+      job_transcript: Keyword.get(opts, :job_transcript, JobTranscript),
       slug: Keyword.get(opts, :slug, "run"),
       engine_opts: Keyword.get(opts, :engine_opts, []),
       resume_session_id: Keyword.get(opts, :resume_session_id),
@@ -285,7 +303,14 @@ defmodule ClaudeNotify.JobRunner do
   end
 
   defp notify_completed(state, status) do
-    state.notifier.({:completed, state.job_id, %{status: status, summary: state.last_summary}})
+    transcript = JobTranscript.transcript(state.job_transcript, state.job_id)
+
+    state.notifier.(
+      {:completed, state.job_id,
+       %{status: status, summary: state.last_summary, transcript: transcript}}
+    )
+
+    JobTranscript.discard(state.job_transcript, state.job_id)
   end
 
   defp progress_snapshot(state) do
@@ -325,10 +350,11 @@ defmodule ClaudeNotify.JobRunner do
       {:ok, {:tool_use, detail}} ->
         state
         |> track_progress(detail)
+        |> record_transcript_tool_use(detail)
         |> notify_progress()
 
-      {:ok, {:text, _text}} ->
-        state
+      {:ok, {:text, text}} ->
+        record_transcript_text(state, text)
 
       :ignore ->
         state
@@ -383,4 +409,26 @@ defmodule ClaudeNotify.JobRunner do
   end
 
   defp touched_file(_name, _input), do: nil
+
+  # -- Transcript recording (ClaudeNotify.JobTranscript) --
+
+  defp record_transcript_text(state, text) do
+    JobTranscript.record(state.job_transcript, state.job_id, JobTranscript.text_entry(text))
+    state
+  end
+
+  defp record_transcript_tool_use(state, %{name: name, input: input}) do
+    entry = JobTranscript.tool_use_entry(name, input, worktree_path(state))
+    JobTranscript.record(state.job_transcript, state.job_id, entry)
+    state
+  end
+
+  # `state.worktree` is only unset if a :tool_use event somehow arrived
+  # before handle_continue(:launch) finished setting it up, which cannot
+  # happen (the engine Port that produces these events is only opened after
+  # the worktree exists) - guarded anyway so a diff simply isn't captured
+  # rather than raising, matching this module's "never crash on transcript
+  # capture" contract.
+  defp worktree_path(%{worktree: %{path: path}}), do: path
+  defp worktree_path(_state), do: nil
 end
