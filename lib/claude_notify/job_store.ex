@@ -35,6 +35,7 @@ defmodule ClaudeNotify.JobStore do
       :worktree_path,
       :branch,
       :engine_session_id,
+      :error_tail,
       status: :queued,
       telegram_message_ids: [],
       inserted_at: nil,

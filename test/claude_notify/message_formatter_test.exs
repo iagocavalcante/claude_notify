@@ -183,4 +183,58 @@ defmodule ClaudeNotify.MessageFormatterTest do
     message = MessageFormatter.task_checklist([])
     assert message =~ "📋"
   end
+
+  # Job report tests (story #235)
+
+  @job %{id: 7, project: "trainer", engine: "claude"}
+
+  test "job_completed formats a completed header, summary, and diffstat" do
+    diffstat = " lib/foo.ex | 3 +++\n 1 file changed, 3 insertions(+)"
+    message = MessageFormatter.job_completed(@job, diffstat, "Added a helper function")
+
+    assert message =~ "✅"
+    assert message =~ "7"
+    assert message =~ "trainer"
+    assert message =~ "completed"
+    assert message =~ "Added a helper function"
+    assert message =~ "lib/foo.ex"
+  end
+
+  test "job_completed with no diffstat omits the diff block" do
+    message = MessageFormatter.job_completed(@job, nil, "Nothing to change")
+    assert message =~ "Nothing to change"
+    refute message =~ "```"
+  end
+
+  test "job_completed with no summary shows a placeholder" do
+    message = MessageFormatter.job_completed(@job, nil, nil)
+    assert message =~ "no summary reported"
+  end
+
+  test "job_failed formats a failed header and the error text" do
+    message = MessageFormatter.job_failed(@job, "boom: something broke")
+
+    assert message =~ "❌"
+    assert message =~ "7"
+    assert message =~ "failed"
+    assert message =~ "boom: something broke"
+  end
+
+  test "job_failed with no error text shows a placeholder, never green-washed" do
+    message = MessageFormatter.job_failed(@job, nil)
+    assert message =~ "failed"
+    assert message =~ "no output captured"
+  end
+
+  test "job_output_block wraps text in a pre block" do
+    message = MessageFormatter.job_output_block("line one\nline two")
+    assert message =~ "```"
+    assert message =~ "line one"
+    assert message =~ "line two"
+  end
+
+  test "job_output_block with nil shows a placeholder" do
+    message = MessageFormatter.job_output_block(nil)
+    assert message =~ "No output captured"
+  end
 end

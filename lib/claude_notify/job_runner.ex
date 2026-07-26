@@ -20,6 +20,37 @@ defmodule ClaudeNotify.JobRunner do
   Deliberately does not tear down the worktree on completion - the commit it
   holds is the input to a later PR-creation story.
 
+  ## Progress/completion hook (`opts[:notifier]`)
+
+  `opts[:notifier]` is an optional 1-arity function called with:
+
+    * `{:progress, job_id, %{action_count:, files_touched:, current_tool:,
+      current_detail:}}` on every `:tool_use` event - the same shape
+      `ClaudeNotify.ActivityTracker`/`ClaudeNotify.MessageFormatter.activity_message/1`
+      already use for terminal sessions, so a caller can reuse that
+      formatter as-is.
+    * `{:completed, job_id, %{status: :completed | :failed, summary:}}` once,
+      right after the job's terminal `JobStore` transition actually
+      succeeds (a transition that's rejected - e.g. the job was already
+      `:discarded` by a racing `/cancel` - is not reported here, since
+      nothing about the job's real outcome changed).
+
+  This module only aggregates the raw counters/labels and calls the
+  notifier with them - it does not format any Telegram text itself (see
+  `ClaudeNotify.TelegramPoller`, the only current caller, for the
+  formatting). Defaults to a no-op so every other caller (and every
+  existing test) is unaffected.
+
+  A failed job's `error_tail` (the engine's own reported error message, or
+  - if the engine crashed before reporting one - the tail of its raw
+  stdout) is persisted onto the `JobStore` record itself via the same
+  `update_status/4` call that drives `:running -> :failed`, rather than
+  being carried only in the transient notifier event: `:completed`'s
+  `summary` field is not retained anywhere after the notifier call returns,
+  so a later action against the job (e.g. a Telegram button pressed after
+  this process has already exited) needs the error text to live in
+  `JobStore`, not in this process's memory.
+
   ## Resuming (`opts[:resume_session_id]`)
 
   When `opts[:resume_session_id]` is set, `launch_engine/2` calls
@@ -43,6 +74,13 @@ defmodule ClaudeNotify.JobRunner do
 
   alias ClaudeNotify.{JobStore, WorktreeManager}
 
+  # Bounded tail of raw engine stdout lines, kept regardless of whether they
+  # parsed into a recognized event - the only source for a failed job's
+  # error_tail when the engine crashes before emitting any structured
+  # result/error event of its own. Small on purpose: this is a fallback for
+  # a Telegram message, not a log.
+  @max_raw_lines 20
+
   defstruct [
     :job_id,
     :engine,
@@ -54,9 +92,16 @@ defmodule ClaudeNotify.JobRunner do
     :port,
     :session_id,
     :resume_session_id,
+    :last_summary,
     engine_opts: [],
     buffer: "",
-    finalized: false
+    finalized: false,
+    notifier: nil,
+    action_count: 0,
+    files_touched: MapSet.new(),
+    current_tool: nil,
+    current_detail: nil,
+    raw_lines: []
   ]
 
   @job_rules """
@@ -91,7 +136,8 @@ defmodule ClaudeNotify.JobRunner do
       job_store: Keyword.get(opts, :job_store, JobStore),
       slug: Keyword.get(opts, :slug, "run"),
       engine_opts: Keyword.get(opts, :engine_opts, []),
-      resume_session_id: Keyword.get(opts, :resume_session_id)
+      resume_session_id: Keyword.get(opts, :resume_session_id),
+      notifier: Keyword.get(opts, :notifier, fn _event -> :ok end)
     }
 
     {:ok, state, {:continue, :launch}}
@@ -123,17 +169,24 @@ defmodule ClaudeNotify.JobRunner do
   @impl true
   def handle_info({port, {:data, data}}, %{port: port} = state) do
     {lines, remainder} = extract_lines(state.buffer <> data)
-    new_state = Enum.reduce(lines, state, &process_line/2)
+
+    new_state =
+      lines
+      |> Enum.reduce(state, &process_line/2)
+      |> append_raw_lines(lines)
+
     {:noreply, %{new_state | buffer: remainder}}
   end
 
   @impl true
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
     final_status = if status == 0, do: :completed, else: :failed
+    extras = terminal_extras(state, final_status)
 
-    JobStore.update_status(state.job_store, state.job_id, final_status, %{
-      engine_session_id: state.session_id
-    })
+    case JobStore.update_status(state.job_store, state.job_id, final_status, extras) do
+      {:ok, _job} -> notify_completed(state, final_status)
+      {:error, _reason} -> :ok
+    end
 
     {:stop, :normal, %{state | finalized: true}}
   end
@@ -196,9 +249,52 @@ defmodule ClaudeNotify.JobRunner do
   end
 
   defp fail_job(state) do
-    JobStore.update_status(state.job_store, state.job_id, :failed, %{
-      engine_session_id: state.session_id
-    })
+    extras = terminal_extras(state, :failed)
+
+    case JobStore.update_status(state.job_store, state.job_id, :failed, extras) do
+      {:ok, _job} -> notify_completed(state, :failed)
+      {:error, _reason} -> :ok
+    end
+  end
+
+  # `:error_tail` is only meaningful for a failed job - prefer the engine's
+  # own reported error/result message (`last_summary`); fall back to the
+  # raw stdout tail only if the engine crashed before reporting one at all
+  # (or never got far enough to - e.g. `create_worktree/1` itself failing).
+  defp terminal_extras(state, :failed) do
+    %{engine_session_id: state.session_id, error_tail: state.last_summary || raw_tail(state)}
+  end
+
+  defp terminal_extras(state, :completed) do
+    %{engine_session_id: state.session_id}
+  end
+
+  defp raw_tail(%{raw_lines: []}), do: nil
+  defp raw_tail(%{raw_lines: lines}), do: Enum.join(lines, "\n")
+
+  defp append_raw_lines(state, []), do: state
+
+  defp append_raw_lines(state, lines) do
+    updated = (state.raw_lines ++ lines) |> Enum.take(-@max_raw_lines)
+    %{state | raw_lines: updated}
+  end
+
+  defp notify_progress(state) do
+    state.notifier.({:progress, state.job_id, progress_snapshot(state)})
+    state
+  end
+
+  defp notify_completed(state, status) do
+    state.notifier.({:completed, state.job_id, %{status: status, summary: state.last_summary}})
+  end
+
+  defp progress_snapshot(state) do
+    %{
+      action_count: state.action_count,
+      files_touched: state.files_touched,
+      current_tool: state.current_tool,
+      current_detail: state.current_detail
+    }
   end
 
   # -- Stdout parsing --
@@ -216,15 +312,20 @@ defmodule ClaudeNotify.JobRunner do
 
   defp process_line(line, state) do
     case state.engine.parse_event(line) do
-      {:ok, {:result, %{session_id: session_id} = result}} ->
+      {:ok, {:result, %{session_id: session_id, summary: summary} = result}} ->
         Logger.info("JobRunner: job #{state.job_id} result: #{inspect(result)}")
-        maybe_store_session_id(state, session_id)
+
+        state
+        |> maybe_store_session_id(session_id)
+        |> Map.put(:last_summary, summary || state.last_summary)
 
       {:ok, {:session, session_id}} ->
         maybe_store_session_id(state, session_id)
 
-      {:ok, {:tool_use, _detail}} ->
+      {:ok, {:tool_use, detail}} ->
         state
+        |> track_progress(detail)
+        |> notify_progress()
 
       {:ok, {:text, _text}} ->
         state
@@ -247,4 +348,39 @@ defmodule ClaudeNotify.JobRunner do
     JobStore.update(state.job_store, state.job_id, %{engine_session_id: session_id})
     %{state | session_id: session_id}
   end
+
+  # -- Progress tracking (for opts[:notifier]) --
+
+  defp track_progress(state, %{name: name, input: input}) do
+    detail = tool_detail(name, input)
+    file = touched_file(name, input)
+
+    %{
+      state
+      | action_count: state.action_count + 1,
+        current_tool: name,
+        current_detail: detail,
+        files_touched:
+          if(file, do: MapSet.put(state.files_touched, file), else: state.files_touched)
+    }
+  end
+
+  defp tool_detail(name, input) when name in ["Read", "Write", "Edit"] and is_map(input),
+    do: Map.get(input, "file_path")
+
+  defp tool_detail("Bash", input) when is_map(input), do: Map.get(input, "command")
+
+  defp tool_detail(name, input) when name in ["Glob", "Grep"] and is_map(input),
+    do: Map.get(input, "pattern")
+
+  defp tool_detail(_name, _input), do: nil
+
+  defp touched_file(name, input) when name in ["Read", "Write", "Edit"] and is_map(input) do
+    case Map.get(input, "file_path") do
+      path when is_binary(path) -> Path.basename(path)
+      _ -> nil
+    end
+  end
+
+  defp touched_file(_name, _input), do: nil
 end
