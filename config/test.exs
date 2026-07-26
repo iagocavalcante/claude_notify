@@ -10,4 +10,5 @@ config :claude_notify,
   webhook_secret: "test-webhook-secret",
   webhook_max_skew_seconds: 300,
   max_event_concurrency: 20,
-  start_poller: false
+  start_poller: false,
+  start_job_reconciler: false
