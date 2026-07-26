@@ -12,7 +12,9 @@ Elixir app that sends interactive Telegram notifications for Claude Code session
 - **Interactive approvals** — respond to permission prompts with Yes / No / Yes (don't ask) / Esc directly from Telegram
 - **Numbered option support** — for multi-choice prompts, choose options `1..9` from inline buttons
 - **Safer terminal injection** — text input is sent via clipboard paste with TTY validation
-- **Security hardening** — signed hook events (HMAC), replay protection, Telegram chat authorization, and debug endpoint protection
+- **Security hardening** — signed hook events (HMAC), replay protection, and Telegram chat authorization
+- **Job dispatcher** — `/run` a coding-agent CLI (`claude` or `codex`) headlessly against a registered project in its own isolated git worktree, with progress/completion reports and a `Create PR` button as the only push path
+- **Watch mode** — opt in to a live, throttled transcript of a running job; off by default to keep the dispatcher quiet
 
 ## How It Works
 
@@ -123,11 +125,17 @@ source .env && iex -S mix
 |---------|-------------|
 | `/sessions` | List and select active sessions |
 | `/approve` | Send Yes to the selected session |
-| `/cancel` | Send Escape to the selected session |
+| `/cancel` | Send Escape to the selected session (bare, no id) |
 | `/dashboard` | Show live session dashboard |
+| `/run [claude\|codex] <project> <prompt>` | Launch a dispatcher job — see [Job dispatcher](#job-dispatcher) |
+| `/jobs` | List known dispatcher jobs and their status |
+| `/cancel <id>` | Cancel dispatcher job `<id>` |
+| `/projects` | List registered dispatcher projects |
+| `/watch <id>` | Watch dispatcher job `<id>`'s live transcript |
+| `/unwatch <id>` | Stop watching dispatcher job `<id>` |
 | `/help` | Show available commands |
 
-Reply to any message to send text to that session. If only one session is active, it is auto-selected.
+Reply to any message to send text to that session. If only one session is active, it is auto-selected. Replying to a dispatcher job's activity message resumes that job instead — see [Job dispatcher](#job-dispatcher).
 
 ## Security Model
 
@@ -137,7 +145,7 @@ Reply to any message to send text to that session. If only one session is active
   - `X-Claude-Notify-Signature: sha256=<hmac>`
 - Signatures are verified with `CLAUDE_NOTIFY_WEBHOOK_SECRET`.
 - Replayed signed payloads are rejected.
-- `GET /debug/sessions` is disabled by default and returns `403` unless explicitly enabled.
+- The HTTP surface exposes exactly two routes — `GET /health` and `POST /api/events` — anything else, including any `/debug/*` path, returns a plain `404`.
 
 ## Configuration
 
@@ -152,10 +160,11 @@ CLAUDE_NOTIFY_WEBHOOK_SECRET=replace_with_random_64_hex_chars
 Optional variables:
 
 ```bash
-ENABLE_DEBUG_ENDPOINTS=false
 MAX_EVENT_CONCURRENCY=8
 WEBHOOK_MAX_SKEW_SECONDS=300
 ```
+
+Dispatcher settings (job commands, watch mode) are `config.exs`/`runtime.exs` keys, not `.env` variables — see [Job dispatcher](#job-dispatcher) for the full list with defaults.
 
 Load this env in the shell where you run Claude Code so hooks can sign webhook requests:
 
@@ -187,7 +196,6 @@ TELEGRAM_BOT_TOKEN=your_bot_token_here
 TELEGRAM_CHAT_ID=your_chat_id_here
 CLAUDE_NOTIFY_WEBHOOK_SECRET=replace_with_random_64_hex_chars
 # optional
-ENABLE_DEBUG_ENDPOINTS=false
 MAX_EVENT_CONCURRENCY=8
 WEBHOOK_MAX_SKEW_SECONDS=300
 ```
@@ -265,7 +273,7 @@ chmod +x hooks/*.sh
 
 ## Job dispatcher
 
-The dispatcher lets you hand a coding-agent CLI (`claude`, with `codex` planned) a prompt against a registered project and let it run headless in an isolated git worktree, without touching your own checkout.
+The dispatcher lets you hand a coding-agent CLI (`claude` or `codex`) a prompt against a registered project from Telegram, and let it run headless in its own isolated git worktree, without touching your own checkout. Every job command below requires the authorized `TELEGRAM_CHAT_ID` chat — see [Security Model](#security-model).
 
 ### Registering projects
 
@@ -279,25 +287,70 @@ config :claude_notify,
   ]
 ```
 
-Each entry needs an absolute `path` that is the toplevel of a git repository; invalid entries are dropped with a warning log rather than failing the whole registry. `aliases` is optional. Entries can also live in `~/.claude_notify/projects.json` (same shape, string keys) for machine-local projects that shouldn't be committed — those override application-config entries with the same name. The registry is (re)loaded on every job-launch attempt, so editing either source is picked up without restarting the app.
+Each entry needs an absolute `path` that is the toplevel of a git repository; invalid entries are dropped with a warning log rather than failing the whole registry. `aliases` is optional. Entries can also live in `~/.claude_notify/projects.json` for machine-local projects that shouldn't be committed:
+
+```json
+[
+  {"name": "claude_notify", "aliases": ["cn"], "path": "/Users/me/code/claude_notify"},
+  {"name": "trainer_gym_ai", "aliases": ["tg"], "path": "/Users/me/code/trainer-gym-ai"}
+]
+```
+
+File entries take precedence over application-config entries with the same name. The registry is (re)loaded on every job-launch attempt, so editing either source is picked up without restarting the app.
 
 ### Commands
 
-There is no Telegram command surface for the dispatcher yet (planned — see Escopo below); jobs are currently launched by calling `ClaudeNotify.JobSupervisor.start_job/2` directly (e.g. from `iex -S mix`):
+**`/run [claude|codex] <project> <prompt>`** — launches a job. `<project>` is a registered name or alias; the rest of the message after it is the prompt verbatim. The engine defaults to `claude` when omitted.
 
-```elixir
-{:ok, job} = ClaudeNotify.JobStore.create(%{engine: "claude", project: "claude_notify", prompt: "..."})
-ClaudeNotify.JobSupervisor.start_job(job)
+The engine token, when present, **always wins over the project name** — if the first word after `/run` is exactly `claude` or `codex`, it's consumed as the engine selector, not the project name, even if you have a project registered under that exact name:
+
 ```
+/run trainer fix the flaky test          → engine claude, project "trainer"
+/run codex trainer fix the flaky test    → engine codex,  project "trainer"
+/run claude claude fix the flaky test    → engine claude, project "claude" (project named "claude" — must repeat the engine token to reach it)
+```
+
+An unregistered project name replies with the list of known projects instead of failing silently. A missing prompt (or missing project) replies with a usage message; no job is created.
+
+**`/jobs`** — lists every known job with its id, engine, project, and status (`##{id} #{engine} #{project} - #{status}`).
+
+**`/cancel <id>`** — cancels dispatcher job `<id>` (must parse as a bare integer): transitions it to `:discarded` and stops its running engine process, if any. **`/cancel`** with no argument (or a non-numeric one) is unrelated — it's the pre-existing shortcut that sends Escape to the currently selected terminal session.
+
+**`/projects`** — lists all registered project names (canonical names only, not aliases).
+
+**`/watch <id>` / `/unwatch <id>`** — see [Watch mode](#watch-mode) below; equivalent to tapping the `[Watch]`/`[Unwatch]` button on the job's activity message.
+
+**Reply to a job's activity message to resume it.** This does not continue the same job in place — it creates a **new** job (new id, new worktree, new branch) with `resume_session_id` set to the original job's `engine_session_id`, and your reply text as its prompt. Only a `:completed` or `:failed` job can be resumed this way (a job with no recorded `engine_session_id` — e.g. it failed before the engine ever reported one — can't be resumed at all); resuming a job that's still `:queued`/`:running`/`:awaiting_input` replies with an error instead.
+
+  **Resume limitation:** the new job still gets a brand-new worktree cut from the repo's *current default branch* — it does **not** check out the original job's branch. The engine's own memory of the earlier conversation may reference files or state that only exist on the *original* job's branch. This is an acceptable gap only because every job is required to commit and leave its worktree clean before finishing — in the common case there's nothing uncommitted left to lose — but a resume that expects to see uncommitted state from its earlier turn will not find it.
+
+### Report buttons and the human gate
+
+When a job finishes, its activity message is replaced with a report and buttons:
+
+- **Completed** → `[Show diff]` `[Create PR]` `[Discard]`. `Show diff` sends the job's `git diff` against the repo's current branch as a separate message (or "No changes to show." if empty). **`Create PR` is the only path in this codebase that ever runs `git push` or `gh pr create`** — it pushes the job's branch (`git push -u origin <branch>`) and then runs `gh pr create`, replying with the PR URL on success or an explicit failure message (distinguishing a push failure from a push-succeeded-but-`gh`-failed case) otherwise. It refuses if the job isn't `:completed` or if its worktree no longer exists on disk.
+- **Failed** → `[Show output]` `[Discard]`. `Show output` sends the job's `error_tail` (the engine's own reported error, or the tail of its raw stdout if it crashed before reporting one).
+- **`Discard`** tears down the job's worktree and branch (`ClaudeNotify.WorktreeManager.discard/1`) and edits the report to say so. For a job still `:queued`/`:running`/`:awaiting_input` (reachable via `/cancel <id>` too), this also drives the status to `:discarded`. For an already-terminal job (`:completed`/`:failed`), discarding only removes the worktree — the job's historical `:completed`/`:failed` status is left untouched, since the job did genuinely finish; only its now-unwanted worktree is being cleaned up.
+
+No other code path pushes or opens a pull request. The wrapped prompt every job runs under also explicitly instructs the engine itself never to push or open a PR, and to stay inside its own worktree.
+
+### Watch mode
+
+Off by default (quiet mode) — a job's activity message only ever shows an aggregate action/file counter, not per-tool output. Opting in:
+
+- Tap **`[Watch]`** on a job's activity message, or send **`/watch <id>`**. For a still-running job this sends one new message with the current transcript snapshot and swaps the activity message's button to `[Unwatch]`; that transcript message is then edited in place as new entries arrive.
+- Edits are throttled to at most one per `:claude_notify, :watch_edit_interval_ms` (default 2000ms) — a burst of tool calls within the window coalesces into a single trailing edit, not one Telegram edit per tool call.
+- The transcript is bounded to Telegram's 4096-character message limit; when it doesn't fit, the **oldest** entries are dropped first so the most recent activity stays visible, with a truncation notice at the top.
+- **`[Unwatch]`** (or `/unwatch <id>`) finalizes the transcript message with a fresh read and flips the button back to `[Watch]`.
+- **Watching an already-terminal job almost always replies "transcript gone."** A job's transcript is held in memory only while it runs and is discarded immediately after its completion notifier fires — by the time you tap `[Watch]` on a job that already finished, the transcript is very likely already gone. Watching a job *while it's still running*, or being watched at the moment it completes, is the only way to see its transcript; the completion report itself (diff/output buttons) is unaffected either way.
+- Watching an unknown job id, or a job you're already watching, replies with a clear error rather than silently doing nothing.
 
 ### Engine support
 
 | Engine | Status |
 |--------|--------|
-| `claude` | merged — drives the `claude` CLI via `ClaudeNotify.Engine.Claude` |
-| `codex` | in progress |
-
-Telegram commands to launch/inspect/cancel jobs interactively are also in progress.
+| `claude` | Drives the `claude` CLI (`claude -p ... --output-format stream-json --verbose --dangerously-skip-permissions`) via `ClaudeNotify.Engine.Claude`. Its `stream-json` event parsing was confirmed against a real invocation. |
+| `codex` | Drives the `codex` CLI (`codex exec --experimental-json --sandbox workspace-write --ask-for-approval never ...`) via `ClaudeNotify.Engine.Codex`. Fully implemented and unit-tested, but its event-shape parsing was verified only from the `@openai/codex-sdk` source and offline CLI flag-parsing probes, not a live run — see `ClaudeNotify.Engine.Codex`'s moduledoc for exactly what is and isn't confirmed. `--experimental-json` is an undocumented, explicitly "experimental" upstream flag; a future `codex-cli` release could change or remove it. |
 
 ### Concurrency
 
@@ -307,7 +360,8 @@ Up to `:claude_notify, :job_concurrency` (default 3) jobs run at once; requests 
 
 - **Worktree isolation** — every job gets its own `git worktree` on a fresh branch (`job/<job_id>-<slug>`) under a dedicated base directory (`~/.claude_notify/worktrees/<repo>/<job_id>` by default, configurable via `:claude_notify, :worktree_base_dir`). The job's prompt is wrapped with rules telling the engine to stay inside that worktree and never touch any other checkout.
 - **Registered paths only** — a job can only target a project explicitly listed in the registry (see above); an unregistered name fails the job cleanly instead of falling back to an arbitrary path.
-- **Human-gate: nothing pushes or opens a PR** — the wrapped prompt explicitly forbids `git push` and opening pull requests; committing locally is the end of a job's own work. Turning a job's commit into a PR is a deliberate, separate, human-triggered action (a future "Create PR" button) — the dispatcher never does this on its own.
+- **Authorized chat gate** — every dispatcher command and button callback is rejected unless it comes from the configured `TELEGRAM_CHAT_ID`, same as every other Telegram command in this app.
+- **Human gate: nothing pushes or opens a PR except `Create PR`** — the wrapped prompt explicitly forbids the engine itself from running `git push` or opening a pull request; committing locally is the end of a job's own work. Turning a job's commit into a PR is the deliberate, separate, human-triggered `Create PR` button described above — no other code path does this.
 - **Boot reconciliation** — see below.
 
 ### Reconciliation
@@ -320,7 +374,50 @@ Up to `:claude_notify, :job_concurrency` (default 3) jobs run at once; requests 
 
 Reconciliation never crashes the app — any failure during the pass is caught and logged, and boot proceeds regardless. It's disabled under `MIX_ENV=test` (`start_job_reconciler: false` in `config/test.exs`) so the test suite never reconciles against a developer's real `~/.claude_notify` state.
 
+### Dispatcher configuration reference
+
+All of these are `config.exs`/`runtime.exs` keys under `config :claude_notify, ...` — not `.env` variables.
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `:projects` | `[]` | Registered project entries — see [Registering projects](#registering-projects) |
+| `:job_concurrency` | `3` | Max jobs running at once before new launches queue FIFO |
+| `:job_worktree_retention_seconds` | `604_800` (7 days) | How long a `:completed`/`:discarded` job's worktree survives before boot reconciliation sweeps it |
+| `:start_job_reconciler` | `true` (`false` in `config/test.exs`) | Whether `ClaudeNotify.JobReconciler` runs its one-shot pass at boot |
+| `:job_transcript_max_entries` | `200` | Max transcript entries kept per job (oldest dropped first) |
+| `:job_transcript_max_diff_bytes` | `4_000` | Max size of a single captured per-file diff in a transcript entry, before truncation |
+| `:watch_edit_interval_ms` | `2_000` | Minimum time between throttled watch-message edits |
+| `:worktree_base_dir` | `~/.claude_notify/worktrees` | Base directory job worktrees are created under |
+| `:job_store_path` | `~/.claude_notify/job_store.dat` | Where `ClaudeNotify.JobStore` persists job records to disk |
+
+### Dispatcher architecture
+
+```
+ProjectRegistry   — resolves a project name/alias to a validated repo path (config.exs + projects.json)
+      |
+WorktreeManager   — creates/discards the job's isolated git worktree + branch inside that repo
+      |
+JobStore          — persists job records (status, worktree/branch, engine_session_id) to disk
+      |
+JobSupervisor /   — enforces the concurrency cap + FIFO queue, then supervises one
+  Dispatcher        JobRunner process per running job
+      |
+JobRunner         — drives the engine CLI as a Port, parses its output, records the
+                     transcript, and pushes progress/completion back to JobStore
+      |
+Engine.Claude /   — engine-specific command building + event parsing
+  Engine.Codex
+      |
+TelegramPoller    — the only caller of the above: parses /run /jobs /cancel /projects
+                     /watch /unwatch and reply-to-job text, renders activity/report
+                     messages and buttons, and is the sole path that can push or open a PR
+```
+
+`JobTranscript` sits alongside `JobRunner`/`TelegramPoller` rather than in this vertical chain — it's a shared, in-memory ring buffer that `JobRunner` writes to as a job runs and `TelegramPoller` reads from for watch mode, discarded once the job's completion notifier has fired.
+
 ## Architecture
+
+This covers the hook → Telegram → terminal-injection pipeline. For the job dispatcher's own modules (`ProjectRegistry`, `WorktreeManager`, `JobStore`, `JobSupervisor`, `JobRunner`, `Engine.*`, `JobTranscript`), see [Dispatcher architecture](#dispatcher-architecture) above.
 
 | Module | Role |
 |--------|------|
