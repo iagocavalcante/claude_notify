@@ -263,6 +263,63 @@ chmod +x hooks/*.sh
 
 </details>
 
+## Job dispatcher
+
+The dispatcher lets you hand a coding-agent CLI (`claude`, with `codex` planned) a prompt against a registered project and let it run headless in an isolated git worktree, without touching your own checkout.
+
+### Registering projects
+
+A project must be explicitly registered before any job can run against it — this is the first security layer. Add entries to `config/config.exs` (or your `config/runtime.exs`):
+
+```elixir
+config :claude_notify,
+  projects: [
+    %{name: "claude_notify", aliases: ["cn"], path: "/Users/me/code/claude_notify"},
+    %{name: "trainer_gym_ai", aliases: ["tg"], path: "/Users/me/code/trainer-gym-ai"}
+  ]
+```
+
+Each entry needs an absolute `path` that is the toplevel of a git repository; invalid entries are dropped with a warning log rather than failing the whole registry. `aliases` is optional. Entries can also live in `~/.claude_notify/projects.json` (same shape, string keys) for machine-local projects that shouldn't be committed — those override application-config entries with the same name. The registry is (re)loaded on every job-launch attempt, so editing either source is picked up without restarting the app.
+
+### Commands
+
+There is no Telegram command surface for the dispatcher yet (planned — see Escopo below); jobs are currently launched by calling `ClaudeNotify.JobSupervisor.start_job/2` directly (e.g. from `iex -S mix`):
+
+```elixir
+{:ok, job} = ClaudeNotify.JobStore.create(%{engine: "claude", project: "claude_notify", prompt: "..."})
+ClaudeNotify.JobSupervisor.start_job(job)
+```
+
+### Engine support
+
+| Engine | Status |
+|--------|--------|
+| `claude` | merged — drives the `claude` CLI via `ClaudeNotify.Engine.Claude` |
+| `codex` | in progress |
+
+Telegram commands to launch/inspect/cancel jobs interactively are also in progress.
+
+### Concurrency
+
+Up to `:claude_notify, :job_concurrency` (default 3) jobs run at once; requests beyond the cap queue FIFO and launch as slots free up (`ClaudeNotify.JobSupervisor.Dispatcher`).
+
+### Safety model
+
+- **Worktree isolation** — every job gets its own `git worktree` on a fresh branch (`job/<job_id>-<slug>`) under a dedicated base directory (`~/.claude_notify/worktrees/<repo>/<job_id>` by default, configurable via `:claude_notify, :worktree_base_dir`). The job's prompt is wrapped with rules telling the engine to stay inside that worktree and never touch any other checkout.
+- **Registered paths only** — a job can only target a project explicitly listed in the registry (see above); an unregistered name fails the job cleanly instead of falling back to an arbitrary path.
+- **Human-gate: nothing pushes or opens a PR** — the wrapped prompt explicitly forbids `git push` and opening pull requests; committing locally is the end of a job's own work. Turning a job's commit into a PR is a deliberate, separate, human-triggered action (a future "Create PR" button) — the dispatcher never does this on its own.
+- **Boot reconciliation** — see below.
+
+### Reconciliation
+
+`ClaudeNotify.JobReconciler` runs once at application boot (right after `JobStore`/`JobSupervisor` come up) to reconcile job state against reality after a restart:
+
+- Any job still marked `:running` at boot has, by construction, no surviving process — `JobRunner`s are never restarted (`restart: :temporary`) and the job record tracks no OS PID, so `:running` at boot always means dead. Each such job is transitioned to `:failed`, and any Telegram message(s) tracked for it are edited to say it was interrupted (jobs with no tracked message are just marked failed — no edit is attempted).
+- Worktrees found on disk with no matching `JobStore` record are **listed and reported** to the authorized Telegram chat with a cleanup prompt. They are **never auto-deleted** — cleanup is a human decision.
+- Worktrees belonging to `:completed`/`:discarded` jobs older than `:claude_notify, :job_worktree_retention_seconds` (default 7 days, judged against the job's `updated_at`) are swept automatically.
+
+Reconciliation never crashes the app — any failure during the pass is caught and logged, and boot proceeds regardless. It's disabled under `MIX_ENV=test` (`start_job_reconciler: false` in `config/test.exs`) so the test suite never reconciles against a developer's real `~/.claude_notify` state.
+
 ## Architecture
 
 | Module | Role |
