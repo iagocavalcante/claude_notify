@@ -3,29 +3,67 @@ defmodule ClaudeNotify.TelegramPoller do
   GenServer that long-polls Telegram getUpdates for:
   - Inline keyboard callbacks (Yes/No button presses)
   - Text messages (/sessions command, prompt text to inject)
+  - Dispatcher job commands (/run, /jobs, /cancel, /projects) and
+    reply-to-job routing (see the "Job commands" section below)
 
   Maintains a "selected session" per chat so users can pick a session
   and then type prompts that get injected into that terminal.
+
+  ## Job commands
+
+  `/run [claude|codex] <project> <prompt>` launches a dispatcher job via
+  `ClaudeNotify.JobSupervisor.start_job/2`; `/jobs` lists known jobs;
+  `/cancel <id>` cancels one; `/projects` lists registered projects.
+  Replying to a job's activity message resumes that job (a NEW job, wired
+  with `resume_session_id` - see `ClaudeNotify.JobRunner`'s moduledoc for
+  what "resume" does and does not carry over).
+
+  Job-command collaborators (`ClaudeNotify.JobStore`,
+  `ClaudeNotify.JobSupervisor`, `ClaudeNotify.ProjectRegistry`, and the
+  Telegram client) are read from GenServer state rather than hardcoded, so
+  tests can substitute isolated instances - mirroring the same
+  `opts`-with-defaults pattern `ClaudeNotify.JobReconciler.run/1` already
+  uses. Production callers never need to pass any of this; see `init/1` for
+  the defaults.
   """
 
   use GenServer
 
   require Logger
 
-  alias ClaudeNotify.{Telegram, SessionStore, TerminalInjector, MessageFormatter, Dashboard}
+  alias ClaudeNotify.{
+    Telegram,
+    SessionStore,
+    TerminalInjector,
+    MessageFormatter,
+    Dashboard,
+    JobStore,
+    JobSupervisor,
+    ProjectRegistry
+  }
 
   @poll_timeout 30
   @retry_delay 5_000
+  @known_engines ["claude", "codex"]
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
     Logger.info("TelegramPoller: starting with long polling")
     send(self(), :poll)
-    {:ok, %{offset: 0, selected_sessions: %{}}}
+
+    {:ok,
+     %{
+       offset: 0,
+       selected_sessions: %{},
+       telegram: Keyword.get(opts, :telegram, Telegram),
+       job_store: Keyword.get(opts, :job_store, JobStore),
+       project_registry: Keyword.get(opts, :project_registry),
+       job_launch_opts: Keyword.get(opts, :job_launch_opts, [])
+     }}
   end
 
   @impl true
@@ -58,16 +96,20 @@ defmodule ClaudeNotify.TelegramPoller do
     end)
   end
 
-  defp handle_update(%{"callback_query" => callback_query}, state)
-       when not is_nil(callback_query) do
+  # Public (but undocumented) so tests can drive a single raw Telegram
+  # update through the exact same path :poll uses, without a real network
+  # round trip - same rationale as authorized_chat?/1 below.
+  @doc false
+  def handle_update(%{"callback_query" => callback_query}, state)
+      when not is_nil(callback_query) do
     handle_callback(callback_query, state)
   end
 
-  defp handle_update(%{"message" => message}, state) when not is_nil(message) do
+  def handle_update(%{"message" => message}, state) when not is_nil(message) do
     handle_message(message, state)
   end
 
-  defp handle_update(_update, state), do: state
+  def handle_update(_update, state), do: state
 
   # --- Callback query handling (button presses) ---
 
@@ -150,8 +192,8 @@ defmodule ClaudeNotify.TelegramPoller do
   defp handle_reply_to(chat_id, text, reply_message_id, state) do
     case SessionStore.lookup_session_by_message(reply_message_id) do
       nil ->
-        # Not a tracked message, treat as regular text command
-        handle_text_command(chat_id, text, state)
+        # Not a tracked terminal-session message - try a job message next.
+        handle_reply_to_job(chat_id, text, reply_message_id, state)
 
       session_id ->
         session = SessionStore.get_session(session_id)
@@ -178,6 +220,76 @@ defmodule ClaudeNotify.TelegramPoller do
     end
   end
 
+  # --- Reply-to-job routing (resume) ---
+
+  defp handle_reply_to_job(chat_id, text, reply_message_id, state) do
+    case find_job_by_message(state.job_store, reply_message_id) do
+      nil ->
+        # Not a tracked job message either, treat as a regular text command.
+        handle_text_command(chat_id, text, state)
+
+      job ->
+        resume_job(job, text, state)
+    end
+  end
+
+  defp find_job_by_message(job_store, message_id) do
+    job_store
+    |> JobStore.list()
+    |> Enum.find(fn job -> message_id in (job.telegram_message_ids || []) end)
+  end
+
+  defp resume_job(%{status: status} = job, text, state) when status in [:completed, :failed] do
+    case job.engine_session_id do
+      nil ->
+        state.telegram.send_message(
+          MessageFormatter.escape_full("Job ##{job.id} has no recorded session to resume from.")
+        )
+
+        state
+
+      session_id ->
+        launch_resumed_job(job, session_id, text, state)
+    end
+  end
+
+  defp resume_job(job, _text, state) do
+    state.telegram.send_message(
+      MessageFormatter.escape_full(
+        "Job ##{job.id} is #{job.status} and can't be resumed right now."
+      )
+    )
+
+    state
+  end
+
+  defp launch_resumed_job(original_job, session_id, prompt, state) do
+    job_store = state.job_store
+
+    {:ok, new_job} =
+      JobStore.create(job_store, %{
+        engine: original_job.engine,
+        project: original_job.project,
+        prompt: prompt
+      })
+
+    send_and_track_activity_message(
+      state,
+      new_job.id,
+      "Job ##{new_job.id} (#{original_job.project}, #{original_job.engine}): " <>
+        "resuming job ##{original_job.id}..."
+    )
+
+    opts =
+      state.job_launch_opts
+      |> Keyword.put_new(:job_store, job_store)
+      |> Keyword.put_new(:project_registry, registry(state))
+      |> Keyword.put(:resume_session_id, session_id)
+
+    JobSupervisor.start_job(new_job, opts)
+    state
+  end
+
   defp handle_text_command(chat_id, text, state) do
     trimmed = String.trim(text)
 
@@ -197,11 +309,32 @@ defmodule ClaudeNotify.TelegramPoller do
         send_session_list(chat_id)
         state
 
+      String.starts_with?(trimmed, "/cancel ") ->
+        # "/cancel <job id>" cancels a dispatcher job. Anything else after
+        # "/cancel " (not a bare integer) falls through to the existing
+        # escape-shortcut clause below, unchanged.
+        case trimmed
+             |> String.replace_prefix("/cancel ", "")
+             |> String.trim()
+             |> Integer.parse() do
+          {job_id, ""} -> handle_job_cancel(job_id, state)
+          _ -> handle_shortcut_command(chat_id, "escape", state)
+        end
+
       String.starts_with?(trimmed, "/cancel") ->
         handle_shortcut_command(chat_id, "escape", state)
 
       String.starts_with?(trimmed, "/approve") ->
         handle_shortcut_command(chat_id, "yes", state)
+
+      String.starts_with?(trimmed, "/run") ->
+        handle_run_command(trimmed, state)
+
+      String.starts_with?(trimmed, "/jobs") ->
+        handle_jobs_command(state)
+
+      String.starts_with?(trimmed, "/projects") ->
+        handle_projects_command(state)
 
       String.starts_with?(trimmed, "/help") ->
         send_help(chat_id)
@@ -392,9 +525,14 @@ defmodule ClaudeNotify.TelegramPoller do
         MessageFormatter.escape_full("/approve - Send Yes to selected session"),
         MessageFormatter.escape_full("/cancel - Send Escape to selected session"),
         MessageFormatter.escape_full("/dashboard - Show live session dashboard"),
+        MessageFormatter.escape_full("/run [claude|codex] <project> <prompt> - launch a job"),
+        MessageFormatter.escape_full("/jobs - List jobs"),
+        MessageFormatter.escape_full("/cancel <id> - Cancel a job"),
+        MessageFormatter.escape_full("/projects - List registered projects"),
         MessageFormatter.escape_full("/help - Show this help"),
         "",
         MessageFormatter.escape_full("Reply to any message to send text to that session."),
+        MessageFormatter.escape_full("Reply to a job's message to resume it."),
         MessageFormatter.escape_full("If only one session is active, it's auto-selected.")
       ]
       |> Enum.join("\n")
@@ -402,6 +540,194 @@ defmodule ClaudeNotify.TelegramPoller do
     body = %{chat_id: chat_id, text: text, parse_mode: "MarkdownV2"}
     Telegram.api_post_public("sendMessage", body)
   end
+
+  # --- Job commands ---
+
+  defp handle_run_command(trimmed, state) do
+    case String.split(trimmed, ~r/\s+/, parts: 2) do
+      ["/run", rest] ->
+        case parse_run_args(rest) do
+          {:ok, engine, project, prompt} ->
+            launch_job(engine, project, prompt, state)
+
+          :error ->
+            send_run_usage(state)
+            state
+        end
+
+      _ ->
+        send_run_usage(state)
+        state
+    end
+  end
+
+  # A registered project literally named "claude" or "codex" is only
+  # reachable as the second word, after an explicit engine token - see the
+  # moduledoc.
+  defp parse_run_args(args) do
+    trimmed = String.trim(args)
+
+    case String.split(trimmed, ~r/\s+/, parts: 2) do
+      [maybe_engine, rest] when maybe_engine in @known_engines ->
+        parse_project_and_prompt(maybe_engine, rest)
+
+      [_first, _rest] ->
+        parse_project_and_prompt("claude", trimmed)
+
+      _ ->
+        :error
+    end
+  end
+
+  defp parse_project_and_prompt(engine, text) do
+    case String.split(String.trim(text), ~r/\s+/, parts: 2) do
+      [project, prompt] when project != "" ->
+        case String.trim(prompt) do
+          "" -> :error
+          trimmed_prompt -> {:ok, engine, project, trimmed_prompt}
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp launch_job(engine, project, prompt, state) do
+    registry = registry(state)
+
+    case ProjectRegistry.lookup(registry, project) do
+      {:error, {:unknown_project, _name, known}} ->
+        send_unknown_project(state, known)
+        state
+
+      {:ok, _repo_path} ->
+        job_store = state.job_store
+
+        {:ok, job} =
+          JobStore.create(job_store, %{engine: engine, project: project, prompt: prompt})
+
+        send_and_track_activity_message(
+          state,
+          job.id,
+          "Job ##{job.id} (#{project}, #{engine}): starting..."
+        )
+
+        opts =
+          state.job_launch_opts
+          |> Keyword.put_new(:job_store, job_store)
+          |> Keyword.put_new(:project_registry, registry)
+
+        JobSupervisor.start_job(job, opts)
+        state
+    end
+  end
+
+  defp handle_jobs_command(state) do
+    jobs = JobStore.list(state.job_store)
+    state.telegram.send_message(jobs_text(jobs))
+    state
+  end
+
+  defp jobs_text([]) do
+    "*Jobs*\n\n" <> MessageFormatter.escape_full("No jobs yet. Use /run to launch one.")
+  end
+
+  defp jobs_text(jobs) do
+    lines =
+      Enum.map(jobs, fn job ->
+        MessageFormatter.escape_full("##{job.id} #{job.engine} #{job.project} - #{job.status}")
+      end)
+
+    Enum.join(["*Jobs*", ""] ++ lines, "\n")
+  end
+
+  defp handle_job_cancel(job_id, state) do
+    case JobStore.update_status(state.job_store, job_id, :discarded, %{}) do
+      {:ok, job} ->
+        dynamic_supervisor =
+          Keyword.get(state.job_launch_opts, :dynamic_supervisor, JobSupervisor)
+
+        JobSupervisor.stop_job(job_id, dynamic_supervisor: dynamic_supervisor)
+
+        state.telegram.send_message(
+          MessageFormatter.escape_full("Job ##{job_id} (#{job.project}) cancelled.")
+        )
+
+        state
+
+      {:error, {:invalid_transition, from, :discarded}} ->
+        state.telegram.send_message(
+          MessageFormatter.escape_full("Job ##{job_id} is #{from} and can't be cancelled.")
+        )
+
+        state
+
+      {:error, :not_found} ->
+        state.telegram.send_message(MessageFormatter.escape_full("Job ##{job_id} not found."))
+        state
+    end
+  end
+
+  defp handle_projects_command(state) do
+    names = state |> registry() |> ProjectRegistry.known_projects()
+
+    text =
+      case names do
+        [] ->
+          "*Projects*\n\n" <> MessageFormatter.escape_full("No projects registered.")
+
+        _ ->
+          Enum.join(["*Projects*", ""] ++ Enum.map(names, &MessageFormatter.escape_full/1), "\n")
+      end
+
+    state.telegram.send_message(text)
+    state
+  end
+
+  defp send_run_usage(state) do
+    text =
+      [
+        "*Usage*",
+        "",
+        MessageFormatter.escape_full("/run <project> <prompt> - launch a claude job"),
+        MessageFormatter.escape_full("/run codex <project> <prompt> - launch a codex job"),
+        MessageFormatter.escape_full("/jobs - list jobs"),
+        MessageFormatter.escape_full("/cancel <id> - cancel a job"),
+        MessageFormatter.escape_full("/projects - list registered projects")
+      ]
+      |> Enum.join("\n")
+
+    state.telegram.send_message(text)
+  end
+
+  defp send_unknown_project(state, known_projects) do
+    known_text =
+      case known_projects do
+        [] -> "none registered"
+        names -> Enum.join(names, ", ")
+      end
+
+    state.telegram.send_message(
+      MessageFormatter.escape_full("Unknown project. Known projects: #{known_text}")
+    )
+  end
+
+  # Sends the job's activity message and, if it was sent successfully,
+  # stores its message id into the job's telegram_message_ids (so a later
+  # reply to that message can be routed back to this job - see
+  # `handle_reply_to_job/4`). A Telegram send failure here does not fail the
+  # job launch itself; the job proceeds without a tracked message.
+  defp send_and_track_activity_message(state, job_id, text) do
+    case state.telegram.send_message(MessageFormatter.escape_full(text)) do
+      {:ok, %{"result" => %{"message_id" => message_id}}} ->
+        JobStore.update(state.job_store, job_id, %{telegram_message_ids: [message_id]})
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp registry(state), do: state.project_registry || ProjectRegistry.load()
 
   # --- Helpers ---
 
