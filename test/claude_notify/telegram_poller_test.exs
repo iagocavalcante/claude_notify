@@ -109,6 +109,15 @@ defmodule ClaudeNotify.TelegramPollerTest do
       {:ok, %{"result" => true}}
     end
 
+    # Minimal addition for story #242 (native command menu) - forwards the
+    # exact command list so tests can assert register_bot_commands/1 sends
+    # everything in one call, same observability shape as every other
+    # function here.
+    def set_my_commands(commands) do
+      forward({:telegram_set_my_commands, commands})
+      {:ok, %{"result" => true}}
+    end
+
     defp forward(message) do
       case Process.whereis(:telegram_poller_test_process) do
         nil -> send(self(), message)
@@ -123,6 +132,13 @@ defmodule ClaudeNotify.TelegramPollerTest do
   # test command) only compiles this one file, so this file needs to be
   # runnable standalone. See ClaudeNotify.Engine.Fixture's own moduledoc for
   # the identical rationale.
+  # Returns {:error, :boom} instead of registering anything - just enough of
+  # the telegram module surface for register_bot_commands/1 to call into, to
+  # prove a failed setMyCommands (story #242) is logged and non-fatal.
+  defmodule FailingTelegram do
+    def set_my_commands(_commands), do: {:error, :boom}
+  end
+
   defmodule FixtureEngine do
     @behaviour ClaudeNotify.Engine
 
@@ -170,6 +186,48 @@ defmodule ClaudeNotify.TelegramPollerTest do
     # Verify the session has the expected tty_path
     session = SessionStore.get_session("sess-1")
     assert session[:tty_path] == "/dev/ttys001"
+  end
+
+  describe "command menu (story #242)" do
+    import ExUnit.CaptureLog
+
+    test "bot_commands/0 covers the full current surface, README-aligned" do
+      commands = TelegramPoller.bot_commands()
+
+      assert Enum.map(commands, &elem(&1, 0)) == ~w(
+               sessions approve cancel dashboard run jobs projects watch unwatch help
+             )
+
+      assert Enum.all?(commands, fn {command, description} ->
+               command =~ ~r/^[a-z0-9_]{1,32}$/ and String.length(description) in 3..256
+             end)
+    end
+
+    test "boot registers exactly one setMyCommands call carrying every command with a description" do
+      state = %{telegram: FakeTelegram}
+
+      assert {:noreply, ^state} = TelegramPoller.handle_info(:register_commands, state)
+
+      expected =
+        Enum.map(TelegramPoller.bot_commands(), fn {command, description} ->
+          %{command: command, description: description}
+        end)
+
+      assert_received {:telegram_set_my_commands, ^expected}
+      refute_received {:telegram_set_my_commands, _}
+    end
+
+    test "a failing setMyCommands is logged and does not crash the poller" do
+      state = %{telegram: FailingTelegram}
+
+      log =
+        capture_log(fn ->
+          assert {:noreply, ^state} = TelegramPoller.handle_info(:register_commands, state)
+        end)
+
+      assert log =~ "setMyCommands failed"
+      assert log =~ ":boom"
+    end
   end
 
   describe "job commands" do

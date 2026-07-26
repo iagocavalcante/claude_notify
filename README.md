@@ -121,6 +121,8 @@ source .env && iex -S mix
 
 ## Telegram Commands
 
+This table also drives Telegram's native "/" command menu, which self-registers automatically when the poller boots (`TelegramPoller.register_bot_commands/1`); a failed registration is logged and does not stop the bot.
+
 | Command | Description |
 |---------|-------------|
 | `/sessions` | List and select active sessions |
