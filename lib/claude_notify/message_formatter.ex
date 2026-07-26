@@ -1,15 +1,38 @@
 defmodule ClaudeNotify.MessageFormatter do
+  @notification_truncate_at 500
+
   @doc """
   Format a notification question message (for permission prompts, etc.).
+  Truncates messages over #{@notification_truncate_at} chars; use
+  `notification_question_full/2` for the un-truncated version.
   """
   def notification_question(message, session_id) do
-    truncated = truncate(message, 500)
+    build_notification(truncate(message, @notification_truncate_at), session_id)
+  end
+
+  @doc """
+  Like `notification_question/2` but does not truncate the body — used by
+  the See more expansion path.
+  """
+  def notification_question_full(message, session_id) do
+    build_notification(message || "", session_id)
+  end
+
+  @doc """
+  True when `notification_question/2` would truncate this message.
+  """
+  def notification_truncated?(message) when is_binary(message),
+    do: byte_size(message) > @notification_truncate_at
+
+  def notification_truncated?(_), do: false
+
+  defp build_notification(body, session_id) do
     short_id = String.slice(session_id, 0, 8)
 
     [
       "*Claude Code Question*",
       "",
-      escape(truncated),
+      escape(body),
       "",
       "Session: `#{escape_code(short_id)}`"
     ]

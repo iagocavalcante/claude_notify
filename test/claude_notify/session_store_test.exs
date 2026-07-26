@@ -109,4 +109,25 @@ defmodule ClaudeNotify.SessionStoreTest do
     SessionStore.register_prompt("sess-1", "hello", "/tmp/project")
     assert SessionStore.get_prompt_message_id("sess-1") == nil
   end
+
+  test "register_notification_text and get_notification_text round-trip" do
+    SessionStore.register_notification_text(42, "full notification text")
+    # Cast then call — call ensures the cast has been processed.
+    SessionStore.lookup_session_by_message(0)
+    assert SessionStore.get_notification_text(42) == "full notification text"
+  end
+
+  test "get_notification_text returns nil for unknown message_id" do
+    assert SessionStore.get_notification_text(999) == nil
+  end
+
+  test "notification_text is cleaned up when session stops" do
+    SessionStore.register_prompt("sess-1", "hello", "/tmp/project")
+    SessionStore.register_message(42, "sess-1")
+    SessionStore.register_notification_text(42, "long permission prompt body")
+
+    SessionStore.register_stop("sess-1", "user_quit")
+
+    assert SessionStore.get_notification_text(42) == nil
+  end
 end

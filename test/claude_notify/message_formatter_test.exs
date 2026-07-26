@@ -305,4 +305,29 @@ defmodule ClaudeNotify.MessageFormatterTest do
     assert message =~ "truncated"
     refute message =~ "OLDESTMARKER"
   end
+
+  describe "notification_truncated?/1" do
+    test "false for short messages" do
+      refute MessageFormatter.notification_truncated?("hello")
+      refute MessageFormatter.notification_truncated?("")
+      refute MessageFormatter.notification_truncated?(nil)
+    end
+
+    test "true once message exceeds 500 bytes" do
+      assert MessageFormatter.notification_truncated?(String.duplicate("a", 501))
+    end
+
+    test "boundary at exactly 500 bytes" do
+      refute MessageFormatter.notification_truncated?(String.duplicate("a", 500))
+    end
+  end
+
+  describe "notification_question_full/2" do
+    test "does not truncate even very long messages" do
+      long = String.duplicate("a", 1500)
+      result = MessageFormatter.notification_question_full(long, "abc12345")
+      # MarkdownV2 doesn't escape 'a', so the body length is unchanged
+      assert result =~ String.duplicate("a", 1500)
+    end
+  end
 end
