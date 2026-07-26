@@ -6,6 +6,7 @@ defmodule ClaudeNotify.TelegramPollerTest do
     SessionStore,
     JobStore,
     JobSupervisor,
+    JobTranscript,
     ProjectRegistry
   }
 
@@ -27,6 +28,21 @@ defmodule ClaudeNotify.TelegramPollerTest do
       {:ok, %{"result" => %{"message_id" => System.unique_integer([:positive, :monotonic])}}}
     end
 
+    # Forwards as the SAME {:telegram_send, text} tuple as send_message/1
+    # above (buttons intentionally not part of the observable tuple, same
+    # observability level send_message/1 itself has) - this keeps every
+    # pre-existing `assert_receive {:telegram_send, text}` valid unchanged
+    # now that the job activity message's initial send carries a [Watch]
+    # button (see ClaudeNotify.TelegramPoller.send_and_track_activity_message/3).
+    # Watch-mode tests prove the button works functionally (tapping
+    # "jobwatch:<id>" starts a watch), the same way every other job button
+    # (Show diff/Create PR/...) is already proven here - not by inspecting
+    # this call's button list.
+    def send_with_buttons(text, _buttons) do
+      forward({:telegram_send, text})
+      {:ok, %{"result" => %{"message_id" => System.unique_integer([:positive, :monotonic])}}}
+    end
+
     def edit_message_text(message_id, text) do
       forward({:telegram_edit, message_id, text})
       {:ok, %{"result" => %{"message_id" => message_id}}}
@@ -34,6 +50,11 @@ defmodule ClaudeNotify.TelegramPollerTest do
 
     def edit_message_text_with_buttons(message_id, text, buttons) do
       forward({:telegram_edit_buttons, message_id, text, buttons})
+      {:ok, %{"result" => %{"message_id" => message_id}}}
+    end
+
+    def edit_message_reply_markup(message_id, buttons) do
+      forward({:telegram_edit_markup, message_id, buttons})
       {:ok, %{"result" => %{"message_id" => message_id}}}
     end
 
@@ -155,17 +176,25 @@ defmodule ClaudeNotify.TelegramPollerTest do
         engine_opts: [script: script]
       ]
 
+      # A per-test isolated ClaudeNotify.JobTranscript, same rationale as
+      # `store` above - keeps each test's transcript entries independent of
+      # the app's global singleton and every other test.
+      transcript = :"job_transcript_#{System.unique_integer([:positive])}"
+      start_supervised!({JobTranscript, name: transcript})
+
       state = %{
         offset: 0,
         selected_sessions: %{},
         telegram: FakeTelegram,
         job_store: store,
+        job_transcript: transcript,
         project_registry: registry,
         job_launch_opts: job_launch_opts,
-        cmd_runner: fake_cmd_runner()
+        cmd_runner: fake_cmd_runner(),
+        watches: %{}
       }
 
-      %{store: store, registry: registry, state: state}
+      %{store: store, registry: registry, transcript: transcript, state: state}
     end
 
     # -- Fixtures / helpers --
@@ -741,6 +770,242 @@ defmodule ClaudeNotify.TelegramPollerTest do
       TelegramPoller.handle_update(callback_update("jobshowoutput:#{job.id}"), state)
       assert_receive {:telegram_send, output_text}
       assert output_text =~ "boom: something broke"
+    end
+
+    # -- Watch mode (story #238) --
+
+    # Same shape as write_fixture_engine_with_tool_use/1, plus an upfront
+    # sleep - so a test can reliably tap [Watch]/`/watch` WHILE the job is
+    # still :running (before any transcript entry, let alone completion,
+    # exists), instead of racing the (otherwise near-instant) fixture
+    # engine to a finish line.
+    defp write_fixture_engine_with_tool_use_slow(tmp_dir) do
+      path = Path.join(tmp_dir, "fake_engine_progress_slow.sh")
+
+      File.write!(path, """
+      #!/usr/bin/env bash
+      sleep 0.3
+      cat <<'JSON'
+      {"type":"system","subtype":"init","cwd":"ignored","session_id":"fixture-session-progress-slow"}
+      {"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"lib/foo.ex"}}]}}
+      {"type":"assistant","message":{"content":[{"type":"text","text":"working on it"}]}}
+      {"type":"result","subtype":"success","is_error":false,"result":"All done, added foo","session_id":"fixture-session-progress-slow"}
+      JSON
+      exit 0
+      """)
+
+      File.chmod!(path, 0o755)
+      path
+    end
+
+    test "tapping [Watch] on a running job's activity message starts watching, sends a transcript message, and flips the button to [Unwatch]",
+         %{state: state, store: store} do
+      TelegramPoller.handle_update(text_message("/run trainer FIXTURE_SLOW do the thing"), state)
+      assert_receive {:telegram_send, _starting}
+      assert [job] = JobStore.list(store)
+      assert job.status == :running
+
+      new_state = TelegramPoller.handle_update(callback_update("jobwatch:#{job.id}"), state)
+
+      assert_receive {:telegram_send, transcript_text}
+      assert transcript_text =~ "trainer"
+      assert %{message_id: _, dirty: false, timer_ref: nil} = new_state.watches[job.id]
+
+      assert_receive {:telegram_edit_markup, message_id, [["Unwatch", "jobunwatch:" <> id_str]]}
+      assert message_id == hd(job.telegram_message_ids)
+      assert id_str == to_string(job.id)
+
+      wait_for_status(store, job.id, :completed)
+    end
+
+    test "/watch <id> works exactly like tapping the button", %{state: state, store: store} do
+      TelegramPoller.handle_update(text_message("/run trainer FIXTURE_SLOW do the thing"), state)
+      assert_receive {:telegram_send, _starting}
+      assert [job] = JobStore.list(store)
+
+      new_state = TelegramPoller.handle_update(text_message("/watch #{job.id}"), state)
+
+      assert_receive {:telegram_send, transcript_text}
+      assert transcript_text =~ "trainer"
+      assert Map.has_key?(new_state.watches, job.id)
+
+      wait_for_status(store, job.id, :completed)
+    end
+
+    test "/watch with a non-numeric argument reports usage, no crash", %{state: state} do
+      TelegramPoller.handle_update(text_message("/watch not-a-number"), state)
+      assert_receive {:telegram_send, text}
+      assert text =~ "Usage"
+    end
+
+    test "watching an unknown job id reports not found", %{state: state} do
+      TelegramPoller.handle_update(text_message("/watch 999999"), state)
+      assert_receive {:telegram_send, text}
+      assert text =~ "not found"
+    end
+
+    test "watching the same job twice reports it's already watched", %{
+      state: state,
+      store: store
+    } do
+      TelegramPoller.handle_update(text_message("/run trainer FIXTURE_SLOW do the thing"), state)
+      assert_receive {:telegram_send, _starting}
+      assert [job] = JobStore.list(store)
+
+      new_state = TelegramPoller.handle_update(text_message("/watch #{job.id}"), state)
+      assert_receive {:telegram_send, _transcript}
+      assert_receive {:telegram_edit_markup, _, _}
+
+      TelegramPoller.handle_update(text_message("/watch #{job.id}"), new_state)
+      assert_receive {:telegram_send, text}
+      assert text =~ "Already watching"
+
+      wait_for_status(store, job.id, :completed)
+    end
+
+    test "a burst of progress events within the throttle window produces at most one transcript edit",
+         %{state: state, store: store} do
+      previous = Application.get_env(:claude_notify, :watch_edit_interval_ms)
+      Application.put_env(:claude_notify, :watch_edit_interval_ms, 50)
+
+      on_exit(fn ->
+        case previous do
+          nil -> Application.delete_env(:claude_notify, :watch_edit_interval_ms)
+          value -> Application.put_env(:claude_notify, :watch_edit_interval_ms, value)
+        end
+      end)
+
+      {:ok, job} = JobStore.create(store, %{engine: "claude", project: "trainer", prompt: "x"})
+      JobTranscript.record(state.job_transcript, job.id, JobTranscript.text_entry("first"))
+
+      watching_state = %{
+        state
+        | watches: %{job.id => %{message_id: 4242, dirty: false, timer_ref: nil}}
+      }
+
+      {:noreply, s1} = TelegramPoller.handle_info({:watch_progress, job.id}, watching_state)
+      assert s1.watches[job.id].timer_ref != nil
+
+      {:noreply, s2} = TelegramPoller.handle_info({:watch_progress, job.id}, s1)
+      {:noreply, s3} = TelegramPoller.handle_info({:watch_progress, job.id}, s2)
+      assert s3.watches[job.id].timer_ref == s1.watches[job.id].timer_ref
+
+      assert_receive {:watch_flush, flushed_job_id}, 500
+      assert flushed_job_id == job.id
+
+      {:noreply, _s4} = TelegramPoller.handle_info({:watch_flush, job.id}, s3)
+
+      assert_receive {:telegram_edit, 4242, text}
+      assert text =~ "first"
+      refute_receive {:telegram_edit, 4242, _}
+    end
+
+    test "/unwatch stops further edits: no Telegram calls after unwatch despite new progress events",
+         %{state: state, store: store} do
+      {:ok, job} =
+        JobStore.create(store, %{
+          engine: "claude",
+          project: "trainer",
+          prompt: "x",
+          telegram_message_ids: [111]
+        })
+
+      JobTranscript.record(state.job_transcript, job.id, JobTranscript.text_entry("hello"))
+
+      watching_state = %{
+        state
+        | watches: %{job.id => %{message_id: 4343, dirty: false, timer_ref: nil}}
+      }
+
+      new_state = TelegramPoller.handle_update(text_message("/unwatch #{job.id}"), watching_state)
+
+      refute Map.has_key?(new_state.watches, job.id)
+      assert_receive {:telegram_edit, 4343, finalize_text}
+      assert finalize_text =~ "hello"
+      assert_receive {:telegram_edit_markup, _message_id, [["Watch", "jobwatch:" <> _]]}
+
+      {:noreply, after_progress} =
+        TelegramPoller.handle_info({:watch_progress, job.id}, new_state)
+
+      assert after_progress == new_state
+      refute_receive {:telegram_edit, 4343, _}
+      refute_receive {:telegram_edit_markup, _, _}
+    end
+
+    test "/unwatch on a job that isn't being watched says so", %{state: state, store: store} do
+      {:ok, job} = JobStore.create(store, %{engine: "claude", project: "trainer", prompt: "x"})
+
+      TelegramPoller.handle_update(text_message("/unwatch #{job.id}"), state)
+      assert_receive {:telegram_send, text}
+      assert text =~ "not being watched"
+    end
+
+    test "a :watch_progress event for an unwatched job makes no Telegram calls", %{state: state} do
+      {:noreply, new_state} = TelegramPoller.handle_info({:watch_progress, 999_999}, state)
+      assert new_state == state
+      refute_receive {:telegram_edit, _, _}
+      refute_receive {:telegram_edit_markup, _, _}
+    end
+
+    test "job completion while watched finalizes the transcript message with the final content",
+         %{state: state, store: store, tmp_dir: tmp_dir} do
+      script = write_fixture_engine_with_tool_use_slow(tmp_dir)
+
+      state = %{
+        state
+        | job_launch_opts: Keyword.put(state.job_launch_opts, :engine_opts, script: script)
+      }
+
+      TelegramPoller.handle_update(text_message("/run trainer add a helper"), state)
+      assert_receive {:telegram_send, _starting}
+      assert [job] = JobStore.list(store)
+      job_id = job.id
+
+      new_state = TelegramPoller.handle_update(callback_update("jobwatch:#{job_id}"), state)
+      assert_receive {:telegram_send, _transcript}
+      assert_receive {:telegram_edit_markup, _message_id, [["Unwatch", "jobunwatch:" <> _]]}
+      assert %{message_id: transcript_message_id} = new_state.watches[job_id]
+
+      assert_receive {:watch_completed, ^job_id, transcript}, 2000
+
+      {:noreply, final_state} =
+        TelegramPoller.handle_info({:watch_completed, job_id, transcript}, new_state)
+
+      refute Map.has_key?(final_state.watches, job_id)
+      assert_receive {:telegram_edit, ^transcript_message_id, final_text}
+      assert final_text =~ "Read"
+      assert final_text =~ "foo\\.ex"
+
+      wait_for_status(store, job_id, :completed)
+    end
+
+    test "watching an already-terminal job whose transcript was already discarded gets the honest 'gone' reply",
+         %{state: state, store: store} do
+      TelegramPoller.handle_update(text_message("/run trainer fix the widget"), state)
+      assert_receive {:telegram_send, _starting}
+      assert [job] = JobStore.list(store)
+      wait_for_status(store, job.id, :completed)
+
+      TelegramPoller.handle_update(text_message("/watch #{job.id}"), state)
+
+      assert_receive {:telegram_send, text}
+      assert text =~ "gone"
+    end
+
+    test "watching an already-terminal job whose transcript is still available gets a static snapshot, not a live watch",
+         %{state: state, store: store} do
+      {:ok, job} = JobStore.create(store, %{engine: "claude", project: "trainer", prompt: "x"})
+      {:ok, _} = JobStore.update_status(store, job.id, :running, %{})
+      {:ok, job} = JobStore.update_status(store, job.id, :completed, %{})
+
+      JobTranscript.record(state.job_transcript, job.id, JobTranscript.text_entry("late arrival"))
+
+      new_state = TelegramPoller.handle_update(text_message("/watch #{job.id}"), state)
+
+      assert_receive {:telegram_send, text}
+      assert text =~ "late arrival"
+      refute text =~ "gone"
+      refute Map.has_key?(new_state.watches, job.id)
     end
   end
 end

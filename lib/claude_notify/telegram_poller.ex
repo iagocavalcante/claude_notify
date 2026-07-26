@@ -25,6 +25,36 @@ defmodule ClaudeNotify.TelegramPoller do
   `opts`-with-defaults pattern `ClaudeNotify.JobReconciler.run/1` already
   uses. Production callers never need to pass any of this; see `init/1` for
   the defaults.
+
+  ## Watch mode
+
+  Opt-in per job, off by default (quiet mode): tapping a job's activity
+  message's [Watch] button, or `/watch <id>`, sends ONE additional message -
+  a live snapshot of `ClaudeNotify.JobTranscript.transcript/3` for that job -
+  and edits that same message in place as new entries arrive, throttled to
+  at most one edit per `:claude_notify, :watch_edit_interval_ms` (default
+  2000ms; a burst of events within the window coalesces into a single
+  trailing edit, same throttle shape as `ClaudeNotify.ActivityTracker`).
+  [Unwatch] (or `/unwatch <id>`) cancels any pending edit and finalizes the
+  transcript message with its current content; a job completing while
+  watched finalizes it too, using the transcript snapshot
+  `ClaudeNotify.JobRunner` hands the `:completed` notifier event with -
+  never a fresh read, since `JobTranscript` discards a job's entries right
+  after that same synchronous notifier call returns (see
+  `ClaudeNotify.JobTranscript`'s moduledoc). Watching an already-terminal
+  job replies with a static snapshot if the transcript is still available,
+  or an honest "transcript gone" otherwise.
+
+  Per-job watch bookkeeping (`state.watches`: `job_id => %{message_id:,
+  dirty:, timer_ref:}`) lives in this GenServer's own state, not a separate
+  process - this app never watches more than a handful of jobs at once.
+  Since the job progress/completion notifier runs INSIDE the job's own
+  `ClaudeNotify.JobRunner` process (see `default_job_notifier/1`), it
+  reaches back into THIS process's live state via a plain `send/2` to
+  `self()` captured at launch time, handled by the `:watch_progress` /
+  `:watch_completed` `handle_info/2` clauses below - not by touching
+  `state` inside the notifier closure directly, which would only be a
+  stale, launch-time snapshot.
   """
 
   use GenServer
@@ -39,6 +69,7 @@ defmodule ClaudeNotify.TelegramPoller do
     Dashboard,
     JobStore,
     JobSupervisor,
+    JobTranscript,
     ProjectRegistry,
     WorktreeManager
   }
@@ -64,9 +95,11 @@ defmodule ClaudeNotify.TelegramPoller do
        selected_sessions: %{},
        telegram: Keyword.get(opts, :telegram, Telegram),
        job_store: Keyword.get(opts, :job_store, JobStore),
+       job_transcript: Keyword.get(opts, :job_transcript, JobTranscript),
        project_registry: Keyword.get(opts, :project_registry),
        job_launch_opts: Keyword.get(opts, :job_launch_opts, []),
-       cmd_runner: Keyword.get(opts, :cmd_runner, &default_cmd_runner/3)
+       cmd_runner: Keyword.get(opts, :cmd_runner, &default_cmd_runner/3),
+       watches: %{}
      }}
   end
 
@@ -90,6 +123,34 @@ defmodule ClaudeNotify.TelegramPoller do
         Process.send_after(self(), :poll, @retry_delay)
         {:noreply, state}
     end
+  end
+
+  # -- Watch mode (see moduledoc): notifier -> self() plumbing --
+
+  # Sent by `default_job_notifier/1` on every `:progress` event for ANY
+  # job (watched or not) - `schedule_watch_flush/2` is a no-op unless
+  # `job_id` is actually in `state.watches`, so an unwatched job causes
+  # zero extra Telegram calls (just this cheap map lookup).
+  @impl true
+  def handle_info({:watch_progress, job_id}, state) do
+    {:noreply, schedule_watch_flush(state, job_id)}
+  end
+
+  # Sent once, right after `handle_job_completed/3` runs, carrying the
+  # SAME transcript snapshot `ClaudeNotify.JobRunner` handed the
+  # `:completed` notifier event - not re-read here, since by the time this
+  # message is actually processed `JobTranscript.discard/2` has already
+  # run (see moduledoc).
+  @impl true
+  def handle_info({:watch_completed, job_id, transcript}, state) do
+    {:noreply, finalize_watch_on_completion(state, job_id, transcript)}
+  end
+
+  # The trailing edit of a throttled watch: fires `watch_edit_interval_ms`
+  # after the first progress event since the last flush.
+  @impl true
+  def handle_info({:watch_flush, job_id}, state) do
+    {:noreply, flush_watch(state, job_id)}
   end
 
   defp process_updates(updates, state) do
@@ -164,6 +225,14 @@ defmodule ClaudeNotify.TelegramPoller do
         {:job_discard, job_id} ->
           Telegram.answer_callback_query(callback_id, "Discarding...")
           handle_job_discard(job_id, state)
+
+        {:job_watch, job_id} ->
+          Telegram.answer_callback_query(callback_id, "Watching...")
+          handle_job_watch(job_id, state)
+
+        {:job_unwatch, job_id} ->
+          Telegram.answer_callback_query(callback_id, "Unwatched")
+          handle_job_unwatch(job_id, state)
 
         :error ->
           Telegram.answer_callback_query(callback_id, "Invalid action")
@@ -304,6 +373,7 @@ defmodule ClaudeNotify.TelegramPoller do
       state.job_launch_opts
       |> Keyword.put_new(:job_store, job_store)
       |> Keyword.put_new(:project_registry, registry(state))
+      |> Keyword.put_new(:job_transcript, state.job_transcript)
       |> Keyword.put_new(:notifier, default_job_notifier(state))
       |> Keyword.put(:resume_session_id, session_id)
 
@@ -356,6 +426,26 @@ defmodule ClaudeNotify.TelegramPoller do
 
       String.starts_with?(trimmed, "/projects") ->
         handle_projects_command(state)
+
+      String.starts_with?(trimmed, "/watch") ->
+        case parse_watch_id_arg(trimmed, "/watch") do
+          {:ok, job_id} ->
+            handle_job_watch(job_id, state)
+
+          :error ->
+            state.telegram.send_message(MessageFormatter.escape_full("Usage: /watch <job id>"))
+            state
+        end
+
+      String.starts_with?(trimmed, "/unwatch") ->
+        case parse_watch_id_arg(trimmed, "/unwatch") do
+          {:ok, job_id} ->
+            handle_job_unwatch(job_id, state)
+
+          :error ->
+            state.telegram.send_message(MessageFormatter.escape_full("Usage: /unwatch <job id>"))
+            state
+        end
 
       String.starts_with?(trimmed, "/help") ->
         send_help(chat_id)
@@ -550,6 +640,8 @@ defmodule ClaudeNotify.TelegramPoller do
         MessageFormatter.escape_full("/jobs - List jobs"),
         MessageFormatter.escape_full("/cancel <id> - Cancel a job"),
         MessageFormatter.escape_full("/projects - List registered projects"),
+        MessageFormatter.escape_full("/watch <id> - Watch a job's live transcript"),
+        MessageFormatter.escape_full("/unwatch <id> - Stop watching a job"),
         MessageFormatter.escape_full("/help - Show this help"),
         "",
         MessageFormatter.escape_full("Reply to any message to send text to that session."),
@@ -637,6 +729,7 @@ defmodule ClaudeNotify.TelegramPoller do
           state.job_launch_opts
           |> Keyword.put_new(:job_store, job_store)
           |> Keyword.put_new(:project_registry, registry)
+          |> Keyword.put_new(:job_transcript, state.job_transcript)
           |> Keyword.put_new(:notifier, default_job_notifier(state))
 
         JobSupervisor.start_job(job, opts)
@@ -734,13 +827,24 @@ defmodule ClaudeNotify.TelegramPoller do
     )
   end
 
-  # Sends the job's activity message and, if it was sent successfully,
+  # Sends the job's activity message (with a [Watch] button - see the
+  # moduledoc's "Watch mode" section) and, if it was sent successfully,
   # stores its message id into the job's telegram_message_ids (so a later
   # reply to that message can be routed back to this job - see
   # `handle_reply_to_job/4`). A Telegram send failure here does not fail the
   # job launch itself; the job proceeds without a tracked message.
+  #
+  # Only the INITIAL send carries `reply_markup` - the later plain
+  # `edit_message_text/2` calls in `handle_job_progress/3` never pass one,
+  # and Telegram's `editMessageText` leaves an existing inline keyboard
+  # untouched when `reply_markup` is omitted, so the [Watch] button (or
+  # [Unwatch], once `set_activity_unwatch_button/2` swaps it - see
+  # `begin_live_watch/2`) persists across those edits without this module
+  # needing to resend it on every progress tick.
   defp send_and_track_activity_message(state, job_id, text) do
-    case state.telegram.send_message(MessageFormatter.escape_full(text)) do
+    buttons = [["Watch", "jobwatch:#{job_id}"]]
+
+    case state.telegram.send_with_buttons(MessageFormatter.escape_full(text), buttons) do
       {:ok, %{"result" => %{"message_id" => message_id}}} ->
         JobStore.update(state.job_store, job_id, %{telegram_message_ids: [message_id]})
 
@@ -760,10 +864,26 @@ defmodule ClaudeNotify.TelegramPoller do
   # a fresh ProjectRegistry on every call when `state.project_registry` is
   # nil (production default), so this stays correct even if the registry is
   # edited between launch and completion.
+  #
+  # `poller_pid` is captured here (this function always runs inside THIS
+  # GenServer's own process) so the closure - which JobRunner actually
+  # calls from ITS OWN process - can reach back into this process's LIVE
+  # state for watch-mode bookkeeping (`state.watches` can gain/lose this
+  # job between launch and now) via a plain `send/2`, handled by the
+  # `:watch_progress`/`:watch_completed` `handle_info/2` clauses. The
+  # existing `handle_job_progress/3`/`handle_job_completed/3` calls below
+  # are unchanged - this only adds a message send alongside them.
   defp default_job_notifier(state) do
+    poller_pid = self()
+
     fn
-      {:progress, job_id, progress} -> handle_job_progress(state, job_id, progress)
-      {:completed, job_id, result} -> handle_job_completed(state, job_id, result)
+      {:progress, job_id, progress} ->
+        handle_job_progress(state, job_id, progress)
+        send(poller_pid, {:watch_progress, job_id})
+
+      {:completed, job_id, result} ->
+        handle_job_completed(state, job_id, result)
+        send(poller_pid, {:watch_completed, job_id, result.transcript})
     end
   end
 
@@ -1013,6 +1133,212 @@ defmodule ClaudeNotify.TelegramPoller do
     end
   end
 
+  # --- Watch mode (Watch/Unwatch button + /watch, /unwatch - see moduledoc) ---
+
+  defp handle_job_watch(job_id, state) do
+    case JobStore.get(state.job_store, job_id) do
+      nil ->
+        state.telegram.send_message(MessageFormatter.escape_full("Job ##{job_id} not found."))
+        state
+
+      job ->
+        start_watch(state, job)
+    end
+  end
+
+  defp start_watch(state, job) do
+    cond do
+      Map.has_key?(state.watches, job.id) ->
+        state.telegram.send_message(
+          MessageFormatter.escape_full("Already watching job ##{job.id}.")
+        )
+
+        state
+
+      job.status in [:queued, :running, :awaiting_input] ->
+        begin_live_watch(state, job)
+
+      true ->
+        send_terminal_snapshot(state, job)
+        state
+    end
+  end
+
+  # A running (or about-to-run) job: send the first transcript message and
+  # register `state.watches[job.id]`, so future `:watch_progress` events
+  # (see `default_job_notifier/1`) drive throttled edits of THIS message.
+  # Also swaps the activity message's [Watch] button for [Unwatch] - see
+  # `send_and_track_activity_message/3` for why a plain `edit_message_text/2`
+  # progress tick doesn't erase it afterwards.
+  defp begin_live_watch(state, job) do
+    entries = JobTranscript.transcript(state.job_transcript, job.id)
+    text = MessageFormatter.transcript_message(job, entries)
+
+    case state.telegram.send_message(text) do
+      {:ok, %{"result" => %{"message_id" => message_id}}} ->
+        set_activity_button(state, job, "Unwatch", "jobunwatch:#{job.id}")
+        watch = %{message_id: message_id, dirty: false, timer_ref: nil}
+        %{state | watches: Map.put(state.watches, job.id, watch)}
+
+      _other ->
+        state
+    end
+  end
+
+  # A job that's already terminal (:completed/:failed/:discarded): nothing
+  # left to watch, so no `state.watches` entry is registered - either a
+  # one-shot static snapshot of whatever transcript is still available, or
+  # (the expected case, since `ClaudeNotify.JobRunner` always discards a
+  # job's transcript right after its own terminal notifier call - see
+  # `ClaudeNotify.JobTranscript`'s moduledoc) an honest "it's gone" reply.
+  defp send_terminal_snapshot(state, job) do
+    case JobTranscript.transcript(state.job_transcript, job.id) do
+      [] -> state.telegram.send_message(MessageFormatter.transcript_unavailable(job))
+      entries -> state.telegram.send_message(MessageFormatter.transcript_message(job, entries))
+    end
+  end
+
+  defp handle_job_unwatch(job_id, state) do
+    case Map.get(state.watches, job_id) do
+      nil ->
+        state.telegram.send_message(
+          MessageFormatter.escape_full("Job ##{job_id} is not being watched.")
+        )
+
+        state
+
+      watch ->
+        cancel_watch_timer(watch)
+        stop_watch(state, job_id, watch)
+    end
+  end
+
+  # Explicit unwatch: finalizes the transcript message with a FRESH read
+  # (the job is not necessarily terminal, unlike `finalize_watch_on_completion/3`
+  # below, so there's no discard race to worry about here) and flips the
+  # activity message's button back to [Watch] so the job can be re-watched.
+  defp stop_watch(state, job_id, watch) do
+    case JobStore.get(state.job_store, job_id) do
+      nil ->
+        :ok
+
+      job ->
+        entries = JobTranscript.transcript(state.job_transcript, job_id)
+        text = MessageFormatter.transcript_message(job, entries)
+        state.telegram.edit_message_text(watch.message_id, text)
+        set_activity_button(state, job, "Watch", "jobwatch:#{job.id}")
+    end
+
+    %{state | watches: Map.delete(state.watches, job_id)}
+  end
+
+  # Job completion while watched: finalizes the transcript message using
+  # the snapshot `ClaudeNotify.JobRunner` handed the `:completed` notifier
+  # event, NOT a fresh `JobTranscript.transcript/2` read - by the time this
+  # `handle_info/2`-driven call runs, `JobTranscript.discard/2` has almost
+  # certainly already fired (see moduledoc's "Watch mode" section). The
+  # activity message itself needs no button flip-back here: the pre-existing
+  # completion-report flow (`deliver_completion_report/4`) already replaces
+  # its ENTIRE keyboard with the Show diff/Create PR/Discard (or Show
+  # output/Discard) buttons.
+  defp finalize_watch_on_completion(state, job_id, transcript) do
+    case Map.get(state.watches, job_id) do
+      nil ->
+        state
+
+      watch ->
+        cancel_watch_timer(watch)
+
+        case JobStore.get(state.job_store, job_id) do
+          nil ->
+            :ok
+
+          job ->
+            text = MessageFormatter.transcript_message(job, transcript)
+            state.telegram.edit_message_text(watch.message_id, text)
+        end
+
+        %{state | watches: Map.delete(state.watches, job_id)}
+    end
+  end
+
+  # Trailing-edge throttle, same shape as `ClaudeNotify.ActivityTracker`'s
+  # `maybe_schedule_flush/3`: the first `:watch_progress` since the last
+  # flush arms a timer; further events before it fires just mark `dirty`,
+  # so a burst coalesces into a single edit `watch_edit_interval_ms` later.
+  # A no-op when `job_id` isn't currently watched.
+  defp schedule_watch_flush(state, job_id) do
+    case Map.get(state.watches, job_id) do
+      nil ->
+        state
+
+      %{timer_ref: nil} = watch ->
+        ref = Process.send_after(self(), {:watch_flush, job_id}, watch_edit_interval_ms())
+        %{state | watches: Map.put(state.watches, job_id, %{watch | timer_ref: ref, dirty: true})}
+
+      watch ->
+        %{state | watches: Map.put(state.watches, job_id, %{watch | dirty: true})}
+    end
+  end
+
+  defp flush_watch(state, job_id) do
+    case Map.get(state.watches, job_id) do
+      nil ->
+        state
+
+      %{dirty: false} = watch ->
+        %{state | watches: Map.put(state.watches, job_id, %{watch | timer_ref: nil})}
+
+      watch ->
+        render_and_edit_watch(state, job_id, watch)
+
+        %{
+          state
+          | watches: Map.put(state.watches, job_id, %{watch | dirty: false, timer_ref: nil})
+        }
+    end
+  end
+
+  defp render_and_edit_watch(state, job_id, watch) do
+    case JobStore.get(state.job_store, job_id) do
+      nil ->
+        :ok
+
+      job ->
+        entries = JobTranscript.transcript(state.job_transcript, job_id)
+        text = MessageFormatter.transcript_message(job, entries)
+        state.telegram.edit_message_text(watch.message_id, text)
+    end
+  end
+
+  defp cancel_watch_timer(%{timer_ref: nil}), do: :ok
+  defp cancel_watch_timer(%{timer_ref: ref}), do: Process.cancel_timer(ref)
+
+  defp watch_edit_interval_ms do
+    Application.get_env(:claude_notify, :watch_edit_interval_ms, 2_000)
+  end
+
+  # Swaps ONLY a job's activity message's inline keyboard (via
+  # `Telegram.edit_message_reply_markup/2`) - never touches its text, since
+  # the caller doesn't know (and shouldn't need to reconstruct) whatever
+  # progress text is currently displayed there.
+  defp set_activity_button(state, %{telegram_message_ids: [message_id | _]}, label, data) do
+    state.telegram.edit_message_reply_markup(message_id, [[label, data]])
+  end
+
+  defp set_activity_button(_state, _job, _label, _data), do: :ok
+
+  defp parse_watch_id_arg(trimmed, prefix) do
+    trimmed
+    |> String.replace_prefix(prefix, "")
+    |> String.trim()
+    |> Integer.parse()
+    |> case do
+      {job_id, ""} -> {:ok, job_id}
+      _ -> :error
+    end
+  end
+
   # --- Job diff/diffstat (read-only `git diff`, no DI needed - only the
   # push/PR path in create_pr/2 needs to be faked in tests) ---
 
@@ -1056,6 +1382,8 @@ defmodule ClaudeNotify.TelegramPoller do
   defp parse_callback_data("jobshowoutput:" <> id), do: parse_job_callback(:job_show_output, id)
   defp parse_callback_data("jobpr:" <> id), do: parse_job_callback(:job_create_pr, id)
   defp parse_callback_data("jobdiscard:" <> id), do: parse_job_callback(:job_discard, id)
+  defp parse_callback_data("jobwatch:" <> id), do: parse_job_callback(:job_watch, id)
+  defp parse_callback_data("jobunwatch:" <> id), do: parse_job_callback(:job_unwatch, id)
 
   defp parse_callback_data(data) when is_binary(data) do
     case String.split(data, ":", parts: 2) do
