@@ -237,4 +237,72 @@ defmodule ClaudeNotify.MessageFormatterTest do
     message = MessageFormatter.job_output_block(nil)
     assert message =~ "No output captured"
   end
+
+  # Watch mode transcript rendering (story #238)
+
+  test "transcript_unavailable reports the job id and never claims to be watching" do
+    message = MessageFormatter.transcript_unavailable(@job)
+    assert message =~ "7"
+    assert message =~ "gone"
+  end
+
+  test "transcript_message with no entries shows a waiting placeholder" do
+    message = MessageFormatter.transcript_message(@job, [])
+    assert message =~ "trainer"
+    assert message =~ "no output yet"
+  end
+
+  test "transcript_message renders :text entries in order" do
+    entries = [
+      %{type: :text, text: "first update", at: 1},
+      %{type: :text, text: "second update", at: 2}
+    ]
+
+    message = MessageFormatter.transcript_message(@job, entries)
+
+    assert message =~ "first update"
+    assert message =~ "second update"
+    first_index = :binary.match(message, "first update") |> elem(0)
+    second_index = :binary.match(message, "second update") |> elem(0)
+    assert first_index < second_index
+  end
+
+  test "transcript_message renders a :tool_use entry's diff in the existing consolidated-diff (fenced pre block) style" do
+    entry = %{
+      type: :tool_use,
+      name: "Edit",
+      file_path: "lib/foo.ex",
+      diff: "-old line\n+new line",
+      at: 1
+    }
+
+    message = MessageFormatter.transcript_message(@job, [entry])
+
+    assert message =~ "Edit"
+    assert message =~ "foo\\.ex"
+    assert message =~ "```"
+    assert message =~ "old line"
+    assert message =~ "new line"
+  end
+
+  test "transcript_message renders a :tool_use entry with no diff, no pre block" do
+    entry = %{type: :tool_use, name: "Read", file_path: "lib/foo.ex", diff: nil, at: 1}
+    message = MessageFormatter.transcript_message(@job, [entry])
+
+    assert message =~ "Read"
+    refute message =~ "```"
+  end
+
+  test "transcript_message never exceeds Telegram's 4096-char limit and keeps the newest entries when over budget" do
+    oldest = %{type: :text, text: "OLDESTMARKER " <> String.duplicate("a", 2000), at: 1}
+    middle = %{type: :text, text: "MIDDLEMARKER " <> String.duplicate("b", 2000), at: 2}
+    newest = %{type: :text, text: "NEWESTMARKER " <> String.duplicate("c", 2000), at: 3}
+
+    message = MessageFormatter.transcript_message(@job, [oldest, middle, newest])
+
+    assert byte_size(message) <= 4096
+    assert message =~ "NEWESTMARKER"
+    assert message =~ "truncated"
+    refute message =~ "OLDESTMARKER"
+  end
 end

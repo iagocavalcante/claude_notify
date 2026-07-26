@@ -258,6 +258,116 @@ defmodule ClaudeNotify.MessageFormatter do
   """
   def job_output_block(text), do: pre_block(text) || escape("No output captured.")
 
+  @doc """
+  Format the reply for watching an already-terminal job whose transcript
+  was already discarded (see `ClaudeNotify.JobTranscript`'s discard-on-
+  completion lifecycle, driven by `ClaudeNotify.JobRunner`) - never claims
+  the job is still being watched.
+  """
+  def transcript_unavailable(job) do
+    escape("Job ##{job.id}: transcript gone (job ended before watching).")
+  end
+
+  @max_transcript_chars 4_096
+  @transcript_truncation_notice "_earlier entries truncated_\n\n"
+
+  @doc """
+  Format a watched job's transcript message: a header plus its recorded
+  `ClaudeNotify.JobTranscript.transcript/3` entries (oldest first) - a
+  `:text` entry as escaped plain text, a `:tool_use` entry as a tool/file
+  label plus its captured diff rendered in the same fenced `pre_block/1`
+  style already used for `job_completed/3`'s diffstat.
+
+  Bounded to Telegram's 4096-char message limit: when the full render
+  doesn't fit, the OLDEST entries are dropped first - newest content
+  always wins - and a truncation marker is added. Always renders
+  something for a non-empty `entries` list, byte-truncating a single
+  oversized entry (never splitting a UTF-8 codepoint) if even the newest
+  entry alone doesn't fit.
+  """
+  def transcript_message(job, []) do
+    transcript_header(job) <> escape("(no output yet)")
+  end
+
+  def transcript_message(job, entries) do
+    header = transcript_header(job)
+    blocks = Enum.map(entries, &render_transcript_entry/1)
+    newest_first = Enum.reverse(blocks)
+    budget = @max_transcript_chars - byte_size(header)
+
+    {kept, kept_count} = take_transcript_blocks(newest_first, budget)
+
+    if kept_count < length(blocks) do
+      truncated_budget = max(budget - byte_size(@transcript_truncation_notice), 0)
+      {kept_truncated, _count} = take_transcript_blocks(newest_first, truncated_budget)
+      header <> @transcript_truncation_notice <> Enum.join(kept_truncated, "\n\n")
+    else
+      header <> Enum.join(kept, "\n\n")
+    end
+  end
+
+  defp transcript_header(job) do
+    "👀 " <>
+      escape("Job ##{job.id} (#{job.project}, #{job.engine}) - transcript") <>
+      "\n━━━━━━━━━━━━━━━\n\n"
+  end
+
+  defp render_transcript_entry(%{type: :text, text: text}), do: escape(text)
+
+  defp render_transcript_entry(%{type: :tool_use, name: name, file_path: nil}) do
+    escape("🔧 #{name}")
+  end
+
+  defp render_transcript_entry(%{type: :tool_use, name: name, file_path: file_path, diff: diff}) do
+    label = escape("🔧 #{name}: #{file_path}")
+
+    case pre_block(diff) do
+      nil -> label
+      block -> label <> "\n" <> block
+    end
+  end
+
+  # Keeps the longest NEWEST-first prefix of `blocks` (each preceded by a
+  # "\n\n" separator, except the first) that fits within `budget` bytes,
+  # returned already in oldest-first order - ready for a direct
+  # `Enum.join/2` - so newer entries are always favored when not
+  # everything fits. Always keeps at least one (byte-truncated if
+  # necessary) block, so a non-empty transcript never renders as empty.
+  defp take_transcript_blocks([], _budget), do: {[], 0}
+
+  defp take_transcript_blocks([newest | rest], budget) do
+    fitted = fit_transcript_block(newest, budget)
+    accumulate_transcript_blocks(rest, budget - byte_size(fitted), [fitted], 1)
+  end
+
+  defp accumulate_transcript_blocks([], _remaining, acc, count), do: {acc, count}
+
+  defp accumulate_transcript_blocks([block | rest], remaining, acc, count) do
+    needed = byte_size(block) + 2
+
+    if needed <= remaining do
+      accumulate_transcript_blocks(rest, remaining - needed, [block | acc], count + 1)
+    else
+      {acc, count}
+    end
+  end
+
+  defp fit_transcript_block(block, budget) when byte_size(block) <= budget, do: block
+
+  defp fit_transcript_block(block, budget) do
+    block
+    |> binary_part(0, max(budget, 0))
+    |> valid_utf8_transcript_prefix()
+  end
+
+  defp valid_utf8_transcript_prefix(bin) do
+    if String.valid?(bin) do
+      bin
+    else
+      valid_utf8_transcript_prefix(binary_part(bin, 0, byte_size(bin) - 1))
+    end
+  end
+
   defp summary_line(nil), do: escape("(no summary reported)")
   defp summary_line(""), do: escape("(no summary reported)")
   defp summary_line(text), do: escape(truncate(text, 500))

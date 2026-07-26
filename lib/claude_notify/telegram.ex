@@ -68,6 +68,22 @@ defmodule ClaudeNotify.Telegram do
     api_post("editMessageText", body)
   end
 
+  @doc """
+  Edits only an existing message's inline keyboard, leaving its text
+  untouched - the companion to `edit_message_text_with_buttons/3` for
+  callers that need to swap a message's buttons (e.g. Watch -> Unwatch)
+  without needing to know or resend its current text.
+  """
+  def edit_message_reply_markup(message_id, buttons) do
+    body = %{
+      chat_id: chat_id(),
+      message_id: message_id,
+      reply_markup: %{inline_keyboard: inline_keyboard(buttons)}
+    }
+
+    api_post("editMessageReplyMarkup", body)
+  end
+
   defp inline_keyboard([]), do: []
 
   defp inline_keyboard(buttons) do
