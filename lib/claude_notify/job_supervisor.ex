@@ -217,6 +217,7 @@ defmodule ClaudeNotify.JobSupervisor do
     end
 
     defp engine_for_name("claude"), do: {:ok, ClaudeNotify.Engine.Claude}
+    defp engine_for_name("codex"), do: {:ok, ClaudeNotify.Engine.Codex}
     defp engine_for_name(other), do: {:error, {:unsupported_engine, other}}
   end
 end
