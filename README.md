@@ -53,6 +53,7 @@ Terminal.app — keystrokes injected into correct tab
 - **Elixir >= 1.19** and **Erlang/OTP >= 28**
 - **python3** (used by hook scripts for JSON processing)
 - **cloudflared** or **Tailscale CLI** (optional; choose either for remote web previews)
+- **Google Chrome or Microsoft Edge plus the paired Claude browser extension** (optional; required only for browser-enabled Claude jobs)
 - A **Telegram Bot** (create one via [@BotFather](https://t.me/BotFather))
 
 ## Quick Setup
@@ -153,6 +154,8 @@ This table also drives Telegram's native "/" command menu, which self-registers 
 
 Reply to any message to send text to that session. If only one session is active, it is auto-selected. Replying to a dispatcher job's activity message resumes that job instead — see [Job dispatcher](#job-dispatcher).
 
+Registered bot commands in the table above are handled by Claude Notify. Every other slash command is forwarded verbatim to the selected destination, so project skills such as `/post-shorts make three variants` work like they do in Claude Code. A selected terminal session receives the text in its existing Terminal.app tab; a selected project starts an isolated dispatcher job with that text as its prompt.
+
 ## Security Model
 
 - Only the configured `TELEGRAM_CHAT_ID` can control sessions from Telegram messages/callbacks.
@@ -210,7 +213,7 @@ TAILSCALE_PREVIEW_MODE=serve
 
 Dispatcher settings (job commands, watch mode) are `config.exs`/`runtime.exs` keys, not `.env` variables — see [Job dispatcher](#job-dispatcher) for the full list with defaults.
 
-When `CLAUDE_NOTIFY_CLAUDE_CHROME=true`, every Claude dispatcher and resumed job starts with `--chrome`, including jobs inside isolated worktrees. Install and pair Claude in Chrome first. Bot commands such as `/jobs` remain owned by Telegram; any other slash command, such as a project `/post-shorts` skill or Claude's `/chrome`, is sent verbatim to the selected session/project.
+When `CLAUDE_NOTIFY_CLAUDE_CHROME=true`, every Claude dispatcher and resumed job starts with `--chrome`, including jobs inside isolated worktrees. Bot commands such as `/jobs` remain owned by Telegram; any other slash command, such as a project `/post-shorts` skill or Claude's `/chrome`, is sent verbatim to the selected session/project.
 
 Load this env in the shell where you run Claude Code so hooks can sign webhook requests:
 
@@ -219,6 +222,27 @@ set -a
 source .env
 set +a
 ```
+
+## Claude skills and Chrome from Telegram
+
+Claude Notify preserves Claude Code's message-oriented workflow: select a destination, then send normal prompts or project slash commands from Telegram. Browser access depends on which kind of destination is selected:
+
+| Selected destination | What happens | Chrome behavior |
+|----------------------|--------------|-----------------|
+| Terminal session from `/sessions` | The message or slash command is pasted into the existing Claude Code process | Uses that process's current browser connection. Send `/chrome` first if it was not started with Chrome enabled. |
+| Project from `/new` or `/projects` | A new Claude or Codex job runs in an isolated worktree | Claude jobs start with `--chrome` when `CLAUDE_NOTIFY_CLAUDE_CHROME=true`; Codex jobs are unchanged. |
+| Completed job activity message | A reply creates a fresh job that resumes the recorded agent conversation | Resumed Claude jobs also receive `--chrome` when enabled. |
+
+To enable full Claude browser tools for new project jobs:
+
+1. Install the [Claude browser extension](https://code.claude.com/docs/en/chrome) in Chrome or Edge, pair it with Claude Code, and leave the browser running.
+2. Set `CLAUDE_NOTIFY_CLAUDE_CHROME=true` in this project's `.env`.
+3. Restart Claude Notify so the runtime configuration is reloaded.
+4. In Telegram, send `/new`, choose a project and Claude, then send a normal prompt or a skill such as `/post-shorts ...`.
+
+The extension pairing belongs to the local Claude/browser installation, so it remains available when a dispatcher job runs from a generated worktree. The job can use the visible browser's existing login state and extension permissions. Login challenges, CAPTCHAs, confirmation dialogs, and sites outside the extension's allowed scope may still require manual interaction.
+
+If Claude recognizes a skill but reports that browser tools are unavailable, check that the extension says it is connected, Chrome is running, and the job was created after enabling the environment variable and restarting the service. Existing terminal processes do not gain the `--chrome` startup flag retroactively; use `/chrome` in that session or start a new Claude Code process.
 
 ## Ephemeral web previews
 
@@ -458,7 +482,7 @@ Off by default (quiet mode) — a job's activity message only ever shows an aggr
 
 | Engine | Status |
 |--------|--------|
-| `claude` | Drives the `claude` CLI (`claude -p ... --output-format stream-json --verbose --dangerously-skip-permissions`) via `ClaudeNotify.Engine.Claude`. Its `stream-json` event parsing was confirmed against a real invocation. |
+| `claude` | Drives the `claude` CLI (`claude [--chrome] -p ... --output-format stream-json --verbose --dangerously-skip-permissions`) via `ClaudeNotify.Engine.Claude`. `--chrome` is added when `CLAUDE_NOTIFY_CLAUDE_CHROME=true`, including for resumed jobs. Its `stream-json` event parsing and browser-tool connection were confirmed against real invocations. |
 | `codex` | Drives the `codex` CLI (`codex exec --experimental-json --sandbox workspace-write --ask-for-approval never ...`) via `ClaudeNotify.Engine.Codex`. Fully implemented and unit-tested, but its event-shape parsing was verified only from the `@openai/codex-sdk` source and offline CLI flag-parsing probes, not a live run — see `ClaudeNotify.Engine.Codex`'s moduledoc for exactly what is and isn't confirmed. `--experimental-json` is an undocumented, explicitly "experimental" upstream flag; a future `codex-cli` release could change or remove it. |
 
 ### Concurrency
@@ -485,13 +509,14 @@ Reconciliation never crashes the app — any failure during the pass is caught a
 
 ### Dispatcher configuration reference
 
-All of these are `config.exs`/`runtime.exs` keys under `config :claude_notify, ...` — not `.env` variables.
+These are the main dispatcher keys under `config :claude_notify, ...`. Environment-backed keys show their corresponding variable below.
 
 | Key | Default | Purpose |
 |-----|---------|---------|
 | `:workspace_roots` | `[~/Workspaces]` | Roots scanned for selectable Git repositories; set with `CLAUDE_NOTIFY_WORKSPACE_ROOTS` |
 | `:workspace_discovery_depth` | `4` | Maximum directory depth scanned below each workspace root |
 | `:projects` | `[]` | Optional explicit project entries and aliases — see [Registering explicit projects and aliases](#registering-explicit-projects-and-aliases) |
+| `:claude_chrome_enabled` | `false` | Add `--chrome` to new and resumed Claude dispatcher jobs; set with `CLAUDE_NOTIFY_CLAUDE_CHROME` |
 | `:job_concurrency` | `3` | Max jobs running at once before new launches queue FIFO |
 | `:job_worktree_retention_seconds` | `604_800` (7 days) | How long a `:completed`/`:discarded` job's worktree survives before boot reconciliation sweeps it |
 | `:start_job_reconciler` | `true` (`false` in `config/test.exs`) | Whether `ClaudeNotify.JobReconciler` runs its one-shot pass at boot |
@@ -516,8 +541,8 @@ JobSupervisor /   — enforces the concurrency cap + FIFO queue, then supervises
 JobRunner         — drives the engine CLI as a Port, parses its output, records the
                      transcript, and pushes progress/completion back to JobStore
       |
-Engine.Claude /   — engine-specific command building + event parsing
-  Engine.Codex
+Engine.Claude /   — engine-specific command building + event parsing; Claude can connect
+  Engine.Codex      to the paired browser extension when --chrome is enabled
       |
 TelegramPoller    — the only caller of the above: guides /new and parses /run /jobs /cancel /projects
                      /watch /unwatch and reply-to-job text, renders activity/report
