@@ -50,7 +50,7 @@ defmodule ClaudeNotify.IntegrationTest do
       "tool_output" => "3 tests, 0 failures"
     })
 
-    # 5. Session ends with diff
+    # 5. The turn ends with a diff; the terminal session remains idle.
     EventHandler.handle_event(%{
       "event" => "stop",
       "session_id" => "integ-1",
@@ -59,7 +59,7 @@ defmodule ClaudeNotify.IntegrationTest do
       "git_diff" => " 2 files changed, +10 -3"
     })
 
-    assert SessionStore.get_session("integ-1") == nil
+    assert SessionStore.get_session("integ-1").status == :idle
   end
 
   test "session without git diff still works" do
@@ -86,6 +86,6 @@ defmodule ClaudeNotify.IntegrationTest do
       "git_diff" => ""
     })
 
-    assert SessionStore.get_session("integ-2") == nil
+    assert SessionStore.get_session("integ-2").status == :idle
   end
 end

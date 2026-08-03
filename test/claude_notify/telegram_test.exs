@@ -74,6 +74,47 @@ defmodule ClaudeNotify.TelegramTest do
     end
   end
 
+  describe "html_chunk/2" do
+    test "closes and reopens formatting across chunks" do
+      html = "<b>" <> String.duplicate("formatted text ", 30) <> "</b>"
+      chunks = Telegram.html_chunk(html, 90)
+
+      assert length(chunks) > 1
+      assert Enum.all?(chunks, &(String.length(&1) <= 90))
+      assert Enum.all?(chunks, &String.starts_with?(&1, "<b>"))
+      assert Enum.all?(chunks, &String.ends_with?(&1, "</b>"))
+
+      reconstructed =
+        chunks
+        |> Enum.map(
+          &(&1
+            |> String.replace_prefix("<b>", "")
+            |> String.replace_suffix("</b>", ""))
+        )
+        |> Enum.join()
+
+      assert reconstructed == String.duplicate("formatted text ", 30)
+    end
+
+    test "does not split escaped HTML entities" do
+      html = "<pre>" <> String.duplicate("&lt;value&gt; ", 30) <> "</pre>"
+      chunks = Telegram.html_chunk(html, 80)
+
+      assert length(chunks) > 1
+      assert Enum.all?(chunks, &(String.length(&1) <= 80))
+      refute Enum.any?(chunks, &Regex.match?(~r/&[^;]*$/, &1))
+    end
+
+    test "keeps nested tags balanced" do
+      html = "<blockquote><b>" <> String.duplicate("nested ", 40) <> "</b></blockquote>"
+      chunks = Telegram.html_chunk(html, 100)
+
+      assert Enum.all?(chunks, &String.starts_with?(&1, "<blockquote><b>"))
+      assert Enum.all?(chunks, &String.ends_with?(&1, "</b></blockquote>"))
+      assert Enum.all?(chunks, &(String.length(&1) <= 100))
+    end
+  end
+
   describe "API surface" do
     test "edit_message_text supports arity 2 and 3" do
       assert function_exported?(Telegram, :edit_message_text, 2)
@@ -91,6 +132,13 @@ defmodule ClaudeNotify.TelegramTest do
     test "send_message accepts opts" do
       assert function_exported?(Telegram, :send_message, 1)
       assert function_exported?(Telegram, :send_message, 2)
+    end
+
+    test "HTML message helpers are available" do
+      assert function_exported?(Telegram, :send_html_with_retry, 1)
+      assert function_exported?(Telegram, :send_html_with_retry, 2)
+      assert function_exported?(Telegram, :send_html_with_retry, 3)
+      assert function_exported?(Telegram, :edit_message_text_with_buttons_html_retry, 3)
     end
 
     test "set_message_reaction sends correct API request" do

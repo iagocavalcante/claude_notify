@@ -8,12 +8,8 @@ SESSION_ID="${CLAUDE_SESSION_ID:-unknown}"
 PROMPT="${CLAUDE_PROMPT:-}"
 WORKING_DIR="${CLAUDE_WORKING_DIRECTORY:-$(pwd)}"
 TERM_SID="${TERM_SESSION_ID:-unknown}"
-TTY_DEV="$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' ')"
-if [[ "$TTY_DEV" =~ ^ttys[0-9]+$ ]]; then
-  TTY_PATH="/dev/$TTY_DEV"
-else
-  TTY_PATH="unknown"
-fi
+TTY_PATH="$(resolve_terminal_tty)"
+[ "$TTY_PATH" = "unknown" ] && exit 0
 
 # Truncate prompt to 500 chars to keep payload small
 PROMPT="${PROMPT:0:500}"

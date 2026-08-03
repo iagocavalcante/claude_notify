@@ -86,6 +86,79 @@ defmodule ClaudeNotify.ProjectRegistryTest do
     end
   end
 
+  describe "workspace discovery" do
+    test "discovers git repositories below a configured workspace root", %{tmp: tmp} do
+      workspace = Path.join(tmp, "Workspaces")
+      owner = Path.join(workspace, "acme")
+      File.mkdir_p!(owner)
+      repo = git_repo!(owner, "widgets")
+
+      registry =
+        ProjectRegistry.load(
+          projects: [],
+          workspace_roots: [workspace],
+          workspace_discovery_depth: 3,
+          config_path: missing_config_path(tmp)
+        )
+
+      assert {:ok, ^repo} = ProjectRegistry.lookup(registry, "widgets")
+      assert ProjectRegistry.entries(registry) == [%{name: "widgets", path: repo}]
+    end
+
+    test "uses relative names when repositories share a basename", %{tmp: tmp} do
+      workspace = Path.join(tmp, "Workspaces")
+      first_owner = Path.join(workspace, "acme")
+      second_owner = Path.join(workspace, "personal")
+      File.mkdir_p!(first_owner)
+      File.mkdir_p!(second_owner)
+      first = git_repo!(first_owner, "app")
+      second = git_repo!(second_owner, "app")
+
+      registry =
+        ProjectRegistry.load(
+          projects: [],
+          workspace_roots: [workspace],
+          workspace_discovery_depth: 3,
+          config_path: missing_config_path(tmp)
+        )
+
+      assert {:ok, ^first} = ProjectRegistry.lookup(registry, "acme/app")
+      assert {:ok, ^second} = ProjectRegistry.lookup(registry, "personal/app")
+    end
+
+    test "explicit entries override an automatically discovered name", %{tmp: tmp} do
+      workspace = Path.join(tmp, "Workspaces")
+      File.mkdir_p!(workspace)
+      _discovered = git_repo!(workspace, "widgets")
+      explicit = git_repo!(tmp, "explicit_widgets")
+
+      registry =
+        ProjectRegistry.load(
+          projects: [%{name: "widgets", path: explicit}],
+          workspace_roots: [workspace],
+          config_path: missing_config_path(tmp)
+        )
+
+      assert {:ok, ^explicit} = ProjectRegistry.lookup(registry, "widgets")
+    end
+
+    test "does not follow a workspace symlink to a repository outside the root", %{tmp: tmp} do
+      workspace = Path.join(tmp, "Workspaces")
+      File.mkdir_p!(workspace)
+      outside = git_repo!(tmp, "outside")
+      File.ln_s!(outside, Path.join(workspace, "linked-outside"))
+
+      registry =
+        ProjectRegistry.load(
+          projects: [],
+          workspace_roots: [workspace],
+          config_path: missing_config_path(tmp)
+        )
+
+      assert ProjectRegistry.known_projects(registry) == []
+    end
+  end
+
   describe "validation at load" do
     test "rejects a configured path that does not exist, with a clear log", %{tmp: tmp} do
       missing_path = Path.join(tmp, "nope")

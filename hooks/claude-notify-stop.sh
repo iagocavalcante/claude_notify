@@ -7,12 +7,8 @@ source "$(dirname "$0")/claude-notify-common.sh"
 INPUT=$(cat)
 
 TERM_SID="${TERM_SESSION_ID:-unknown}"
-TTY_DEV="$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' ')"
-if [[ "$TTY_DEV" =~ ^ttys[0-9]+$ ]]; then
-  TTY_PATH="/dev/$TTY_DEV"
-else
-  TTY_PATH="unknown"
-fi
+TTY_PATH="$(resolve_terminal_tty)"
+[ "$TTY_PATH" = "unknown" ] && exit 0
 
 # Capture git diff for the working directory
 WORKING_DIR="${PWD}"

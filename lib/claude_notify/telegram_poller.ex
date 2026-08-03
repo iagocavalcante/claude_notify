@@ -13,7 +13,7 @@ defmodule ClaudeNotify.TelegramPoller do
 
   `/run [claude|codex] <project> <prompt>` launches a dispatcher job via
   `ClaudeNotify.JobSupervisor.start_job/2`; `/jobs` lists known jobs;
-  `/cancel <id>` cancels one; `/projects` lists registered projects.
+  `/cancel <id>` cancels one; `/projects` opens the working-directory picker.
   Replying to a job's activity message resumes that job (a NEW job, wired
   with `resume_session_id` - see `ClaudeNotify.JobRunner`'s moduledoc for
   what "resume" does and does not carry over).
@@ -70,6 +70,7 @@ defmodule ClaudeNotify.TelegramPoller do
     JobStore,
     JobSupervisor,
     JobTranscript,
+    PreviewManager,
     ProjectRegistry,
     WorktreeManager
   }
@@ -78,6 +79,7 @@ defmodule ClaudeNotify.TelegramPoller do
 
   @poll_timeout 30
   @known_engines ["claude", "codex"]
+  @project_page_size 8
   @max_retry_delay 15_000
 
   # Single source of truth for the bot's command surface: both
@@ -91,15 +93,19 @@ defmodule ClaudeNotify.TelegramPoller do
   # Telegram only allows one description per command name, so its entry
   # covers both briefly instead of getting two menu rows.
   @bot_commands [
-    {"sessions", "List and select active sessions"},
+    {"new", "Choose a project and start a task"},
+    {"sessions", "List and select terminal sessions, including idle"},
     {"approve", "Send Yes to the selected session"},
     {"cancel", "Send Escape to the selected session, or cancel a job by id"},
-    {"dashboard", "Show live session dashboard"},
+    {"dashboard", "Show Claude Code and Codex sessions and jobs"},
     {"run", "Launch a dispatcher job: [claude|codex] <project> <prompt>"},
     {"jobs", "List known dispatcher jobs and their status"},
-    {"projects", "List registered dispatcher projects"},
+    {"projects", "Choose a project working directory"},
     {"watch", "Watch a dispatcher job's live transcript"},
     {"unwatch", "Stop watching a dispatcher job"},
+    {"preview", "Open a secure web preview for a job"},
+    {"previews", "List active web previews"},
+    {"unpreview", "Stop and remove a web preview"},
     {"help", "Show available commands"}
   ]
 
@@ -118,11 +124,15 @@ defmodule ClaudeNotify.TelegramPoller do
      %{
        offset: 0,
        selected_sessions: %{},
+       selected_projects: %{},
+       selected_engines: %{},
        telegram: Keyword.get(opts, :telegram, Telegram),
        job_store: Keyword.get(opts, :job_store, JobStore),
        job_transcript: Keyword.get(opts, :job_transcript, JobTranscript),
        project_registry: Keyword.get(opts, :project_registry),
        job_launch_opts: Keyword.get(opts, :job_launch_opts, []),
+       preview_module: Keyword.get(opts, :preview_module, PreviewManager),
+       preview_manager: Keyword.get(opts, :preview_manager, PreviewManager),
        cmd_runner: Keyword.get(opts, :cmd_runner, &default_cmd_runner/3),
        watches: %{},
        attempt: 0,
@@ -271,6 +281,31 @@ defmodule ClaudeNotify.TelegramPoller do
       Logger.info("TelegramPoller: callback: #{data}")
 
       case parse_callback_data(data) do
+        {:nav, :new} ->
+          Telegram.answer_callback_query(callback_id, "Choose a project")
+          send_project_picker(chat_id, state, 0)
+          state
+
+        {:nav, :sessions} ->
+          Telegram.answer_callback_query(callback_id, "Open sessions")
+          send_session_list(chat_id)
+          state
+
+        {:nav, :jobs} ->
+          Telegram.answer_callback_query(callback_id, "Recent jobs")
+          handle_jobs_command(state)
+
+        {:projects_page, page} ->
+          Telegram.answer_callback_query(callback_id, "Projects")
+          send_project_picker(chat_id, state, page)
+          state
+
+        {:project, token} ->
+          handle_project_select(callback_id, chat_id, token, state)
+
+        {:engine, engine} ->
+          handle_engine_select(callback_id, chat_id, engine, state)
+
         {:select, session_id} ->
           Telegram.answer_callback_query(callback_id, "Session selected")
           handle_session_select(chat_id, session_id, state)
@@ -312,6 +347,10 @@ defmodule ClaudeNotify.TelegramPoller do
         {:job_unwatch, job_id} ->
           Telegram.answer_callback_query(callback_id, "Unwatched")
           handle_job_unwatch(job_id, state)
+
+        {:job_preview, job_id} ->
+          Telegram.answer_callback_query(callback_id, "Creating preview...")
+          handle_preview_job(job_id, state)
 
         :error ->
           Telegram.answer_callback_query(callback_id, "Invalid action")
@@ -686,6 +725,10 @@ defmodule ClaudeNotify.TelegramPoller do
         Dashboard.create(chat_id)
         state
 
+      String.starts_with?(trimmed, "/new") ->
+        send_project_picker(chat_id, state, 0)
+        state
+
       String.starts_with?(trimmed, "/sessions") or String.starts_with?(trimmed, "/select") ->
         send_session_list(chat_id)
         state
@@ -715,11 +758,20 @@ defmodule ClaudeNotify.TelegramPoller do
       String.starts_with?(trimmed, "/run") ->
         handle_run_command(trimmed, state)
 
+      String.starts_with?(trimmed, "/previews") ->
+        handle_previews_command(state)
+
+      String.starts_with?(trimmed, "/unpreview") ->
+        handle_unpreview_command(trimmed, state)
+
+      String.starts_with?(trimmed, "/preview") ->
+        handle_preview_command(trimmed, state)
+
       String.starts_with?(trimmed, "/jobs") ->
         handle_jobs_command(state)
 
       String.starts_with?(trimmed, "/projects") ->
-        handle_projects_command(state)
+        handle_projects_command(chat_id, state)
 
       String.starts_with?(trimmed, "/watch") ->
         case parse_watch_id_arg(trimmed, "/watch") do
@@ -748,7 +800,7 @@ defmodule ClaudeNotify.TelegramPoller do
         end
 
       String.starts_with?(trimmed, "/start") ->
-        send_start(chat_id)
+        send_start(chat_id, state)
         state
 
       String.starts_with?(trimmed, "/status") ->
@@ -791,22 +843,26 @@ defmodule ClaudeNotify.TelegramPoller do
     end
   end
 
-  # Auto-selects session when only one is active, otherwise prompts
+  # Auto-selects the only known terminal session, including an idle one.
   defp resolve_session(chat_id, state) do
     case Map.get(state.selected_sessions, chat_id) do
       nil ->
         sessions =
-          SessionStore.all_sessions()
-          |> Enum.reject(fn {id, _} -> id == "unknown" end)
+          SessionStore.terminal_sessions()
+          |> Map.to_list()
 
         case sessions do
           [{id, _}] ->
-            # Auto-select the only active session
+            # Auto-select the only open terminal session, even when idle.
             new_selected = Map.put(state.selected_sessions, chat_id, id)
             {:ok, id, %{state | selected_sessions: new_selected}}
 
           [] ->
-            Telegram.send_message(MessageFormatter.escape_full("No active sessions."))
+            Telegram.send_message(
+              MessageFormatter.escape_full(
+                "No open terminal sessions. Use /new to choose a project and start a task."
+              )
+            )
 
             {:error, :no_session, state}
 
@@ -861,13 +917,30 @@ defmodule ClaudeNotify.TelegramPoller do
 
         Telegram.send_message(text)
         new_selected = Map.put(state.selected_sessions, chat_id, session_id)
-        %{state | selected_sessions: new_selected}
+
+        state
+        |> Map.put(:selected_sessions, new_selected)
+        |> Map.put(
+          :selected_projects,
+          Map.delete(Map.get(state, :selected_projects, %{}), chat_id)
+        )
     end
   end
 
   # --- Text injection ---
 
   defp handle_text_input(chat_id, text, state) do
+    case Map.get(Map.get(state, :selected_projects, %{}), chat_id) do
+      project when is_binary(project) ->
+        engine = Map.get(Map.get(state, :selected_engines, %{}), chat_id, "claude")
+        launch_job(engine, project, text, state)
+
+      nil ->
+        handle_terminal_text_input(chat_id, text, state)
+    end
+  end
+
+  defp handle_terminal_text_input(chat_id, text, state) do
     case resolve_session(chat_id, state) do
       {:ok, session_id, state} ->
         session = SessionStore.get_session(session_id)
@@ -902,18 +975,21 @@ defmodule ClaudeNotify.TelegramPoller do
 
   defp send_session_list(chat_id) do
     sessions =
-      SessionStore.all_sessions()
-      |> Enum.reject(fn {id, _session} -> id == "unknown" end)
-      |> Map.new()
+      SessionStore.terminal_sessions()
 
     if map_size(sessions) == 0 do
-      Telegram.send_message(MessageFormatter.escape_full("No active sessions."))
+      Telegram.send_message(
+        MessageFormatter.escape_full(
+          "No open terminal sessions. Use /new to choose a project and start a task."
+        )
+      )
     else
       buttons =
         Enum.map(sessions, fn {id, session} ->
           project = Path.basename(session[:working_dir] || "unknown")
           short_id = String.slice(id, 0, 8)
-          label = "#{project} (#{short_id})"
+          status = session_status_display(session[:status])
+          label = "#{project} · #{status} (#{short_id})"
           [label, "select:#{id}"]
         end)
 
@@ -926,7 +1002,7 @@ defmodule ClaudeNotify.TelegramPoller do
       body = %{
         chat_id: chat_id,
         text:
-          "*Active Sessions*\n\n#{MessageFormatter.escape_full("Select a session to send prompts to:")}",
+          "*Terminal Sessions*\n\n#{MessageFormatter.escape_full("Select a working, waiting, or idle session:")}",
         parse_mode: "MarkdownV2",
         reply_markup: %{inline_keyboard: inline_keyboard}
       }
@@ -946,12 +1022,16 @@ defmodule ClaudeNotify.TelegramPoller do
          command_lines ++
          [
            "",
-           MessageFormatter.escape_full("Reply to any message to send text to that session."),
-           MessageFormatter.escape_full("Reply to a job's message to resume it."),
+           MessageFormatter.escape_full("Quick start: /new → choose a project → send your task."),
            MessageFormatter.escape_full(
-             "Send a photo or document to save it locally — the bot replies with the path so you can ask Claude to read it."
+             "Reply to a completed task to continue its conversation."
            ),
-           MessageFormatter.escape_full("If only one session is active, it's auto-selected.")
+           MessageFormatter.escape_full(
+             "Use /sessions when you want to control an open terminal session."
+           ),
+           MessageFormatter.escape_full(
+             "Photos and documents are saved locally; the bot returns a path an agent can read."
+           )
          ])
       |> Enum.join("\n")
 
@@ -1027,7 +1107,7 @@ defmodule ClaudeNotify.TelegramPoller do
         send_and_track_activity_message(
           state,
           job.id,
-          "Job ##{job.id} (#{project}, #{engine}): starting..."
+          job_starting_text(job, prompt)
         )
 
         opts =
@@ -1038,6 +1118,7 @@ defmodule ClaudeNotify.TelegramPoller do
           |> Keyword.put_new(:notifier, default_job_notifier(state))
 
         JobSupervisor.start_job(job, opts)
+        Dashboard.refresh()
         state
     end
   end
@@ -1048,8 +1129,218 @@ defmodule ClaudeNotify.TelegramPoller do
     state
   end
 
+  defp handle_preview_command(trimmed, state) do
+    case parse_preview_command(trimmed) do
+      {:ok, job_id, provider} ->
+        handle_preview_job(job_id, state, provider)
+
+      :error ->
+        state.telegram.send_message_with_retry(
+          MessageFormatter.escape_full("Usage: /preview <job id> [cloudflare|tailscale]")
+        )
+
+        state
+    end
+  end
+
+  defp handle_preview_job(job_id, state, provider \\ nil) do
+    case JobStore.get(state.job_store, job_id) do
+      nil ->
+        state.telegram.send_message_with_retry(
+          MessageFormatter.escape_full("Job ##{job_id} not found.")
+        )
+
+      job ->
+        notify_preparing(state, "typing")
+
+        result =
+          if provider do
+            preview_module(state).start_preview(preview_manager(state), job, provider)
+          else
+            preview_module(state).start_preview(preview_manager(state), job)
+          end
+
+        case result do
+          {:ok, preview} ->
+            minutes = max(div(preview.expires_at - System.system_time(:second), 60), 1)
+
+            state.telegram.send_html_with_retry(
+              MessageFormatter.agent_markdown_html("""
+              **Preview ##{preview.id} is ready**
+
+              [Open job ##{job.id} preview](#{preview.url})
+
+              #{preview_access_message(preview)} Expires in about #{minutes} minutes.
+              """)
+            )
+
+          {:error, reason} ->
+            state.telegram.send_message_with_retry(
+              MessageFormatter.escape_full(preview_error(job_id, reason))
+            )
+        end
+    end
+
+    state
+  catch
+    :exit, reason ->
+      state.telegram.send_message_with_retry(
+        MessageFormatter.escape_full("Preview service is unavailable: #{inspect(reason)}")
+      )
+
+      state
+  end
+
+  defp handle_previews_command(state) do
+    text =
+      case preview_module(state).list(preview_manager(state)) do
+        [] ->
+          "No active previews. Use /preview <job id> to create one."
+
+        previews ->
+          lines =
+            Enum.map(previews, fn preview ->
+              minutes = max(div(preview.expires_at - System.system_time(:second), 60), 0)
+
+              provider = Map.get(preview, :provider, :cloudflare)
+
+              "- [Preview ##{preview.id} · job ##{preview.job_id}](#{preview.url}) · #{provider} · #{minutes}m left"
+            end)
+
+          Enum.join(["**Active previews**", "" | lines], "\n")
+      end
+
+    state.telegram.send_html_with_retry(MessageFormatter.agent_markdown_html(text))
+    state
+  catch
+    :exit, reason ->
+      state.telegram.send_message_with_retry(
+        MessageFormatter.escape_full("Preview service is unavailable: #{inspect(reason)}")
+      )
+
+      state
+  end
+
+  defp handle_unpreview_command(trimmed, state) do
+    case parse_command_id(trimmed, "/unpreview") do
+      {:ok, preview_id} ->
+        case preview_module(state).stop_preview(preview_manager(state), preview_id) do
+          {:ok, preview} ->
+            state.telegram.send_message_with_retry(
+              MessageFormatter.escape_full(
+                "Preview ##{preview.id} stopped. Its local server and remote access route were removed."
+              )
+            )
+
+          {:error, :not_found} ->
+            state.telegram.send_message_with_retry(
+              MessageFormatter.escape_full("Preview ##{preview_id} not found.")
+            )
+        end
+
+      :error ->
+        state.telegram.send_message_with_retry(
+          MessageFormatter.escape_full("Usage: /unpreview <preview id>")
+        )
+    end
+
+    state
+  catch
+    :exit, reason ->
+      state.telegram.send_message_with_retry(
+        MessageFormatter.escape_full("Preview service is unavailable: #{inspect(reason)}")
+      )
+
+      state
+  end
+
+  defp parse_command_id(trimmed, command) do
+    case String.split(trimmed, ~r/\s+/, parts: 2) do
+      [^command, value] ->
+        case Integer.parse(String.trim(value)) do
+          {id, ""} when id > 0 -> {:ok, id}
+          _ -> :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp parse_preview_command(trimmed) do
+    case String.split(trimmed, ~r/\s+/, trim: true) do
+      ["/preview", id] ->
+        parse_preview_id(id, nil)
+
+      ["/preview", id, provider] when provider in ["cloudflare", "tailscale"] ->
+        parse_preview_id(id, provider)
+
+      _ ->
+        :error
+    end
+  end
+
+  defp parse_preview_id(value, provider) do
+    case Integer.parse(value) do
+      {id, ""} when id > 0 -> {:ok, id, provider}
+      _ -> :error
+    end
+  end
+
+  defp preview_error(_job_id, :not_configured) do
+    "No preview provider is configured. Configure Cloudflare Access or install and connect Tailscale, then restart."
+  end
+
+  defp preview_error(_job_id, {:provider_not_configured, provider}),
+    do: "The #{provider} preview provider is not configured or available."
+
+  defp preview_error(_job_id, :unknown_preview_provider),
+    do: "Unknown preview provider. Choose cloudflare or tailscale."
+
+  defp preview_error(job_id, :worktree_missing),
+    do: "Job ##{job_id}'s worktree is gone, so it cannot be previewed."
+
+  defp preview_error(_job_id, :preview_command_not_found) do
+    "No web app command was detected. Add .claude-notify.json with a preview.command array to the project."
+  end
+
+  defp preview_error(_job_id, {:executable_not_found, executable}),
+    do: "Preview executable not found: #{executable}."
+
+  defp preview_error(_job_id, :origin_not_ready),
+    do: "The web app did not start listening before the preview timeout."
+
+  defp preview_error(_job_id, :origin_exited),
+    do: "The web app exited before it became ready."
+
+  defp preview_error(_job_id, :tailscale_port_unavailable),
+    do: "No Tailscale HTTPS preview port is available. Stop an existing preview and retry."
+
+  defp preview_error(_job_id, :tailscale_remote_port_unavailable),
+    do: "No SSH relay port is available on the configured Tailscale host."
+
+  defp preview_error(_job_id, :tailscale_needs_login),
+    do: "The configured Tailscale host needs to sign in before previews can be shared."
+
+  defp preview_error(_job_id, reason),
+    do: "Could not create the web preview: #{inspect(reason)}"
+
+  defp preview_access_message(%{access: :otp}),
+    do: "Cloudflare Access will email an allowed tester a one-time PIN."
+
+  defp preview_access_message(%{access: :tailnet}),
+    do: "Only identities and devices allowed by your Tailscale policy can open it."
+
+  defp preview_access_message(%{access: :public}),
+    do: "This uses public Tailscale Funnel access; anyone with the URL can open it."
+
+  defp preview_access_message(_preview), do: "Access is controlled by the preview provider."
+
+  defp preview_module(state), do: Map.get(state, :preview_module, PreviewManager)
+  defp preview_manager(state), do: Map.get(state, :preview_manager, PreviewManager)
+
   defp jobs_text([]) do
-    "*Jobs*\n\n" <> MessageFormatter.escape_full("No jobs yet. Use /run to launch one.")
+    "*Jobs*\n\n" <> MessageFormatter.escape_full("No jobs yet. Use /new to start one.")
   end
 
   defp jobs_text(jobs) do
@@ -1073,6 +1364,7 @@ defmodule ClaudeNotify.TelegramPoller do
           MessageFormatter.escape_full("Job ##{job_id} (#{job.project}) cancelled.")
         )
 
+        Dashboard.refresh()
         state
 
       {:error, {:invalid_transition, from, :discarded}} ->
@@ -1091,20 +1383,184 @@ defmodule ClaudeNotify.TelegramPoller do
     end
   end
 
-  defp handle_projects_command(state) do
-    names = state |> registry() |> ProjectRegistry.known_projects()
-
-    text =
-      case names do
-        [] ->
-          "*Projects*\n\n" <> MessageFormatter.escape_full("No projects registered.")
-
-        _ ->
-          Enum.join(["*Projects*", ""] ++ Enum.map(names, &MessageFormatter.escape_full/1), "\n")
-      end
-
-    state.telegram.send_message_with_retry(text)
+  defp handle_projects_command(chat_id, state) do
+    send_project_picker(chat_id, state, 0)
     state
+  end
+
+  defp send_project_picker(_chat_id, state, requested_page) do
+    entries = state |> registry() |> ProjectRegistry.entries()
+
+    case entries do
+      [] ->
+        roots =
+          Application.get_env(:claude_notify, :workspace_roots, [])
+          |> Enum.map(&friendly_path/1)
+          |> Enum.join(", ")
+
+        location = if roots == "", do: "no workspace roots are configured", else: roots
+
+        state.telegram.send_message_with_retry(
+          [
+            "*No projects found*",
+            "",
+            MessageFormatter.escape_full("I looked for Git repositories in #{location}."),
+            MessageFormatter.escape_full(
+              "Set CLAUDE_NOTIFY_WORKSPACE_ROOTS to one or more comma-separated directories, then restart the bot."
+            )
+          ]
+          |> Enum.join("\n")
+        )
+
+      _ ->
+        page_count = ceil(length(entries) / @project_page_size)
+        page = requested_page |> max(0) |> min(page_count - 1)
+
+        project_rows =
+          entries
+          |> Enum.slice(page * @project_page_size, @project_page_size)
+          |> Enum.map(fn entry ->
+            [[project_button_label(entry), "project:#{project_token(entry.name)}"]]
+          end)
+
+        rows = project_rows ++ project_pagination_rows(page, page_count)
+
+        text =
+          [
+            "*Choose a project*",
+            "",
+            MessageFormatter.escape_full(
+              "Pick a working directory. Normal messages will start tasks there."
+            ),
+            MessageFormatter.escape_full("Page #{page + 1} of #{page_count}")
+          ]
+          |> Enum.join("\n")
+
+        state.telegram.send_with_button_rows_retry(text, rows)
+    end
+  end
+
+  defp project_pagination_rows(_page, 1), do: []
+
+  defp project_pagination_rows(page, page_count) do
+    previous = if page > 0, do: [["‹ Previous", "projects:#{page - 1}"]], else: []
+    next = if page + 1 < page_count, do: [["Next ›", "projects:#{page + 1}"]], else: []
+    [previous ++ next]
+  end
+
+  defp project_button_label(%{name: name, path: path}) do
+    parent = path |> Path.dirname() |> Path.basename()
+    label = if parent in ["", "/"], do: name, else: "#{name} · #{parent}"
+    String.slice(label, 0, 48)
+  end
+
+  defp handle_project_select(callback_id, chat_id, token, state) do
+    case Enum.find(ProjectRegistry.entries(registry(state)), &(project_token(&1.name) == token)) do
+      nil ->
+        Telegram.answer_callback_query(callback_id, "Project list changed — choose again")
+        send_project_picker(chat_id, state, 0)
+        state
+
+      project ->
+        engine = Map.get(Map.get(state, :selected_engines, %{}), chat_id, "claude")
+        Telegram.answer_callback_query(callback_id, "Working in #{project.name}")
+
+        text =
+          [
+            "📁 *#{MessageFormatter.escape_full(project.name)}*",
+            "`#{MessageFormatter.escape_code_public(friendly_path(project.path))}`",
+            "",
+            "Agent: *#{engine_display_name(engine)}*",
+            "",
+            MessageFormatter.escape_full(
+              "Send your task as a normal message. Reply to the completed task to continue that conversation."
+            )
+          ]
+          |> Enum.join("\n")
+
+        buttons = engine_buttons(engine)
+        state.telegram.send_with_buttons_retry(text, buttons)
+
+        state
+        |> Map.put(
+          :selected_projects,
+          Map.put(Map.get(state, :selected_projects, %{}), chat_id, project.name)
+        )
+        |> Map.put(
+          :selected_engines,
+          Map.put(Map.get(state, :selected_engines, %{}), chat_id, engine)
+        )
+        |> Map.put(
+          :selected_sessions,
+          Map.delete(Map.get(state, :selected_sessions, %{}), chat_id)
+        )
+    end
+  end
+
+  defp handle_engine_select(callback_id, chat_id, engine, state)
+       when engine in @known_engines do
+    selected_projects = Map.get(state, :selected_projects, %{})
+
+    case Map.get(selected_projects, chat_id) do
+      nil ->
+        Telegram.answer_callback_query(callback_id, "Choose a project first")
+        send_project_picker(chat_id, state, 0)
+        state
+
+      project ->
+        Telegram.answer_callback_query(callback_id, "Using #{engine_display_name(engine)}")
+
+        state.telegram.send_message_with_retry(
+          MessageFormatter.escape_full(
+            "#{engine_display_name(engine)} selected for #{project}. Send your task when ready."
+          )
+        )
+
+        Map.put(
+          state,
+          :selected_engines,
+          Map.put(Map.get(state, :selected_engines, %{}), chat_id, engine)
+        )
+    end
+  end
+
+  defp engine_buttons(selected) do
+    Enum.map(@known_engines, fn engine ->
+      marker = if engine == selected, do: "✓ ", else: ""
+      ["#{marker}#{engine_display_name(engine)}", "engine:#{engine}"]
+    end)
+  end
+
+  defp engine_display_name("claude"), do: "Claude"
+  defp engine_display_name("codex"), do: "Codex"
+
+  defp friendly_path(path) do
+    home = System.user_home!()
+    expanded = Path.expand(path)
+
+    if expanded == home or String.starts_with?(expanded, home <> "/"),
+      do: "~" <> String.replace_prefix(expanded, home, ""),
+      else: expanded
+  end
+
+  defp project_token(name) do
+    :crypto.hash(:sha256, name)
+    |> Base.encode16(case: :lower)
+    |> String.slice(0, 12)
+  end
+
+  defp job_starting_text(job, prompt) do
+    preview = prompt |> String.replace(~r/\s+/, " ") |> String.slice(0, 160)
+
+    [
+      "⏳ #{job.project} · #{engine_display_name(job.engine)}",
+      "Job ##{job.id} · starting",
+      "",
+      "“#{preview}#{if String.length(prompt) > 160, do: "…", else: ""}”",
+      "",
+      "I'll keep this message updated."
+    ]
+    |> Enum.join("\n")
   end
 
   defp send_run_usage(state) do
@@ -1112,11 +1568,14 @@ defmodule ClaudeNotify.TelegramPoller do
       [
         "*Usage*",
         "",
-        MessageFormatter.escape_full("/run <project> <prompt> - launch a claude job"),
-        MessageFormatter.escape_full("/run codex <project> <prompt> - launch a codex job"),
+        MessageFormatter.escape_full("Easiest: use /new, choose a project, then send your task."),
+        "",
+        MessageFormatter.escape_full("Power-user syntax:"),
+        MessageFormatter.escape_full("/run <project> <prompt> - run with Claude"),
+        MessageFormatter.escape_full("/run codex <project> <prompt> - run with Codex"),
         MessageFormatter.escape_full("/jobs - list jobs"),
         MessageFormatter.escape_full("/cancel <id> - cancel a job"),
-        MessageFormatter.escape_full("/projects - list registered projects")
+        MessageFormatter.escape_full("/projects - choose a working directory")
       ]
       |> Enum.join("\n")
 
@@ -1131,7 +1590,9 @@ defmodule ClaudeNotify.TelegramPoller do
       end
 
     state.telegram.send_message_with_retry(
-      MessageFormatter.escape_full("Unknown project. Known projects: #{known_text}")
+      MessageFormatter.escape_full(
+        "I couldn't find that project. Available projects: #{known_text}. Use /projects to choose one."
+      )
     )
   end
 
@@ -1191,6 +1652,7 @@ defmodule ClaudeNotify.TelegramPoller do
 
       {:completed, job_id, result} ->
         handle_job_completed(state, job_id, result)
+        Dashboard.refresh()
         send(poller_pid, {:watch_completed, job_id, result.transcript})
     end
   end
@@ -1225,33 +1687,41 @@ defmodule ClaudeNotify.TelegramPoller do
   defp deliver_completion_report(state, job, :completed, summary) do
     notify_preparing(state, "typing")
     diffstat = job_diffstat(state, job)
-    text = MessageFormatter.job_completed(job, diffstat, summary)
+    text = MessageFormatter.job_completed_html(job, diffstat, summary)
 
     buttons = [
       ["Show diff", "jobdiff:#{job.id}"],
+      ["Preview", "jobpreview:#{job.id}"],
       ["Create PR", "jobpr:#{job.id}"],
       ["Discard", "jobdiscard:#{job.id}"]
     ]
 
-    edit_job_report(state, job, text, buttons)
+    edit_job_report_html(state, job, text, buttons)
   end
 
   defp deliver_completion_report(state, job, :failed, _summary) do
     notify_preparing(state, "typing")
-    text = MessageFormatter.job_failed(job, job.error_tail)
+    text = MessageFormatter.job_failed_html(job, job.error_tail)
 
     buttons = [
       ["Show output", "jobshowoutput:#{job.id}"],
       ["Discard", "jobdiscard:#{job.id}"]
     ]
 
-    edit_job_report(state, job, text, buttons)
+    edit_job_report_html(state, job, text, buttons)
   end
 
   defp edit_job_report(_state, %{telegram_message_ids: []}, _text, _buttons), do: :ok
 
   defp edit_job_report(state, %{telegram_message_ids: [message_id | _]}, text, buttons) do
     state.telegram.edit_message_text_with_buttons_with_retry(message_id, text, buttons)
+    :ok
+  end
+
+  defp edit_job_report_html(_state, %{telegram_message_ids: []}, _text, _buttons), do: :ok
+
+  defp edit_job_report_html(state, %{telegram_message_ids: [message_id | _]}, text, buttons) do
+    state.telegram.edit_message_text_with_buttons_html_retry(message_id, text, buttons)
     :ok
   end
 
@@ -1417,6 +1887,7 @@ defmodule ClaudeNotify.TelegramPoller do
     case JobStore.update_status(state.job_store, job.id, :discarded, %{}) do
       {:ok, updated_job} ->
         discard_worktree_and_report(state, updated_job)
+        Dashboard.refresh()
 
       {:error, reason} ->
         Logger.warning("TelegramPoller: could not discard job #{job.id}: #{inspect(reason)}")
@@ -1728,45 +2199,48 @@ defmodule ClaudeNotify.TelegramPoller do
     System.cmd(cmd, args, cd: cwd, stderr_to_stdout: true)
   end
 
-  defp send_start(chat_id) do
+  defp send_start(_chat_id, state) do
     text =
       [
-        "*Claude Notify*",
+        "*Your coding agent, in Telegram*",
         "",
         MessageFormatter.escape_full(
-          "This bot bridges Claude Code hooks to Telegram. You'll get notifications when sessions need input, finish, or error out — and you can reply here to control them."
+          "Choose a local project, send a task, and follow Claude or Codex from this chat."
         ),
         "",
         MessageFormatter.escape_full(
-          "Reply to any notification to type into that Claude session. Tap inline buttons to approve/deny prompts."
+          "Your repository stays isolated in a temporary git worktree. Nothing is pushed until you tap Create PR."
         ),
         "",
-        MessageFormatter.escape_full("Type /help for commands.")
+        MessageFormatter.escape_full("Start by choosing where to work.")
       ]
       |> Enum.join("\n")
 
-    body = %{chat_id: chat_id, text: text, parse_mode: "MarkdownV2"}
-    Telegram.api_post_public("sendMessage", body)
+    state.telegram.send_with_button_rows_retry(text, [
+      [["New task", "nav:new"]],
+      [["Open sessions", "nav:sessions"], ["Recent jobs", "nav:jobs"]]
+    ])
   end
 
   defp send_status(chat_id, state) do
     active =
-      SessionStore.all_sessions()
-      |> Enum.reject(fn {id, _} -> id == "unknown" end)
-      |> length()
+      SessionStore.terminal_sessions()
+      |> map_size()
 
     selected = Map.get(state.selected_sessions, chat_id)
+    selected_project = Map.get(Map.get(state, :selected_projects, %{}), chat_id)
+    selected_engine = Map.get(Map.get(state, :selected_engines, %{}), chat_id, "claude")
 
     selected_line =
       case selected && SessionStore.get_session(selected) do
         nil ->
-          MessageFormatter.escape_full("Selected session: none")
+          MessageFormatter.escape_full("Terminal session: none")
 
         session ->
           project = Path.basename(session[:working_dir] || "unknown")
           short = String.slice(selected, 0, 8)
 
-          "Selected: `#{MessageFormatter.escape_code_public(project)}` \\(`#{MessageFormatter.escape_code_public(short)}`\\)"
+          "Terminal session: `#{MessageFormatter.escape_code_public(project)}` \\(`#{MessageFormatter.escape_code_public(short)}`\\)"
       end
 
     text =
@@ -1774,7 +2248,10 @@ defmodule ClaudeNotify.TelegramPoller do
         "*Status*",
         "",
         MessageFormatter.escape_full("Authorized: yes"),
-        MessageFormatter.escape_full("Active sessions: #{active}"),
+        MessageFormatter.escape_full("Terminal sessions: #{active}"),
+        MessageFormatter.escape_full(
+          "New tasks: #{selected_project || "choose with /new"} · #{engine_display_name(selected_engine)}"
+        ),
         selected_line
       ]
       |> Enum.join("\n")
@@ -1795,12 +2272,22 @@ defmodule ClaudeNotify.TelegramPoller do
   # --- Helpers ---
 
   defp parse_callback_data("dash:refresh"), do: {:dash_refresh}
+  defp parse_callback_data("nav:new"), do: {:nav, :new}
+  defp parse_callback_data("nav:sessions"), do: {:nav, :sessions}
+  defp parse_callback_data("nav:jobs"), do: {:nav, :jobs}
+  defp parse_callback_data("projects:" <> page), do: parse_page_callback(page)
+  defp parse_callback_data("project:" <> token) when token != "", do: {:project, token}
+
+  defp parse_callback_data("engine:" <> engine) when engine in @known_engines,
+    do: {:engine, engine}
+
   defp parse_callback_data("jobdiff:" <> id), do: parse_job_callback(:job_diff, id)
   defp parse_callback_data("jobshowoutput:" <> id), do: parse_job_callback(:job_show_output, id)
   defp parse_callback_data("jobpr:" <> id), do: parse_job_callback(:job_create_pr, id)
   defp parse_callback_data("jobdiscard:" <> id), do: parse_job_callback(:job_discard, id)
   defp parse_callback_data("jobwatch:" <> id), do: parse_job_callback(:job_watch, id)
   defp parse_callback_data("jobunwatch:" <> id), do: parse_job_callback(:job_unwatch, id)
+  defp parse_callback_data("jobpreview:" <> id), do: parse_job_callback(:job_preview, id)
 
   defp parse_callback_data(data) when is_binary(data) do
     case String.split(data, ":", parts: 2) do
@@ -1823,6 +2310,13 @@ defmodule ClaudeNotify.TelegramPoller do
   defp parse_job_callback(tag, id_str) do
     case Integer.parse(id_str) do
       {id, ""} -> {tag, id}
+      _ -> :error
+    end
+  end
+
+  defp parse_page_callback(page) do
+    case Integer.parse(page) do
+      {number, ""} when number >= 0 -> {:projects_page, number}
       _ -> :error
     end
   end
@@ -1859,6 +2353,11 @@ defmodule ClaudeNotify.TelegramPoller do
   defp response_label("escape"), do: "Sent: Escape"
   defp response_label("opt_" <> n), do: "Sent: Option #{n}"
   defp response_label(_), do: "Sent"
+
+  defp session_status_display(:active), do: "working"
+  defp session_status_display(:waiting_input), do: "waiting"
+  defp session_status_display(:idle), do: "idle"
+  defp session_status_display(_status), do: "idle"
 
   @doc false
   def authorized_chat?(chat_id) do

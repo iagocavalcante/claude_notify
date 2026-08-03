@@ -13,8 +13,16 @@ Elixir app that sends interactive Telegram notifications for Claude Code session
 - **Numbered option support** — for multi-choice prompts, choose options `1..9` from inline buttons
 - **Safer terminal injection** — text input is sent via clipboard paste with TTY validation
 - **Security hardening** — signed hook events (HMAC), replay protection, and Telegram chat authorization
-- **Job dispatcher** — `/run` a coding-agent CLI (`claude` or `codex`) headlessly against a registered project in its own isolated git worktree, with progress/completion reports and a `Create PR` button as the only push path
+- **Job dispatcher** — run a coding-agent CLI (`claude` or `codex`) headlessly against a discovered or registered project in its own isolated git worktree, with progress/completion reports and a `Create PR` button as the only push path
 - **Watch mode** — opt in to a live, throttled transcript of a running job; off by default to keep the dispatcher quiet
+- **Message-first tasks** — `/new`, tap a repository, then send ordinary messages instead of memorizing `/run` syntax
+- **Automatic project discovery** — Git repositories under your configured workspace roots appear in Telegram automatically
+- **Unified dashboard** — one live view for Claude Code terminal sessions and queued/running Claude Code or Codex jobs
+- **Idle session continuity** — completed Claude Code turns stay listed as idle, selectable sessions instead of disappearing
+- **Accurate session lifecycle** — `SessionStart` lists new/resumed terminals immediately, `Stop` marks a turn idle, `SessionEnd` removes a closed terminal, and known sessions survive bot restarts
+- **Sleep-safe development** — macOS idle sleep is prevented automatically while terminal sessions or dispatcher jobs are working, then released when all work becomes idle
+- **Provider-agnostic web previews** — launch a job's web app through Cloudflare Access (email OTP) or Tailscale Serve (tailnet identity), then tear it down automatically
+- **Reliable rich replies** — coding-agent Markdown renders cleanly in Telegram; long replies are delivered completely in balanced HTML chunks and visually attached to their prompt
 
 ## How It Works
 
@@ -43,6 +51,7 @@ Terminal.app — keystrokes injected into correct tab
 - **Terminal.app** (not iTerm2 — AppleScript targets Terminal.app tabs by TTY)
 - **Elixir >= 1.19** and **Erlang/OTP >= 28**
 - **python3** (used by hook scripts for JSON processing)
+- **cloudflared** or **Tailscale CLI** (optional; choose either for remote web previews)
 - A **Telegram Bot** (create one via [@BotFather](https://t.me/BotFather))
 
 ## Quick Setup
@@ -125,16 +134,20 @@ This table also drives Telegram's native "/" command menu, which self-registers 
 
 | Command | Description |
 |---------|-------------|
-| `/sessions` | List and select active sessions |
+| `/new` | Choose a project and start a task with normal messages |
+| `/sessions` | List and select terminal sessions, including idle |
 | `/approve` | Send Yes to the selected session |
 | `/cancel` | Send Escape to the selected session (bare, no id) |
-| `/dashboard` | Show live session dashboard |
+| `/dashboard` | Show Claude Code and Codex terminal sessions and jobs |
 | `/run [claude\|codex] <project> <prompt>` | Launch a dispatcher job — see [Job dispatcher](#job-dispatcher) |
 | `/jobs` | List known dispatcher jobs and their status |
 | `/cancel <id>` | Cancel dispatcher job `<id>` |
-| `/projects` | List registered dispatcher projects |
+| `/projects` | Choose from discovered and registered projects |
 | `/watch <id>` | Watch dispatcher job `<id>`'s live transcript |
 | `/unwatch <id>` | Stop watching dispatcher job `<id>` |
+| `/preview <job-id> [cloudflare\|tailscale]` | Start a secure preview using the default or selected provider |
+| `/previews` | List active web previews and remaining lifetime |
+| `/unpreview <preview-id>` | Stop a preview and remove its provider route/resources |
 | `/help` | Show available commands |
 
 Reply to any message to send text to that session. If only one session is active, it is auto-selected. Replying to a dispatcher job's activity message resumes that job instead — see [Job dispatcher](#job-dispatcher).
@@ -147,6 +160,8 @@ Reply to any message to send text to that session. If only one session is active
   - `X-Claude-Notify-Signature: sha256=<hmac>`
 - Signatures are verified with `CLAUDE_NOTIFY_WEBHOOK_SECRET`.
 - Replayed signed payloads are rejected.
+- Preview creation is available only through the authorized Telegram chat. Cloudflare policies allow only configured OTP emails; Tailscale Serve obeys tailnet identity and grants. Tailscale Funnel is public and must be explicitly enabled.
+- Tunnel tokens are passed to `cloudflared` through its environment, never placed in Telegram messages, process arguments, or the persistent preview store.
 - The HTTP surface exposes exactly two routes — `GET /health` and `POST /api/events` — anything else, including any `/debug/*` path, returns a plain `404`.
 
 ## Configuration
@@ -164,6 +179,30 @@ Optional variables:
 ```bash
 MAX_EVENT_CONCURRENCY=8
 WEBHOOK_MAX_SKEW_SECONDS=300
+# Comma-separated directories whose Git repositories appear in /new
+CLAUDE_NOTIFY_WORKSPACE_ROOTS="$HOME/Workspaces"
+# Set false to disable automatic `caffeinate -i` while work is active
+CLAUDE_NOTIFY_KEEP_AWAKE=true
+
+# Optional previews: auto selects the first available secure provider
+CLAUDE_NOTIFY_PREVIEW_PROVIDER=auto
+CLAUDE_NOTIFY_PREVIEW_TTL_SECONDS=7200
+
+# Cloudflare Access provider
+CLOUDFLARE_API_TOKEN=your_scoped_api_token
+CLOUDFLARE_ACCOUNT_ID=your_account_id
+CLOUDFLARE_ZONE_ID=your_zone_id
+# Use the zone apex so generated names stay one level deep:
+# preview-12-a1b2c3.example.com
+CLOUDFLARE_PREVIEW_DOMAIN=example.com
+CLOUDFLARE_ACCESS_EMAILS="you@example.com,tester@example.com"
+CLOUDFLARE_ACCESS_SESSION_DURATION=1h
+
+# Tailscale provider (serve is private; funnel is public)
+TAILSCALE_PREVIEW_MODE=serve
+# TAILSCALE_PATH=/path/to/tailscale
+# Optional: use Tailscale on an existing SSH relay instead of installing it locally
+# TAILSCALE_SSH_HOST=ssh-tron
 ```
 
 Dispatcher settings (job commands, watch mode) are `config.exs`/`runtime.exs` keys, not `.env` variables — see [Job dispatcher](#job-dispatcher) for the full list with defaults.
@@ -175,6 +214,57 @@ set -a
 source .env
 set +a
 ```
+
+## Ephemeral web previews
+
+After a dispatcher job creates a web app, tap **Preview** on its completion report or send `/preview <job-id> [cloudflare|tailscale]`. Claude Notify will:
+
+1. Start the app inside that job's isolated worktree on an available loopback port.
+2. Select the configured provider automatically, or use the provider named in the command.
+3. Return the HTTPS URL in Telegram and keep the Mac awake while the preview is active.
+4. Remove the local process and provider resources when its TTL expires or `/unpreview <preview-id>` is sent. Saved resources are reconciled after a service restart.
+
+### Cloudflare Access
+
+This is best for browser-only testers outside your private network. It creates a remotely managed Cloudflare Tunnel, a proxied random hostname such as `preview-12-a1b2c3.example.com`, and a self-hosted Access app restricted to `CLOUDFLARE_ACCESS_EMAILS` through email One-time PIN.
+
+Install `cloudflared` on macOS with `brew install cloudflared`. The Cloudflare zone must already use Cloudflare nameservers and the account must have Zero Trust configured. Create a scoped API token with these permissions:
+
+- `Cloudflare One Connector: cloudflared Write` (or the equivalent Tunnel Write permission)
+- `DNS Write` for the preview zone
+- `Access: Apps and Policies Write`
+- `Access: Organizations, Identity Providers, and Groups Write`
+
+OTP is discovered automatically; if the account does not yet have a One-time PIN identity provider, Claude Notify creates one. Only explicitly configured email addresses are placed in the allow policy—there is no “allow everyone” fallback.
+
+### Tailscale
+
+This has no Cloudflare account, domain, DNS, or API-token requirement. Install and connect the Tailscale CLI on the development machine, leave `TAILSCALE_PREVIEW_MODE=serve`, and set `CLAUDE_NOTIFY_PREVIEW_PROVIDER=tailscale` (or leave it on `auto` when Cloudflare is not configured). Each preview receives its own HTTPS port on the machine's `*.ts.net` hostname. Access stays inside the tailnet and follows its identity-aware grants.
+
+If Tailscale runs on another machine you already access over SSH, set `TAILSCALE_SSH_HOST` to that SSH config alias. Claude Notify opens a loopback-only reverse forward for each preview and runs Tailscale Serve on the relay. The application and worktree remain on the development machine; only preview traffic crosses SSH. SSH must work non-interactively for the background service.
+
+`TAILSCALE_PREVIEW_MODE=funnel` is an explicit public-internet mode. Funnel supplies HTTPS but no login or OTP wall, so anyone with the URL can access the preview. It is intended for public test endpoints and webhooks, not private application data. Funnel supports at most three concurrent routes here because Tailscale restricts it to ports `443`, `8443`, and `10000`.
+
+The app command is auto-detected for common npm/pnpm/yarn/bun, Phoenix, and static HTML projects. For other projects, commit a `.claude-notify.json` file at the repository root. Commands are argv arrays, not shell strings, so pipes and shell expansion are intentionally unavailable:
+
+```json
+{
+  "preview": {
+    "command": [
+      "npm",
+      "run",
+      "dev",
+      "--",
+      "--host",
+      "${HOST}",
+      "--port",
+      "${PORT}"
+    ]
+  }
+}
+```
+
+`${HOST}` resolves to `127.0.0.1`; `${PORT}` is allocated from `41000..41999`. The preview runner does not install dependencies, execute migrations, or run arbitrary Telegram-provided shell commands. Put project-specific preparation in the coding job or a safe project script.
 
 ## Testing
 
@@ -275,11 +365,21 @@ chmod +x hooks/*.sh
 
 ## Job dispatcher
 
-The dispatcher lets you hand a coding-agent CLI (`claude` or `codex`) a prompt against a registered project from Telegram, and let it run headless in its own isolated git worktree, without touching your own checkout. Every job command below requires the authorized `TELEGRAM_CHAT_ID` chat — see [Security Model](#security-model).
+The dispatcher lets you hand a coding-agent CLI (`claude` or `codex`) a prompt against a discovered or explicitly registered project from Telegram, and let it run headless in its own isolated git worktree, without touching your own checkout. Every job command below requires the authorized `TELEGRAM_CHAT_ID` chat — see [Security Model](#security-model).
 
-### Registering projects
+### Choosing workspace roots
 
-A project must be explicitly registered before any job can run against it — this is the first security layer. Add entries to `config/config.exs` (or your `config/runtime.exs`):
+By default the bot discovers Git repositories up to four directories deep under `~/Workspaces`. Each repository appears as a button in `/new` and `/projects`; no per-project setup is required. To use another location, set one or more comma-separated roots in `.env` and restart the bot:
+
+```bash
+CLAUDE_NOTIFY_WORKSPACE_ROOTS="$HOME/code,$HOME/clients"
+```
+
+Discovery stays within those roots, ignores common dependency/build directories, and does not follow symlinks outside a root. If two repositories share a basename, the picker uses their relative paths (for example, `acme/app` and `personal/app`).
+
+### Registering explicit projects and aliases
+
+Explicit entries remain useful for aliases or repositories outside the discovered workspace roots. Add them to `config/config.exs` (or your `config/runtime.exs`):
 
 ```elixir
 config :claude_notify,
@@ -302,7 +402,9 @@ File entries take precedence over application-config entries with the same name.
 
 ### Commands
 
-**`/run [claude|codex] <project> <prompt>`** — launches a job. `<project>` is a registered name or alias; the rest of the message after it is the prompt verbatim. The engine defaults to `claude` when omitted.
+**`/new`** — opens a paginated project picker. Tap a repository, optionally switch between Claude and Codex, then send your task as a normal Telegram message. The selection stays active for later new tasks. Reply to a completed task's message when you want to continue that specific agent conversation instead. Use `/sessions` to switch from project-task mode to an already-open terminal session.
+
+**`/run [claude|codex] <project> <prompt>`** — launches a job. `<project>` is a discovered name, explicit name, or alias; the rest of the message after it is the prompt verbatim. The engine defaults to `claude` when omitted.
 
 The engine token, when present, **always wins over the project name** — if the first word after `/run` is exactly `claude` or `codex`, it's consumed as the engine selector, not the project name, even if you have a project registered under that exact name:
 
@@ -318,7 +420,7 @@ An unregistered project name replies with the list of known projects instead of 
 
 **`/cancel <id>`** — cancels dispatcher job `<id>` (must parse as a bare integer): transitions it to `:discarded` and stops its running engine process, if any. **`/cancel`** with no argument (or a non-numeric one) is unrelated — it's the pre-existing shortcut that sends Escape to the currently selected terminal session.
 
-**`/projects`** — lists all registered project names (canonical names only, not aliases).
+**`/projects`** — opens the same paginated working-directory picker as `/new`.
 
 **`/watch <id>` / `/unwatch <id>`** — see [Watch mode](#watch-mode) below; equivalent to tapping the `[Watch]`/`[Unwatch]` button on the job's activity message.
 
@@ -361,7 +463,7 @@ Up to `:claude_notify, :job_concurrency` (default 3) jobs run at once; requests 
 ### Safety model
 
 - **Worktree isolation** — every job gets its own `git worktree` on a fresh branch (`job/<job_id>-<slug>`) under a dedicated base directory (`~/.claude_notify/worktrees/<repo>/<job_id>` by default, configurable via `:claude_notify, :worktree_base_dir`). The job's prompt is wrapped with rules telling the engine to stay inside that worktree and never touch any other checkout.
-- **Registered paths only** — a job can only target a project explicitly listed in the registry (see above); an unregistered name fails the job cleanly instead of falling back to an arbitrary path.
+- **Allowlisted paths only** — a job can only target a validated Git repository discovered inside a configured workspace root or explicitly listed in the registry. Unknown names fail cleanly instead of falling back to arbitrary paths.
 - **Authorized chat gate** — every dispatcher command and button callback is rejected unless it comes from the configured `TELEGRAM_CHAT_ID`, same as every other Telegram command in this app.
 - **Human gate: nothing pushes or opens a PR except `Create PR`** — the wrapped prompt explicitly forbids the engine itself from running `git push` or opening a pull request; committing locally is the end of a job's own work. Turning a job's commit into a PR is the deliberate, separate, human-triggered `Create PR` button described above — no other code path does this.
 - **Boot reconciliation** — see below.
@@ -382,7 +484,9 @@ All of these are `config.exs`/`runtime.exs` keys under `config :claude_notify, .
 
 | Key | Default | Purpose |
 |-----|---------|---------|
-| `:projects` | `[]` | Registered project entries — see [Registering projects](#registering-projects) |
+| `:workspace_roots` | `[~/Workspaces]` | Roots scanned for selectable Git repositories; set with `CLAUDE_NOTIFY_WORKSPACE_ROOTS` |
+| `:workspace_discovery_depth` | `4` | Maximum directory depth scanned below each workspace root |
+| `:projects` | `[]` | Optional explicit project entries and aliases — see [Registering explicit projects and aliases](#registering-explicit-projects-and-aliases) |
 | `:job_concurrency` | `3` | Max jobs running at once before new launches queue FIFO |
 | `:job_worktree_retention_seconds` | `604_800` (7 days) | How long a `:completed`/`:discarded` job's worktree survives before boot reconciliation sweeps it |
 | `:start_job_reconciler` | `true` (`false` in `config/test.exs`) | Whether `ClaudeNotify.JobReconciler` runs its one-shot pass at boot |
@@ -395,7 +499,7 @@ All of these are `config.exs`/`runtime.exs` keys under `config :claude_notify, .
 ### Dispatcher architecture
 
 ```
-ProjectRegistry   — resolves a project name/alias to a validated repo path (config.exs + projects.json)
+ProjectRegistry   — discovers workspace repos and resolves names/aliases to validated paths
       |
 WorktreeManager   — creates/discards the job's isolated git worktree + branch inside that repo
       |
@@ -410,7 +514,7 @@ JobRunner         — drives the engine CLI as a Port, parses its output, record
 Engine.Claude /   — engine-specific command building + event parsing
   Engine.Codex
       |
-TelegramPoller    — the only caller of the above: parses /run /jobs /cancel /projects
+TelegramPoller    — the only caller of the above: guides /new and parses /run /jobs /cancel /projects
                      /watch /unwatch and reply-to-job text, renders activity/report
                      messages and buttons, and is the sole path that can push or open a PR
 ```

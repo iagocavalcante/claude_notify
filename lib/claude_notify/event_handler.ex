@@ -10,6 +10,17 @@ defmodule ClaudeNotify.EventHandler do
     Dashboard
   }
 
+  def handle_event(%{"event" => "session_start"} = params) do
+    session_id = params["session_id"]
+    working_dir = params["working_dir"] || "unknown"
+    opts = params |> Map.take(["tty_path", "term_session_id"]) |> sanitize_opts()
+
+    update_session_tty(session_id, working_dir, opts)
+    SessionStore.update_status(session_id, :idle, %{session_source: params["source"]})
+    Dashboard.refresh()
+    :ok
+  end
+
   def handle_event(%{"event" => "prompt"} = params) do
     session_id = params["session_id"]
     prompt = params["prompt"] || ""
@@ -40,6 +51,13 @@ defmodule ClaudeNotify.EventHandler do
     git_diff = params["git_diff"]
     transcript_path = params["transcript_path"]
 
+    opts =
+      params |> Map.take(["tty_path", "term_session_id", "transcript_path"]) |> sanitize_opts()
+
+    # A Stop hook can be the first event observed after this service restarts.
+    # Seed/update the terminal metadata so the now-idle session remains listed.
+    update_session_tty(session_id, working_dir, opts)
+
     ActivityTracker.end_session(session_id)
     TaskTracker.end_session(session_id)
 
@@ -49,34 +67,24 @@ defmodule ClaudeNotify.EventHandler do
     # Resolve transcript path: from params or from session store
     resolved_transcript = resolve_transcript_path(transcript_path, session_id)
 
-    # Send Claude's response before the session-ended message
+    # Send Claude's response before marking the turn idle.
     send_claude_response(resolved_transcript, session_id)
 
-    case SessionStore.get_session(session_id) do
-      nil ->
-        now = System.system_time(:second)
-
-        session = %{
-          id: session_id,
-          working_dir: working_dir,
-          prompt_count: 0,
-          started_at: now,
-          stopped_at: now,
-          stop_reason: stop_reason
-        }
-
-        maybe_send_diff(git_diff, session_id)
-        message = MessageFormatter.session_stopped_compact(session)
-        notify_and_register(message, session_id)
-
-      _session ->
-        {_action, session} = SessionStore.register_stop(session_id, stop_reason)
-        maybe_send_diff(git_diff, session_id)
-        message = MessageFormatter.session_stopped_compact(session)
-        notify_and_register(message, session_id)
-    end
+    {_action, session} = SessionStore.register_stop(session_id, stop_reason)
+    maybe_send_diff(git_diff, session_id)
+    message = MessageFormatter.session_stopped_compact(session)
+    notify_and_register(message, session_id)
 
     Dashboard.refresh()
+  end
+
+  def handle_event(%{"event" => "session_end"} = params) do
+    session_id = params["session_id"]
+    SessionStore.remove_session(session_id)
+    ActivityTracker.end_session(session_id)
+    TaskTracker.end_session(session_id)
+    Dashboard.refresh()
+    :ok
   end
 
   def handle_event(%{"event" => "tool_use"} = params) do
@@ -300,11 +308,32 @@ defmodule ClaudeNotify.EventHandler do
   defp send_claude_response(transcript_path, session_id) do
     case ClaudeNotify.TranscriptReader.last_assistant_message(transcript_path) do
       {:ok, text} ->
-        message = MessageFormatter.claude_response(text)
-        notify_and_register(message, session_id)
+        message = MessageFormatter.claude_response_html(text)
+        notify_html_and_register(message, session_id)
 
       :error ->
         :ok
+    end
+  end
+
+  defp notify_html_and_register(message, session_id) do
+    opts =
+      case SessionStore.get_prompt_message_id(session_id) do
+        mid when is_integer(mid) -> [reply_to_message_id: mid]
+        _ -> []
+      end
+
+    case Telegram.send_html_with_retry(message, opts) do
+      {:ok, %{"result" => %{"message_id" => mid}}} ->
+        SessionStore.register_message(mid, session_id)
+        :ok
+
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Telegram HTML send failed: #{inspect(reason)}", session_id: session_id)
+        {:error, reason}
     end
   end
 

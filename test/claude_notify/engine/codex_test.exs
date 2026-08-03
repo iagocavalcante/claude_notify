@@ -279,5 +279,8 @@ defmodule ClaudeNotify.Engine.CodexTest do
 
     final = wait_for_status(store, job.id, :failed)
     assert final.status == :failed
+    assert final.error_tail =~ "Could not find"
+    assert final.error_tail =~ "executable"
+    assert final.error_tail =~ "setup.sh"
   end
 end

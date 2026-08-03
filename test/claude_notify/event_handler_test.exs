@@ -8,6 +8,23 @@ defmodule ClaudeNotify.EventHandlerTest do
     :ok
   end
 
+  test "session_start lists a new session as idle before its first prompt" do
+    assert :ok =
+             EventHandler.handle_event(%{
+               "event" => "session_start",
+               "session_id" => "fresh-sess",
+               "working_dir" => "/tmp/project",
+               "source" => "startup",
+               "tty_path" => "/dev/ttys009"
+             })
+
+    session = SessionStore.get_session("fresh-sess")
+    assert session.status == :idle
+    assert session.prompt_count == 0
+    assert session.working_dir == "/tmp/project"
+    assert session.tty_path == "/dev/ttys009"
+  end
+
   test "handle_event with prompt event registers session" do
     params = %{
       "event" => "prompt",
@@ -23,7 +40,7 @@ defmodule ClaudeNotify.EventHandlerTest do
     assert session.prompt_count == 1
   end
 
-  test "handle_event with stop event removes session" do
+  test "handle_event with stop event keeps session idle" do
     SessionStore.register_prompt("test-sess", "hello", "/tmp/test")
 
     params = %{
@@ -34,7 +51,7 @@ defmodule ClaudeNotify.EventHandlerTest do
 
     EventHandler.handle_event(params)
 
-    assert SessionStore.get_session("test-sess") == nil
+    assert SessionStore.get_session("test-sess").status == :idle
   end
 
   test "handle_event with stop for untracked session still sends notification" do
@@ -47,6 +64,18 @@ defmodule ClaudeNotify.EventHandlerTest do
 
     result = EventHandler.handle_event(params)
     assert result != {:error, :unknown_event}
+  end
+
+  test "session_end removes an idle session" do
+    SessionStore.register_prompt("closed-sess", "hello", "/tmp/project")
+    SessionStore.register_stop("closed-sess", "end_turn")
+
+    assert SessionStore.get_session("closed-sess").status == :idle
+
+    assert :ok =
+             EventHandler.handle_event(%{"event" => "session_end", "session_id" => "closed-sess"})
+
+    assert SessionStore.get_session("closed-sess") == nil
   end
 
   test "handle_event with unknown event returns error" do
@@ -161,12 +190,12 @@ defmodule ClaudeNotify.EventHandlerTest do
     }
 
     EventHandler.handle_event(params)
-    assert SessionStore.get_session("transcript-sess") == nil
+    assert SessionStore.get_session("transcript-sess").status == :idle
 
     File.rm(transcript_path)
   end
 
-  test "full turn flow: prompt echo → tool tracking → claude response → session end" do
+  test "full turn flow: prompt echo → tool tracking → claude response → session idle" do
     transcript_path = Path.join("/tmp", "flow_test_#{System.unique_integer([:positive])}.jsonl")
 
     assistant_msg =
@@ -217,8 +246,8 @@ defmodule ClaudeNotify.EventHandlerTest do
       "transcript_path" => transcript_path
     })
 
-    # Session should be cleaned up
-    assert SessionStore.get_session("flow-sess") == nil
+    # The terminal remains selectable for the next turn.
+    assert SessionStore.get_session("flow-sess").status == :idle
 
     File.rm(transcript_path)
   end
@@ -288,7 +317,7 @@ defmodule ClaudeNotify.EventHandlerTest do
     assert session.status == :active
   end
 
-  test "stop event with git_diff sends diff before session ended" do
+  test "stop event with git_diff sends diff before session becomes idle" do
     SessionStore.register_prompt("test-sess", "hello", "/tmp/test")
 
     EventHandler.handle_event(%{
@@ -299,7 +328,7 @@ defmodule ClaudeNotify.EventHandlerTest do
       "git_diff" => " 1 file changed\n-old\n+new"
     })
 
-    assert SessionStore.get_session("test-sess") == nil
+    assert SessionStore.get_session("test-sess").status == :idle
   end
 
   test "prompt event attempts to set 👀 reaction" do
@@ -343,6 +372,6 @@ defmodule ClaudeNotify.EventHandlerTest do
       "working_dir" => "/tmp/test"
     })
 
-    assert SessionStore.get_session("react-stop-sess") == nil
+    assert SessionStore.get_session("react-stop-sess").status == :idle
   end
 end

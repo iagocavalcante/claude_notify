@@ -179,7 +179,7 @@ defmodule ClaudeNotify.JobRunner do
     else
       {:error, reason} ->
         Logger.error("JobRunner: job #{state.job_id} failed to launch: #{inspect(reason)}")
-        fail_job(state)
+        fail_job(state, launch_error_message(reason))
         {:stop, :normal, %{state | finalized: true}}
     end
   end
@@ -266,14 +266,36 @@ defmodule ClaudeNotify.JobRunner do
     end
   end
 
-  defp fail_job(state) do
-    extras = terminal_extras(state, :failed)
+  defp fail_job(state, error_override \\ nil) do
+    extras =
+      state
+      |> terminal_extras(:failed)
+      |> maybe_put_error_override(error_override)
 
     case JobStore.update_status(state.job_store, state.job_id, :failed, extras) do
       {:ok, _job} -> notify_completed(state, :failed)
       {:error, _reason} -> :ok
     end
   end
+
+  defp maybe_put_error_override(extras, nil), do: extras
+  defp maybe_put_error_override(extras, message), do: Map.put(extras, :error_tail, message)
+
+  defp launch_error_message({:executable_not_found, command}) do
+    "Could not find the #{command} executable. Re-run ./setup.sh or add it to the service PATH."
+  end
+
+  defp launch_error_message({:git_failed, _code, output}) when is_binary(output) do
+    case String.trim(output) do
+      "" -> "Could not create the isolated git worktree. Check the service logs for details."
+      detail -> "Could not create the isolated git worktree: #{detail}"
+    end
+  end
+
+  defp launch_error_message({:port_open_failed, error}),
+    do: "Could not start the coding agent: #{Exception.message(error)}"
+
+  defp launch_error_message(reason), do: "Could not start the coding agent: #{inspect(reason)}"
 
   # `:error_tail` is only meaningful for a failed job - prefer the engine's
   # own reported error/result message (`last_summary`); fall back to the

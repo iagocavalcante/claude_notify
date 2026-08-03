@@ -23,8 +23,9 @@ defmodule ClaudeNotify.MessageFormatterTest do
     }
 
     message = MessageFormatter.session_stopped_compact(session)
-    assert message =~ "🔴"
+    assert message =~ "⚪"
     assert message =~ "my\\_app"
+    assert message =~ "idle"
     assert message =~ "12m"
     assert message =~ "8 prompts"
     assert message =~ "user\\_quit"
@@ -120,6 +121,57 @@ defmodule ClaudeNotify.MessageFormatterTest do
     message = MessageFormatter.claude_response("Check user.name in [config]")
     assert message =~ "user\\.name"
     assert message =~ "\\[config\\]"
+  end
+
+  describe "agent Markdown rendered as Telegram HTML" do
+    test "preserves headings, emphasis, lists, links, inline code, and fenced code" do
+      markdown = """
+      ## Result
+
+      **Done** with *care*.
+      - Updated `lib/app.ex`
+      - See [the PR](https://example.com/pull/1)
+
+      ```elixir
+      assert result == :ok
+      ```
+      """
+
+      html = MessageFormatter.agent_markdown_html(markdown)
+
+      assert html =~ "<b>Result</b>"
+      assert html =~ "<b>Done</b> with <i>care</i>"
+      assert html =~ "• Updated <code>lib/app.ex</code>"
+      assert html =~ "<a href=\"https://example.com/pull/1\">the PR</a>"
+      assert html =~ "<pre>assert result == :ok</pre>"
+    end
+
+    test "escapes model-supplied HTML instead of allowing tag injection" do
+      html = MessageFormatter.agent_markdown_html("<b>fake</b> & <script>alert(1)</script>")
+
+      assert html =~ "&lt;b&gt;fake&lt;/b&gt;"
+      assert html =~ "&amp;"
+      refute html =~ "<script>"
+    end
+
+    test "falls back safely when nested Markdown would create crossed HTML tags" do
+      markdown = "**bold with *nested italic***"
+      html = MessageFormatter.agent_markdown_html(markdown)
+
+      assert html == markdown
+      refute html =~ "<b>"
+      refute html =~ "<i>"
+    end
+
+    test "assistant HTML response keeps the complete content for delivery chunking" do
+      markdown = String.duplicate("**important & safe**\n", 1_000)
+      html = MessageFormatter.claude_response_html(markdown)
+
+      assert byte_size(html) > 4_096
+      assert html =~ "<b>Claude</b>"
+      assert html =~ "<b>important &amp; safe</b>"
+      refute html =~ "response truncated"
+    end
   end
 
   # Rich tool card tests
@@ -225,6 +277,23 @@ defmodule ClaudeNotify.MessageFormatterTest do
     message = MessageFormatter.job_failed(@job, nil)
     assert message =~ "failed"
     assert message =~ "no output captured"
+  end
+
+  test "job completion HTML renders the agent summary instead of exposing Markdown markers" do
+    message =
+      MessageFormatter.job_completed_html(
+        @job,
+        "lib/foo.ex | 2 ++",
+        "## Finished\n\n- Added **validation**\n- Ran `mix test`"
+      )
+
+    assert message =~ "<b>trainer</b> · Claude"
+    assert message =~ "<b>Finished</b>"
+    assert message =~ "• Added <b>validation</b>"
+    assert message =~ "• Ran <code>mix test</code>"
+    assert message =~ "<pre>lib/foo.ex | 2 ++</pre>"
+    refute message =~ "**validation**"
+    assert byte_size(message) <= 4_096
   end
 
   test "job_output_block wraps text in a pre block" do

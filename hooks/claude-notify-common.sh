@@ -40,3 +40,28 @@ print(hmac.new(secret, message, hashlib.sha256).hexdigest())
     --max-time 3 \
     > /dev/null 2>&1
 }
+
+# Claude can invoke hooks from wrapper processes, so PPID is not always the
+# process directly attached to Terminal.app. Walk up the process tree until a
+# real macOS terminal TTY is found. Headless `claude -p` jobs return "unknown"
+# and must not be registered as interactive terminal sessions.
+resolve_terminal_tty() {
+  local pid="$PPID"
+  local tty_dev parent_pid
+
+  for _ in 1 2 3 4 5 6 7 8; do
+    tty_dev="$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')"
+    if [[ "$tty_dev" =~ ^ttys[0-9]+$ ]]; then
+      printf '/dev/%s\n' "$tty_dev"
+      return 0
+    fi
+
+    parent_pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    if ! [[ "$parent_pid" =~ ^[0-9]+$ ]] || [ "$parent_pid" -le 1 ]; then
+      break
+    fi
+    pid="$parent_pid"
+  done
+
+  printf 'unknown\n'
+}

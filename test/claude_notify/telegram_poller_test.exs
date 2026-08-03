@@ -49,6 +49,11 @@ defmodule ClaudeNotify.TelegramPollerTest do
       end
     end
 
+    def send_html_with_retry(text) do
+      forward({:telegram_send, text})
+      {:ok, %{"result" => %{"message_id" => System.unique_integer([:positive, :monotonic])}}}
+    end
+
     # Forwards as the SAME {:telegram_send, text} tuple as send_message/1
     # above (buttons intentionally not part of the observable tuple, same
     # observability level send_message/1 itself has) - this keeps every
@@ -78,6 +83,11 @@ defmodule ClaudeNotify.TelegramPollerTest do
       end
     end
 
+    def send_with_button_rows_retry(text, rows) do
+      forward({:telegram_button_rows, rows})
+      send_message(text)
+    end
+
     def edit_message_text(message_id, text) do
       forward({:telegram_edit, message_id, text})
       {:ok, %{"result" => %{"message_id" => message_id}}}
@@ -94,6 +104,9 @@ defmodule ClaudeNotify.TelegramPollerTest do
     end
 
     def edit_message_text_with_buttons_with_retry(message_id, text, buttons),
+      do: edit_message_text_with_buttons(message_id, text, buttons)
+
+    def edit_message_text_with_buttons_html_retry(message_id, text, buttons),
       do: edit_message_text_with_buttons(message_id, text, buttons)
 
     def edit_message_reply_markup(message_id, buttons) do
@@ -137,6 +150,59 @@ defmodule ClaudeNotify.TelegramPollerTest do
   # prove a failed setMyCommands (story #242) is logged and non-fatal.
   defmodule FailingTelegram do
     def set_my_commands(_commands), do: {:error, :boom}
+  end
+
+  defmodule FakePreviewManager do
+    def start_preview(_server, job) do
+      forward({:preview_started, job.id})
+
+      {:ok,
+       %{
+         id: 9,
+         job_id: job.id,
+         provider: :cloudflare,
+         access: :otp,
+         url: "https://preview-#{job.id}.example.com",
+         expires_at: System.system_time(:second) + 3_600
+       }}
+    end
+
+    def start_preview(_server, job, provider) do
+      forward({:preview_started, job.id, provider})
+
+      {:ok,
+       %{
+         id: 10,
+         job_id: job.id,
+         provider: :tailscale,
+         access: :tailnet,
+         url: "https://devbox.example.ts.net:44300",
+         expires_at: System.system_time(:second) + 3_600
+       }}
+    end
+
+    def list(_server) do
+      [
+        %{
+          id: 9,
+          job_id: 42,
+          url: "https://preview-42.example.com",
+          expires_at: System.system_time(:second) + 3_600
+        }
+      ]
+    end
+
+    def stop_preview(_server, id) do
+      forward({:preview_stopped, id})
+      {:ok, %{id: id}}
+    end
+
+    defp forward(message) do
+      case Process.whereis(:telegram_poller_test_process) do
+        nil -> send(self(), message)
+        pid -> send(pid, message)
+      end
+    end
   end
 
   defmodule FixtureEngine do
@@ -195,7 +261,8 @@ defmodule ClaudeNotify.TelegramPollerTest do
       commands = TelegramPoller.bot_commands()
 
       assert Enum.map(commands, &elem(&1, 0)) == ~w(
-               sessions approve cancel dashboard run jobs projects watch unwatch help
+               new sessions approve cancel dashboard run jobs projects watch unwatch
+               preview previews unpreview help
              )
 
       assert Enum.all?(commands, fn {command, description} ->
@@ -576,6 +643,48 @@ defmodule ClaudeNotify.TelegramPollerTest do
       assert text =~ to_string(job.id)
     end
 
+    test "/preview creates an OTP-protected preview for a known job", %{
+      state: state,
+      store: store
+    } do
+      {:ok, job} = JobStore.create(store, %{engine: "claude", project: "trainer", prompt: "web"})
+      state = Map.merge(state, %{preview_module: FakePreviewManager, preview_manager: :fake})
+
+      TelegramPoller.handle_update(text_message("/preview #{job.id}"), state)
+
+      assert_receive {:preview_started, job_id}
+      assert job_id == job.id
+      assert_receive {:telegram_send, text}
+      assert text =~ "href=\"https://preview-#{job.id}.example.com\""
+      assert text =~ "one-time PIN"
+    end
+
+    test "/previews lists active URLs and /unpreview removes one", %{state: state} do
+      state = Map.merge(state, %{preview_module: FakePreviewManager, preview_manager: :fake})
+
+      TelegramPoller.handle_update(text_message("/previews"), state)
+      assert_receive {:telegram_send, list_text}
+      assert list_text =~ "href=\"https://preview-42.example.com\""
+
+      TelegramPoller.handle_update(text_message("/unpreview 9"), state)
+      assert_receive {:preview_stopped, 9}
+      assert_receive {:telegram_send, stopped_text}
+      assert stopped_text =~ "Preview \\#9 stopped"
+    end
+
+    test "/preview accepts an explicit Tailscale provider", %{state: state, store: store} do
+      {:ok, job} = JobStore.create(store, %{engine: "codex", project: "trainer", prompt: "web"})
+      state = Map.merge(state, %{preview_module: FakePreviewManager, preview_manager: :fake})
+
+      TelegramPoller.handle_update(text_message("/preview #{job.id} tailscale"), state)
+
+      assert_receive {:preview_started, job_id, "tailscale"}
+      assert job_id == job.id
+      assert_receive {:telegram_send, text}
+      assert text =~ "href=\"https://devbox.example.ts.net:44300\""
+      assert text =~ "Tailscale policy"
+    end
+
     test "/jobs with no jobs yet says so", %{state: state} do
       TelegramPoller.handle_update(text_message("/jobs"), state)
 
@@ -588,8 +697,66 @@ defmodule ClaudeNotify.TelegramPollerTest do
     test "/projects lists registered projects", %{state: state} do
       TelegramPoller.handle_update(text_message("/projects"), state)
 
+      assert_receive {:telegram_button_rows, rows}
+      assert inspect(rows) =~ "trainer"
       assert_receive {:telegram_send, text}
-      assert text =~ "trainer"
+      assert text =~ "Choose a project"
+    end
+
+    test "/new lets a user choose a project and launch by sending a normal message", %{
+      state: state,
+      store: store
+    } do
+      TelegramPoller.handle_update(text_message("/new"), state)
+
+      assert_receive {:telegram_button_rows, [[["trainer" <> _, callback_data]] | _]}
+      assert callback_data =~ "project:"
+      assert_receive {:telegram_send, picker_text}
+      assert picker_text =~ "Choose a project"
+
+      selected_state = TelegramPoller.handle_update(callback_update(callback_data), state)
+      assert selected_state.selected_projects[@chat_id] == "trainer"
+      assert selected_state.selected_engines[@chat_id] == "claude"
+      assert_receive {:telegram_send, selected_text}
+      assert selected_text =~ "Send your task"
+
+      TelegramPoller.handle_update(text_message("fix the conversational flow"), selected_state)
+
+      assert_receive {:telegram_send, starting_text}
+      assert starting_text =~ "starting"
+      assert [job] = JobStore.list(store)
+      assert job.project == "trainer"
+      assert job.engine == "claude"
+      assert job.prompt == "fix the conversational flow"
+
+      wait_for_status(store, job.id, :completed)
+    end
+
+    test "agent picker changes future conversational tasks to Codex", %{
+      state: state,
+      store: store
+    } do
+      token =
+        :crypto.hash(:sha256, "trainer")
+        |> Base.encode16(case: :lower)
+        |> String.slice(0, 12)
+
+      selected_state =
+        TelegramPoller.handle_update(callback_update("project:#{token}"), state)
+
+      assert_receive {:telegram_send, _selected_text}
+
+      codex_state =
+        TelegramPoller.handle_update(callback_update("engine:codex"), selected_state)
+
+      assert codex_state.selected_engines[@chat_id] == "codex"
+      assert_receive {:telegram_send, engine_text}
+      assert engine_text =~ "Codex selected"
+
+      TelegramPoller.handle_update(text_message("review this repository"), codex_state)
+      assert [job] = JobStore.list(store)
+      assert job.engine == "codex"
+      assert job.prompt == "review this repository"
     end
 
     # -- /cancel <id> --
@@ -793,8 +960,9 @@ defmodule ClaudeNotify.TelegramPollerTest do
       refute_receive {:telegram_send, _}
 
       assert ["Show diff", "jobdiff:" <> _] = Enum.at(buttons, 0)
-      assert ["Create PR", "jobpr:" <> _] = Enum.at(buttons, 1)
-      assert ["Discard", "jobdiscard:" <> _] = Enum.at(buttons, 2)
+      assert ["Preview", "jobpreview:" <> _] = Enum.at(buttons, 1)
+      assert ["Create PR", "jobpr:" <> _] = Enum.at(buttons, 2)
+      assert ["Discard", "jobdiscard:" <> _] = Enum.at(buttons, 3)
     end
 
     test "a job completion report fires a typing indicator before the card is edited in", %{

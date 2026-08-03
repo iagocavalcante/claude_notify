@@ -7,12 +7,8 @@ INPUT=$(cat)
 
 SESSION_ID="${CLAUDE_SESSION_ID:-unknown}"
 TERM_SID="${TERM_SESSION_ID:-unknown}"
-TTY_DEV="$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' ')"
-if [[ "$TTY_DEV" =~ ^ttys[0-9]+$ ]]; then
-  TTY_PATH="/dev/$TTY_DEV"
-else
-  TTY_PATH="unknown"
-fi
+TTY_PATH="$(resolve_terminal_tty)"
+[ "$TTY_PATH" = "unknown" ] && exit 0
 
 # Extract tool_name, tool_input, and tool_response from stdin JSON
 # Pass shell vars as argv to avoid injection

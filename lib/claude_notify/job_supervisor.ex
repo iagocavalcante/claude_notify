@@ -218,6 +218,8 @@ defmodule ClaudeNotify.JobSupervisor do
 
       case JobStore.update_status(job_store, job.id, :running, %{}) do
         {:ok, _job} ->
+          refresh_dashboard()
+
           case resolve_and_start(job, opts, job_store, state) do
             {:ok, new_state} ->
               new_state
@@ -228,6 +230,7 @@ defmodule ClaudeNotify.JobSupervisor do
               )
 
               JobStore.update_status(job_store, job.id, :failed, %{})
+              refresh_dashboard()
               state
           end
 
@@ -275,5 +278,9 @@ defmodule ClaudeNotify.JobSupervisor do
     defp engine_for_name("claude"), do: {:ok, ClaudeNotify.Engine.Claude}
     defp engine_for_name("codex"), do: {:ok, ClaudeNotify.Engine.Codex}
     defp engine_for_name(other), do: {:error, {:unsupported_engine, other}}
+
+    defp refresh_dashboard do
+      if Process.whereis(ClaudeNotify.Dashboard), do: ClaudeNotify.Dashboard.refresh()
+    end
   end
 end

@@ -15,10 +15,14 @@ defmodule ClaudeNotify.Application do
         ClaudeNotify.TaskTracker,
         ClaudeNotify.Dashboard,
         ClaudeNotify.JobStore,
-        ClaudeNotify.JobTranscript,
-        ClaudeNotify.JobSupervisor,
-        ClaudeNotify.JobSupervisor.Dispatcher
+        ClaudeNotify.PreviewManager
       ] ++
+        keep_awake_child() ++
+        [
+          ClaudeNotify.JobTranscript,
+          ClaudeNotify.JobSupervisor,
+          ClaudeNotify.JobSupervisor.Dispatcher
+        ] ++
         reconciler_child() ++
         [
           {Task.Supervisor,
@@ -33,6 +37,14 @@ defmodule ClaudeNotify.Application do
   defp poller_child do
     if Application.get_env(:claude_notify, :start_poller, true) do
       [ClaudeNotify.TelegramPoller]
+    else
+      []
+    end
+  end
+
+  defp keep_awake_child do
+    if Application.get_env(:claude_notify, :keep_awake_while_working, true) do
+      [ClaudeNotify.KeepAwake]
     else
       []
     end

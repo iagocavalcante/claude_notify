@@ -44,7 +44,11 @@ if [ -f "$PROJECT_DIR/.env" ]; then
   echo ""
   read -p "Keep existing config? (Y/n) " keep_env
   if [[ "$keep_env" =~ ^[Nn] ]]; then
-    unset TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID CLAUDE_NOTIFY_WEBHOOK_SECRET
+    unset TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID CLAUDE_NOTIFY_WEBHOOK_SECRET CLAUDE_NOTIFY_WORKSPACE_ROOTS
+    unset CLAUDE_NOTIFY_PREVIEW_PROVIDER CLAUDE_NOTIFY_PREVIEW_TTL_SECONDS
+    unset CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_ZONE_ID
+    unset CLOUDFLARE_PREVIEW_DOMAIN CLOUDFLARE_ACCESS_EMAILS
+    unset TAILSCALE_PREVIEW_MODE TAILSCALE_PATH TAILSCALE_SSH_HOST TAILSCALE_SSH_PATH
   fi
 fi
 
@@ -86,6 +90,16 @@ ENVEOF
   echo "Saved .env (permissions: owner-only)"
 fi
 
+# Repositories below these roots appear in Telegram's project picker. Keep
+# this machine-local: every user can point the bot at their own workspace.
+if [ -z "${CLAUDE_NOTIFY_WORKSPACE_ROOTS:-}" ]; then
+  echo ""
+  read -p "Workspace roots, comma-separated [$HOME/Workspaces]: " CLAUDE_NOTIFY_WORKSPACE_ROOTS
+  CLAUDE_NOTIFY_WORKSPACE_ROOTS="${CLAUDE_NOTIFY_WORKSPACE_ROOTS:-$HOME/Workspaces}"
+  printf 'CLAUDE_NOTIFY_WORKSPACE_ROOTS="%s"\n' "$CLAUDE_NOTIFY_WORKSPACE_ROOTS" >> "$PROJECT_DIR/.env"
+  chmod 600 "$PROJECT_DIR/.env"
+fi
+
 # --- 3. Install dependencies ---
 echo ""
 echo "Installing dependencies..."
@@ -118,8 +132,10 @@ else:
 hooks = settings.get('hooks', {})
 
 hook_map = {
+    'SessionStart': 'claude-notify-session-start.sh',
     'UserPromptSubmit': 'claude-notify-prompt.sh',
     'Stop': 'claude-notify-stop.sh',
+    'SessionEnd': 'claude-notify-session-end.sh',
     'Notification': 'claude-notify-notify.sh',
     'PostToolUse': 'claude-notify-tool.sh',
 }
@@ -156,16 +172,50 @@ else
 fi
 
 # --- 6. Create run.sh ---
-# Detect Erlang/Elixir paths
+# Detect the interactive-shell paths launchd does not inherit. Capture the
+# current CLI directories and include common user-level install locations so
+# Claude Code/Codex keep resolving after routine package-manager upgrades.
 ELIXIR_BIN="$(dirname "$(which elixir)")"
 ERLANG_BIN="$(dirname "$(which erl)")"
+RUNTIME_PATH=""
+
+append_runtime_path() {
+  local dir="$1"
+  if [ -n "$dir" ] && [ -d "$dir" ]; then
+    case ":$RUNTIME_PATH:" in
+      *":$dir:"*) ;;
+      *) RUNTIME_PATH="${RUNTIME_PATH:+$RUNTIME_PATH:}$dir" ;;
+    esac
+  fi
+}
+
+for agent_cli in claude codex cloudflared tailscale; do
+  if agent_path="$(command -v "$agent_cli" 2>/dev/null)"; then
+    append_runtime_path "$(dirname "$agent_path")"
+    echo "Found $agent_cli: $agent_path"
+  else
+    echo "WARNING: $agent_cli is not installed; features that use it will be unavailable."
+  fi
+done
+
+append_runtime_path "$HOME/.local/bin"
+append_runtime_path "$HOME/.local/share/mise/shims"
+append_runtime_path "$HOME/.npm-global/bin"
+append_runtime_path "$HOME/.bun/bin"
+append_runtime_path "/opt/homebrew/bin"
+append_runtime_path "/usr/local/bin"
+append_runtime_path "$ERLANG_BIN"
+append_runtime_path "$ELIXIR_BIN"
 
 cat > "$PROJECT_DIR/run.sh" <<RUNEOF
 #!/usr/bin/env bash
 set -e
 PROJECT_DIR="$PROJECT_DIR"
 cd "\$PROJECT_DIR"
-export PATH="$ERLANG_BIN:$ELIXIR_BIN:\$PATH"
+export HOME="$HOME"
+export MIX_HOME="\$HOME/.mix"
+export HEX_HOME="\$HOME/.hex"
+export PATH="$RUNTIME_PATH:/usr/bin:/bin:/usr/sbin:/sbin"
 set -a
 source "\$PROJECT_DIR/.env"
 set +a

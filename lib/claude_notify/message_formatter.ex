@@ -63,6 +63,33 @@ defmodule ClaudeNotify.MessageFormatter do
   end
 
   @doc """
+  Formats an assistant response as Telegram HTML while preserving the useful
+  subset of Markdown coding agents commonly emit: headings, bold/italic text,
+  bullets, quotes, links, inline code, and fenced code blocks.
+
+  HTML is used deliberately for agent-authored content. Telegram's MarkdownV2
+  syntax differs from CommonMark, so escaping a normal agent response either
+  exposes literal `**markers**` or produces fragile nested escaping.
+  """
+  def claude_response_html(text) do
+    body = agent_markdown_html(text)
+    "🤖 <b>Claude</b>\n#{body}"
+  end
+
+  @doc """
+  Converts CommonMark-style agent text into safe Telegram HTML.
+
+  All source HTML is escaped before supported Markdown markers are converted,
+  so model output cannot inject arbitrary Telegram tags or attributes.
+  """
+  def agent_markdown_html(text) when is_binary(text) do
+    rendered = text |> String.split("\n") |> render_markdown_lines()
+    if valid_telegram_html?(rendered), do: rendered, else: html_escape(text)
+  end
+
+  def agent_markdown_html(text), do: text |> to_string() |> agent_markdown_html()
+
+  @doc """
   Format a skill invocation card.
   """
   def skill_card(skill_name, description) do
@@ -147,7 +174,9 @@ defmodule ClaudeNotify.MessageFormatter do
   end
 
   @doc """
-  Format a compact "session stopped" message.
+  Format a compact turn-completed message. Claude Code's Stop hook means the
+  assistant is idle and ready for another prompt; it does not mean the terminal
+  session has closed.
   """
   def session_stopped_compact(session) do
     project = project_name(session.working_dir)
@@ -162,7 +191,7 @@ defmodule ClaudeNotify.MessageFormatter do
     reason = session[:stop_reason] || "unknown"
     count = session[:prompt_count] || 0
 
-    "🔴 #{escape(project)} · ended\nDuration: #{escape(duration)} · #{count} prompts · reason: #{escape(reason)}"
+    "⚪ #{escape(project)} · idle\nSession time: #{escape(duration)} · #{count} prompts · last turn: #{escape(reason)}"
   end
 
   @doc """
@@ -259,6 +288,35 @@ defmodule ClaudeNotify.MessageFormatter do
   end
 
   @doc """
+  HTML counterpart to `job_completed/3` for agent-authored summaries.
+  """
+  def job_completed_html(job, diffstat, summary) do
+    summary_html =
+      case summary do
+        nil -> "<i>No summary reported</i>"
+        "" -> "<i>No summary reported</i>"
+        text -> bounded_agent_markdown_html(text, 2_500)
+      end
+
+    diff_html =
+      case diffstat do
+        nil -> nil
+        "" -> nil
+        text -> "<pre>#{bounded_html_escape(text, 900)}</pre>"
+      end
+
+    [
+      "✅ <b>#{html_escape(job.project)}</b> · #{html_escape(engine_name(job.engine))}",
+      "<code>Job ##{html_escape(job.id)} · completed</code>",
+      "",
+      summary_html,
+      diff_html
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  @doc """
   Format a dispatcher job's failure report: a failed header and the tail of
   the engine's own output - never a green-washed success-shaped message.
   `error_text` is the job's persisted `error_tail` (the engine's own error
@@ -270,6 +328,26 @@ defmodule ClaudeNotify.MessageFormatter do
       "❌ #{escape("Job ##{job.id} (#{job.project}, #{job.engine}) failed")}",
       "━━━━━━━━━━━━━━━",
       error_block(error_text)
+    ]
+    |> Enum.join("\n")
+  end
+
+  @doc """
+  HTML counterpart to `job_failed/2`.
+  """
+  def job_failed_html(job, error_text) do
+    error_html =
+      case error_text do
+        nil -> "<i>No output captured</i>"
+        "" -> "<i>No output captured</i>"
+        text -> "<pre>#{bounded_html_escape(text, 2_600)}</pre>"
+      end
+
+    [
+      "❌ <b>#{html_escape(job.project)}</b> · #{html_escape(engine_name(job.engine))}",
+      "<code>Job ##{html_escape(job.id)} · failed</code>",
+      "",
+      error_html
     ]
     |> Enum.join("\n")
   end
@@ -433,6 +511,164 @@ defmodule ClaudeNotify.MessageFormatter do
   Public escape for MarkdownV2 code spans.
   """
   def escape_code_public(text), do: escape_code(text)
+
+  defp bounded_agent_markdown_html(text, max_bytes) do
+    source = to_string(text)
+    render_bounded_markdown(source, max_bytes, min(String.length(source), 2_800))
+  end
+
+  defp render_bounded_markdown(source, max_bytes, char_limit) do
+    truncated? = String.length(source) > char_limit
+    rendered = source |> String.slice(0, char_limit) |> agent_markdown_html()
+    suffix = if truncated?, do: "\n\n<i>…response truncated</i>", else: ""
+
+    cond do
+      byte_size(rendered <> suffix) <= max_bytes ->
+        rendered <> suffix
+
+      char_limit > 120 ->
+        render_bounded_markdown(source, max_bytes, max(div(char_limit * 3, 4), 120))
+
+      true ->
+        bounded_html_escape(source, max_bytes - 32) <> "\n<i>…truncated</i>"
+    end
+  end
+
+  defp render_markdown_lines(lines) do
+    {rendered, code_lines} =
+      Enum.reduce(lines, {[], nil}, fn line, {acc, code_lines} ->
+        cond do
+          is_list(code_lines) and fenced_code_line?(line) ->
+            code = code_lines |> Enum.reverse() |> Enum.join("\n") |> html_escape()
+            {["<pre>#{code}</pre>" | acc], nil}
+
+          is_list(code_lines) ->
+            {acc, [line | code_lines]}
+
+          fenced_code_line?(line) ->
+            {acc, []}
+
+          true ->
+            {[render_markdown_line(line) | acc], nil}
+        end
+      end)
+
+    rendered =
+      case code_lines do
+        nil ->
+          rendered
+
+        unclosed ->
+          [
+            "<pre>#{unclosed |> Enum.reverse() |> Enum.join("\n") |> html_escape()}</pre>"
+            | rendered
+          ]
+      end
+
+    rendered |> Enum.reverse() |> Enum.join("\n")
+  end
+
+  defp fenced_code_line?(line), do: Regex.match?(~r/^\s*```[^`]*\s*$/, line)
+
+  defp render_markdown_line(line) do
+    cond do
+      match = Regex.run(~r/^\s{0,3}[#]{1,6}\s+(.+)$/, line) ->
+        [_, content] = match
+        "<b>#{render_inline_markdown(content)}</b>"
+
+      match = Regex.run(~r/^\s*[-+*]\s+(.+)$/, line) ->
+        [_, content] = match
+        "• #{render_inline_markdown(content)}"
+
+      match = Regex.run(~r/^\s*(\d+)[.)]\s+(.+)$/, line) ->
+        [_, number, content] = match
+        "<b>#{number}.</b> #{render_inline_markdown(content)}"
+
+      match = Regex.run(~r/^\s*>\s?(.*)$/, line) ->
+        [_, content] = match
+        "<blockquote>#{render_inline_markdown(content)}</blockquote>"
+
+      true ->
+        render_inline_markdown(line)
+    end
+  end
+
+  defp render_inline_markdown(text) do
+    ~r/(`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[A-Za-z0-9._~:\/?#\[\]@!$&'()+,;=%-]+\))/
+    |> Regex.split(text, include_captures: true, trim: false)
+    |> Enum.map(fn part ->
+      cond do
+        Regex.match?(~r/^`[^`\n]+`$/, part) ->
+          "<code>#{part |> String.slice(1, String.length(part) - 2) |> html_escape()}</code>"
+
+        match = Regex.run(~r/^\[([^\]\n]+)\]\((https?:\/\/.+)\)$/, part) ->
+          [_, label, url] = match
+          "<a href=\"#{html_escape(url)}\">#{html_escape(label)}</a>"
+
+        true ->
+          part
+          |> html_escape()
+          |> replace_regex(~r/\*\*(.+?)\*\*/, "<b>\\1</b>")
+          |> replace_regex(~r/__(.+?)__/, "<b>\\1</b>")
+          |> replace_regex(~r/~~(.+?)~~/, "<s>\\1</s>")
+          |> replace_regex(~r/(?<!\*)\*([^*\n]+)\*(?!\*)/, "<i>\\1</i>")
+          |> replace_regex(~r/(?<!\w)_([^_\n]+)_(?!\w)/, "<i>\\1</i>")
+      end
+    end)
+    |> Enum.join()
+  end
+
+  defp bounded_html_escape(text, max_bytes) do
+    text
+    |> to_string()
+    |> String.graphemes()
+    |> Enum.reduce_while({[], 0}, fn grapheme, {acc, size} ->
+      escaped = html_escape(grapheme)
+      escaped_size = byte_size(escaped)
+
+      if size + escaped_size <= max(max_bytes, 0),
+        do: {:cont, {[escaped | acc], size + escaped_size}},
+        else: {:halt, {acc, size}}
+    end)
+    |> elem(0)
+    |> Enum.reverse()
+    |> IO.iodata_to_binary()
+  end
+
+  defp replace_regex(text, regex, replacement), do: Regex.replace(regex, text, replacement)
+
+  @telegram_html_tags ~w(b i s code pre blockquote a)
+
+  defp valid_telegram_html?(html) do
+    tags = Regex.scan(~r/<(\/)?([a-z]+)(?:\s+[^>]*)?>/, html)
+
+    case Enum.reduce_while(tags, [], fn
+           [_, "", tag], stack when tag in @telegram_html_tags ->
+             {:cont, [tag | stack]}
+
+           [_, "/", tag], [tag | rest] when tag in @telegram_html_tags ->
+             {:cont, rest}
+
+           _tag, _stack ->
+             {:halt, :invalid}
+         end) do
+      [] -> true
+      _ -> false
+    end
+  end
+
+  defp html_escape(text) do
+    text
+    |> to_string()
+    |> String.replace("&", "&amp;")
+    |> String.replace("<", "&lt;")
+    |> String.replace(">", "&gt;")
+    |> String.replace("\"", "&quot;")
+  end
+
+  defp engine_name("claude"), do: "Claude"
+  defp engine_name("codex"), do: "Codex"
+  defp engine_name(other), do: to_string(other)
 
   # Inside MarkdownV2 pre blocks (```), only backtick and backslash need escaping
   defp escape_pre(text) when is_binary(text) do
