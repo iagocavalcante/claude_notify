@@ -575,6 +575,22 @@ defmodule ClaudeNotify.TelegramPollerTest do
       wait_for_status(store, job.id, :completed)
     end
 
+    test "an unrecognized slash command is forwarded as a project skill", %{
+      state: state,
+      store: store
+    } do
+      state =
+        Map.put(state, :selected_projects, %{@chat_id => "trainer"})
+
+      TelegramPoller.handle_update(text_message("/post-shorts publish the latest clip"), state)
+
+      assert [job] = JobStore.list(store)
+      assert job.engine == "claude"
+      assert job.project == "trainer"
+      assert job.prompt == "/post-shorts publish the latest clip"
+      wait_for_status(store, job.id, :completed)
+    end
+
     test "/run codex <project> <prompt> selects the codex engine", %{state: state, store: store} do
       TelegramPoller.handle_update(text_message("/run codex trainer fix the widget"), state)
 

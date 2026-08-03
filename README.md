@@ -23,6 +23,7 @@ Elixir app that sends interactive Telegram notifications for Claude Code session
 - **Sleep-safe development** — macOS idle sleep is prevented automatically while terminal sessions or dispatcher jobs are working, then released when all work becomes idle
 - **Provider-agnostic web previews** — launch a job's web app through Cloudflare Access (email OTP) or Tailscale Serve (tailnet identity), then tear it down automatically
 - **Reliable rich replies** — coding-agent Markdown renders cleanly in Telegram; long replies are delivered completely in balanced HTML chunks and visually attached to their prompt
+- **Terminal-parity skills and Chrome** — Claude slash commands pass through Telegram, and isolated Claude jobs can use a paired Claude in Chrome extension
 
 ## How It Works
 
@@ -183,6 +184,8 @@ WEBHOOK_MAX_SKEW_SECONDS=300
 CLAUDE_NOTIFY_WORKSPACE_ROOTS="$HOME/Workspaces"
 # Set false to disable automatic `caffeinate -i` while work is active
 CLAUDE_NOTIFY_KEEP_AWAKE=true
+# Add --chrome to Claude dispatcher/resume processes (requires a paired extension)
+CLAUDE_NOTIFY_CLAUDE_CHROME=true
 
 # Optional previews: auto selects the first available secure provider
 CLAUDE_NOTIFY_PREVIEW_PROVIDER=auto
@@ -206,6 +209,8 @@ TAILSCALE_PREVIEW_MODE=serve
 ```
 
 Dispatcher settings (job commands, watch mode) are `config.exs`/`runtime.exs` keys, not `.env` variables — see [Job dispatcher](#job-dispatcher) for the full list with defaults.
+
+When `CLAUDE_NOTIFY_CLAUDE_CHROME=true`, every Claude dispatcher and resumed job starts with `--chrome`, including jobs inside isolated worktrees. Install and pair Claude in Chrome first. Bot commands such as `/jobs` remain owned by Telegram; any other slash command, such as a project `/post-shorts` skill or Claude's `/chrome`, is sent verbatim to the selected session/project.
 
 Load this env in the shell where you run Claude Code so hooks can sign webhook requests:
 

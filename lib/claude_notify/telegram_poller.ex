@@ -812,11 +812,10 @@ defmodule ClaudeNotify.TelegramPoller do
         state
 
       String.starts_with?(trimmed, "/") ->
-        Telegram.send_message(
-          MessageFormatter.escape_full("Unknown command. Use /help for available commands.")
-        )
-
-        state
+        # Bot-owned commands are handled above. Everything else belongs to
+        # the selected Claude/Codex surface, including project skills such as
+        # /post-shorts and built-in interactive commands such as /chrome.
+        handle_text_input(chat_id, trimmed, state)
 
       true ->
         handle_text_input(chat_id, trimmed, state)

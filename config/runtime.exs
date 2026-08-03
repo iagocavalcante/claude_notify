@@ -46,6 +46,7 @@ if config_env() != :test do
     telegram_chat_id: Dotenvy.env!("TELEGRAM_CHAT_ID", :string),
     webhook_secret: Dotenvy.env!("CLAUDE_NOTIFY_WEBHOOK_SECRET", :string),
     workspace_roots: workspace_roots,
+    claude_chrome_enabled: parse_bool.(System.get_env("CLAUDE_NOTIFY_CLAUDE_CHROME"), false),
     preview: %{
       default_provider: System.get_env("CLAUDE_NOTIFY_PREVIEW_PROVIDER", "auto"),
       ttl_seconds:

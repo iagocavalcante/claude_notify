@@ -180,6 +180,17 @@ defmodule ClaudeNotify.JobRunnerTest do
       assert "stream-json" in args
       assert "--verbose" in args
       assert "--dangerously-skip-permissions" in args
+      refute "--chrome" in args
+    end
+
+    test "build and resume commands enable Chrome when requested" do
+      assert {"claude", build_args} = Engine.Claude.build_command("browse", chrome: true)
+      assert "--chrome" in build_args
+
+      assert {"claude", resume_args} =
+               Engine.Claude.resume_command("sess-123", "continue", chrome: true)
+
+      assert "--chrome" in resume_args
     end
 
     test "resume_command/3 includes --resume and the session id" do

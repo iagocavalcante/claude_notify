@@ -4,6 +4,7 @@ config :claude_notify,
   port: 4040,
   telegram_base_url: "https://api.telegram.org",
   max_event_concurrency: 8,
+  claude_chrome_enabled: false,
   keep_awake_while_working: true,
   preview: %{
     default_provider: :auto,

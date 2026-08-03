@@ -3,7 +3,7 @@ defmodule ClaudeNotify.Engine.Claude do
   `ClaudeNotify.Engine` implementation for the Claude Code CLI.
 
   Launches `claude -p <wrapped_prompt> --output-format stream-json --verbose
-  --dangerously-skip-permissions`. Auto-approving every tool call is safe
+  --dangerously-skip-permissions`, optionally with `--chrome`. Auto-approving every tool call is safe
   ONLY because `JobRunner` always runs this with `cwd` set to the job's
   throwaway git worktree/branch (see `ClaudeNotify.WorktreeManager`), which
   is never pushed automatically - the worktree boundary is the actual
@@ -49,31 +49,44 @@ defmodule ClaudeNotify.Engine.Claude do
   @behaviour ClaudeNotify.Engine
 
   @impl true
-  def build_command(prompt, _opts) do
+  def build_command(prompt, opts) do
     {"claude",
-     [
-       "-p",
-       prompt,
-       "--output-format",
-       "stream-json",
-       "--verbose",
-       "--dangerously-skip-permissions"
-     ]}
+     chrome_args(opts) ++
+       [
+         "-p",
+         prompt,
+         "--output-format",
+         "stream-json",
+         "--verbose",
+         "--dangerously-skip-permissions"
+       ]}
   end
 
   @impl true
-  def resume_command(session_id, prompt, _opts) do
+  def resume_command(session_id, prompt, opts) do
     {"claude",
-     [
-       "-p",
-       "--resume",
-       session_id,
-       prompt,
-       "--output-format",
-       "stream-json",
-       "--verbose",
-       "--dangerously-skip-permissions"
-     ]}
+     chrome_args(opts) ++
+       [
+         "-p",
+         "--resume",
+         session_id,
+         prompt,
+         "--output-format",
+         "stream-json",
+         "--verbose",
+         "--dangerously-skip-permissions"
+       ]}
+  end
+
+  defp chrome_args(opts) do
+    enabled =
+      Keyword.get(
+        opts,
+        :chrome,
+        Application.get_env(:claude_notify, :claude_chrome_enabled, false)
+      )
+
+    if enabled, do: ["--chrome"], else: []
   end
 
   @impl true
