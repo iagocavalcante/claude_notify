@@ -152,7 +152,7 @@ This table also drives Telegram's native "/" command menu, which self-registers 
 | `/unpreview <preview-id>` | Stop a preview and remove its provider route/resources |
 | `/help` | Show available commands |
 
-Reply to any message to send text to that session. If only one session is active, it is auto-selected. Replying to a dispatcher job's activity message resumes that job instead — see [Job dispatcher](#job-dispatcher).
+Reply to any message to send text to that session. If only one session is active, it is auto-selected. Standalone `yes`, `no`, `yes!`, `esc`, or a digit from `1` to `9` uses the same direct response keystroke as the matching permission button. Replying to a dispatcher job's activity message resumes that job instead — see [Job dispatcher](#job-dispatcher).
 
 Registered bot commands in the table above are handled by Claude Notify. Every other slash command is forwarded verbatim to the selected destination, so project skills such as `/post-shorts make three variants` work like they do in Claude Code. A selected terminal session receives the text in its existing Terminal.app tab; a selected project starts an isolated dispatcher job with that text as its prompt.
 

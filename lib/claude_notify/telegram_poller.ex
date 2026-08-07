@@ -127,6 +127,7 @@ defmodule ClaudeNotify.TelegramPoller do
        selected_projects: %{},
        selected_engines: %{},
        telegram: Keyword.get(opts, :telegram, Telegram),
+       terminal_injector: Keyword.get(opts, :terminal_injector, TerminalInjector),
        job_store: Keyword.get(opts, :job_store, JobStore),
        job_transcript: Keyword.get(opts, :job_transcript, JobTranscript),
        project_registry: Keyword.get(opts, :project_registry),
@@ -321,7 +322,7 @@ defmodule ClaudeNotify.TelegramPoller do
 
         {:response, session_id, response} ->
           Telegram.answer_callback_query(callback_id, response_label(response))
-          inject_response(session_id, response)
+          inject_response(state, session_id, response)
           state
 
         {:job_diff, job_id} ->
@@ -468,13 +469,13 @@ defmodule ClaudeNotify.TelegramPoller do
               inject_reply_text(text, session)
 
             response ->
-              inject_response(session_id, response)
+              if inject_response(state, session_id, response) == :ok do
+                short = String.slice(session_id, 0, 8)
 
-              short = String.slice(session_id, 0, 8)
-
-              Telegram.send_message(
-                MessageFormatter.escape_full("#{response_label(response)} (#{short})")
-              )
+                state.telegram.send_message_with_retry(
+                  MessageFormatter.escape_full("#{response_label(response)} (#{short})")
+                )
+              end
           end
 
           state
@@ -571,7 +572,8 @@ defmodule ClaudeNotify.TelegramPoller do
     end
   end
 
-  # Maps a reply text to a button-equivalent response code, or nil for free text.
+  # Maps standalone or reply text to a button-equivalent response code, or nil
+  # for free text.
   # Recognized: yes/y/approve, no/n/deny, esc/escape/cancel, yes!/yda (don't ask),
   # and bare numerics 1-9 for numbered options. Match is case-insensitive after
   # trimming whitespace.
@@ -818,7 +820,10 @@ defmodule ClaudeNotify.TelegramPoller do
         handle_text_input(chat_id, trimmed, state)
 
       true ->
-        handle_text_input(chat_id, trimmed, state)
+        case shortcut_response(trimmed) do
+          nil -> handle_text_input(chat_id, trimmed, state)
+          response -> handle_shortcut_command(chat_id, response, state)
+        end
     end
   end
 
@@ -827,13 +832,13 @@ defmodule ClaudeNotify.TelegramPoller do
   defp handle_shortcut_command(chat_id, response, state) do
     case resolve_session(chat_id, state) do
       {:ok, session_id, state} ->
-        inject_response(session_id, response)
+        if inject_response(state, session_id, response) == :ok do
+          label = response_label(response)
 
-        label = response_label(response)
-
-        Telegram.send_message(
-          MessageFormatter.escape_full("#{label} (#{String.slice(session_id, 0, 8)})")
-        )
+          state.telegram.send_message_with_retry(
+            MessageFormatter.escape_full("#{label} (#{String.slice(session_id, 0, 8)})")
+          )
+        end
 
         state
 
@@ -2320,15 +2325,18 @@ defmodule ClaudeNotify.TelegramPoller do
     end
   end
 
-  defp inject_response(session_id, response) do
+  defp inject_response(state, session_id, response) do
     case SessionStore.get_session(session_id) do
       nil ->
         Logger.warning("TelegramPoller: session #{session_id} not found")
+        {:error, :session_not_found}
 
       session ->
         tty_path = session[:tty_path]
 
-        case TerminalInjector.send_response(tty_path, response) do
+        injector = Map.get(state, :terminal_injector, TerminalInjector)
+
+        case injector.send_response(tty_path, response) do
           :ok ->
             :ok
 
@@ -2337,11 +2345,13 @@ defmodule ClaudeNotify.TelegramPoller do
 
             Logger.warning("TelegramPoller: inject failed for #{short_id}: #{inspect(reason)}")
 
-            Telegram.send_message(
+            state.telegram.send_message_with_retry(
               MessageFormatter.escape_full(
                 "Failed to inject #{response_label(response)} into #{short_id}"
               )
             )
+
+            {:error, reason}
         end
     end
   end

@@ -152,6 +152,17 @@ defmodule ClaudeNotify.TelegramPollerTest do
     def set_my_commands(_commands), do: {:error, :boom}
   end
 
+  defmodule FakeTerminalInjector do
+    def send_response(tty_path, response) do
+      case Process.whereis(:telegram_poller_test_process) do
+        nil -> send(self(), {:terminal_response, tty_path, response})
+        pid -> send(pid, {:terminal_response, tty_path, response})
+      end
+
+      :ok
+    end
+  end
+
   defmodule FakePreviewManager do
     def start_preview(_server, job) do
       forward({:preview_started, job.id})
@@ -362,6 +373,7 @@ defmodule ClaudeNotify.TelegramPollerTest do
         offset: 0,
         selected_sessions: %{},
         telegram: FakeTelegram,
+        terminal_injector: FakeTerminalInjector,
         job_store: store,
         job_transcript: transcript,
         project_registry: registry,
@@ -773,6 +785,28 @@ defmodule ClaudeNotify.TelegramPollerTest do
       assert [job] = JobStore.list(store)
       assert job.engine == "codex"
       assert job.prompt == "review this repository"
+    end
+
+    test "standalone yes/no shortcuts use response keystrokes instead of text injection", %{
+      state: state
+    } do
+      session_id = "shortcut-#{System.unique_integer([:positive])}"
+      tty_path = "/dev/ttys321"
+
+      SessionStore.register_prompt(session_id, "waiting", "/tmp/project", %{
+        "tty_path" => tty_path
+      })
+
+      on_exit(fn -> SessionStore.remove_session(session_id) end)
+
+      state = %{state | selected_sessions: %{@chat_id => session_id}}
+
+      for {text, expected} <- [{"yes", "yes"}, {"no", "no"}, {"yes!", "yes_dont_ask"}] do
+        assert TelegramPoller.handle_update(text_message(text), state) == state
+        assert_receive {:terminal_response, ^tty_path, ^expected}
+        assert_receive {:telegram_send, confirmation}
+        assert confirmation =~ "Sent"
+      end
     end
 
     # -- /cancel <id> --
