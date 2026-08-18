@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Claude Code Notification hook - sends notification events to claude_notify
-# Reads JSON from stdin (contains "message" field with the notification text)
+# Claude Code Notification / Codex PermissionRequest hook.
 
 source "$(dirname "$0")/claude-notify-common.sh"
 
@@ -26,12 +25,27 @@ fi
 
 # Build payload using python3 - pass shell vars as argv to avoid injection
 PAYLOAD=$(echo "$INPUT" | python3 -c '
-import json, sys
+import json, sys, time, uuid
 d = json.load(sys.stdin)
+message = d.get("message", "")
+if not message and d.get("hook_event_name") == "PermissionRequest":
+    tool_name = d.get("tool_name", "action")
+    tool_input = d.get("tool_input") or {}
+    detail = tool_input.get("description") if isinstance(tool_input, dict) else None
+    if not detail and isinstance(tool_input, dict):
+        detail = tool_input.get("command")
+    if not detail:
+        detail = json.dumps(tool_input, ensure_ascii=False)
+    message = f"Allow {tool_name}?"
+    if detail and detail != "{}":
+        message += f"\n\n{detail}"
 out = {
     "event": "notification",
+    "event_id": d.get("event_id") or d.get("hook_event_id") or str(uuid.uuid4()),
+    "observed_at": int(time.time() * 1000),
+    "engine": sys.argv[6],
     "session_id": d.get("session_id", sys.argv[1]),
-    "message": d.get("message", ""),
+    "message": message,
     "term_session_id": sys.argv[2],
     "tty_path": sys.argv[3],
     "working_dir": d.get("cwd", sys.argv[4]),
@@ -39,7 +53,7 @@ out = {
     "git_diff": sys.argv[5]
 }
 print(json.dumps(out))
-' "$SESSION_ID" "$TERM_SID" "$TTY_PATH" "$PWD" "$GIT_DIFF" 2>/dev/null)
+' "$SESSION_ID" "$TERM_SID" "$TTY_PATH" "$PWD" "$GIT_DIFF" "${CLAUDE_NOTIFY_ENGINE:-claude}" 2>/dev/null)
 
 post_event_payload "$PAYLOAD"
 

@@ -11,6 +11,25 @@ defmodule ClaudeNotify.MessageFormatterTest do
     assert message =~ "started"
   end
 
+  test "Codex terminal messages are labeled as Codex" do
+    session = %{
+      working_dir: "/Users/iago/projects/my_app",
+      engine: "codex",
+      prompt_count: 1,
+      started_at: 10,
+      stopped_at: 20,
+      stop_reason: "end_turn"
+    }
+
+    assert MessageFormatter.session_started_compact(session) =~ "Codex started"
+    assert MessageFormatter.session_stopped_compact(session) =~ "Codex idle"
+
+    assert MessageFormatter.notification_question("Allow Bash?", "abc123", "codex") =~
+             "Codex Question"
+
+    assert MessageFormatter.agent_response_html("Done", "codex") =~ "<b>Codex</b>"
+  end
+
   test "session_stopped_compact formats minimal stop message" do
     now = System.system_time(:second)
 

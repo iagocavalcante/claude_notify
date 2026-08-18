@@ -31,6 +31,7 @@ defmodule ClaudeNotify.JobStore do
       :id,
       :engine,
       :project,
+      :project_id,
       :prompt,
       :worktree_path,
       :branch,
@@ -92,6 +93,7 @@ defmodule ClaudeNotify.JobStore do
       id: id,
       engine: attrs[:engine],
       project: attrs[:project],
+      project_id: attrs[:project_id],
       prompt: attrs[:prompt],
       worktree_path: attrs[:worktree_path],
       branch: attrs[:branch],
@@ -199,10 +201,22 @@ defmodule ClaudeNotify.JobStore do
     with true <- File.exists?(path),
          {:ok, binary} <- File.read(path),
          {:ok, %{jobs: jobs, next_id: next_id}} <- safe_decode(binary) do
-      %__MODULE__{jobs: jobs, next_id: next_id}
+      %__MODULE__{jobs: normalize_jobs(jobs), next_id: next_id}
     else
       _ -> %__MODULE__{}
     end
+  end
+
+  # Persisted structs from before a field was introduced are ordinary maps
+  # missing that key. Rebuilding them through the current struct definition
+  # supplies safe defaults without requiring a destructive store migration.
+  defp normalize_jobs(jobs) do
+    allowed_keys = Map.keys(%Job{})
+
+    Map.new(jobs, fn {id, job} ->
+      attrs = job |> Map.delete(:__struct__) |> Map.take(allowed_keys)
+      {id, struct(Job, attrs)}
+    end)
   end
 
   # :safe rejects data that would create new atoms, so a corrupted or

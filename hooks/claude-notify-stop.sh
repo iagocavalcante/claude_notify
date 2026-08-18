@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Claude Code Stop hook - sends stop events to claude_notify
+# Claude Code / Codex Stop hook - sends stop events to claude_notify
 # Reads JSON from stdin, extracts session_id, stop reason, and cwd
 
 source "$(dirname "$0")/claude-notify-common.sh"
@@ -25,20 +25,24 @@ fi
 
 # Extract all useful fields from stdin JSON, passing shell vars as argv
 PAYLOAD=$(echo "$INPUT" | python3 -c '
-import json, sys
+import json, sys, time, uuid
 d = json.load(sys.stdin)
 out = {
     "event": "stop",
+    "event_id": d.get("event_id") or d.get("hook_event_id") or str(uuid.uuid4()),
+    "observed_at": int(time.time() * 1000),
+    "engine": sys.argv[4],
     "session_id": d.get("session_id", "unknown"),
     "stop_reason": d.get("stop_reason", d.get("reason", "unknown")),
     "working_dir": d.get("cwd", "unknown"),
     "term_session_id": sys.argv[1],
     "tty_path": sys.argv[2],
     "transcript_path": d.get("transcript_path", ""),
+    "assistant_response": d.get("last_assistant_message", ""),
     "git_diff": sys.argv[3]
 }
 print(json.dumps(out))
-' "$TERM_SID" "$TTY_PATH" "$GIT_DIFF" 2>/dev/null)
+' "$TERM_SID" "$TTY_PATH" "$GIT_DIFF" "${CLAUDE_NOTIFY_ENGINE:-claude}" 2>/dev/null)
 
 post_event_payload "$PAYLOAD"
 

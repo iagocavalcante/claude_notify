@@ -103,6 +103,11 @@ defmodule ClaudeNotify.Engine.Claude do
     {:ok, {:result, %{session_id: event["session_id"], status: status, summary: event["result"]}}}
   end
 
+  defp parse_decoded(%{"type" => "system", "subtype" => "init", "session_id" => session_id})
+       when is_binary(session_id) and session_id != "" do
+    {:ok, {:session, session_id}}
+  end
+
   defp parse_decoded(%{"type" => "assistant", "message" => %{"content" => blocks}})
        when is_list(blocks) do
     case Enum.find_value(blocks, &content_block_event/1) do

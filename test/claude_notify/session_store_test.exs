@@ -97,6 +97,41 @@ defmodule ClaudeNotify.SessionStoreTest do
     assert updated.tty_path == "/dev/ttys001"
   end
 
+  test "stores canonical project scope without overwriting it when later metadata omits it" do
+    scope = %ClaudeNotify.ProjectScope.Scope{
+      id: "project_123",
+      name: "canonical-project",
+      repo_root: "/tmp/project",
+      cwd: "/tmp/project/apps/web",
+      worktree_root: "/tmp/project",
+      git_common_dir: "/tmp/project/.git"
+    }
+
+    SessionStore.update_session_metadata("scoped", "/tmp/project/apps/web", %{
+      "project_scope" => scope,
+      "tty_path" => "/dev/ttys001"
+    })
+
+    SessionStore.update_session_metadata("scoped", "/tmp/project/apps/web", %{
+      "transcript_path" => "/tmp/transcript.jsonl"
+    })
+
+    assert SessionStore.get_session("scoped").project_scope == scope
+  end
+
+  test "stores the terminal engine and does not overwrite it when later metadata omits it" do
+    SessionStore.register_prompt("codex-sess", "hello", "/tmp/project", %{
+      "tty_path" => "/dev/ttys001",
+      "engine" => "codex"
+    })
+
+    SessionStore.update_session_metadata("codex-sess", "/tmp/project", %{
+      "transcript_path" => "/tmp/rollout.jsonl"
+    })
+
+    assert SessionStore.get_session("codex-sess").engine == "codex"
+  end
+
   test "set_prompt_message_id and get it back from session" do
     SessionStore.register_prompt("sess-1", "hello", "/tmp/project")
     SessionStore.set_prompt_message_id("sess-1", 42)

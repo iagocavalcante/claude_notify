@@ -6,16 +6,16 @@ defmodule ClaudeNotify.MessageFormatter do
   Truncates messages over #{@notification_truncate_at} chars; use
   `notification_question_full/2` for the un-truncated version.
   """
-  def notification_question(message, session_id) do
-    build_notification(truncate(message, @notification_truncate_at), session_id)
+  def notification_question(message, session_id, engine \\ "claude") do
+    build_notification(truncate(message, @notification_truncate_at), session_id, engine)
   end
 
   @doc """
   Like `notification_question/2` but does not truncate the body — used by
   the See more expansion path.
   """
-  def notification_question_full(message, session_id) do
-    build_notification(message || "", session_id)
+  def notification_question_full(message, session_id, engine \\ "claude") do
+    build_notification(message || "", session_id, engine)
   end
 
   @doc """
@@ -26,11 +26,11 @@ defmodule ClaudeNotify.MessageFormatter do
 
   def notification_truncated?(_), do: false
 
-  defp build_notification(body, session_id) do
+  defp build_notification(body, session_id, engine) do
     short_id = String.slice(session_id, 0, 8)
 
     [
-      "*Claude Code Question*",
+      "*#{agent_name(engine)} Question*",
       "",
       escape(body),
       "",
@@ -74,6 +74,12 @@ defmodule ClaudeNotify.MessageFormatter do
   def claude_response_html(text) do
     body = agent_markdown_html(text)
     "🤖 <b>Claude</b>\n#{body}"
+  end
+
+  @doc "Formats an interactive terminal agent response for Telegram HTML."
+  def agent_response_html(text, engine) do
+    body = agent_markdown_html(text)
+    "🤖 <b>#{html_escape(agent_name(engine))}</b>\n#{body}"
   end
 
   @doc """
@@ -142,9 +148,6 @@ defmodule ClaudeNotify.MessageFormatter do
     end
   end
 
-  defp project_name(dir) when is_binary(dir), do: Path.basename(dir)
-  defp project_name(_), do: "unknown"
-
   defp truncate(nil, _max), do: ""
   defp truncate(text, max) when byte_size(text) <= max, do: text
   defp truncate(text, max), do: String.slice(text, 0, max) <> "..."
@@ -168,9 +171,9 @@ defmodule ClaudeNotify.MessageFormatter do
   Format a compact "session started" message.
   """
   def session_started_compact(session) do
-    project = project_name(session.working_dir)
+    project = ClaudeNotify.ProjectScope.display_name(session)
     dir = escape_code(session.working_dir)
-    "🟢 #{escape(project)} · started\nDirectory: `#{dir}`"
+    "🟢 #{escape(project)} · #{escape(agent_name(session[:engine]))} started\nDirectory: `#{dir}`"
   end
 
   @doc """
@@ -179,7 +182,7 @@ defmodule ClaudeNotify.MessageFormatter do
   session has closed.
   """
   def session_stopped_compact(session) do
-    project = project_name(session.working_dir)
+    project = ClaudeNotify.ProjectScope.display_name(session)
 
     duration =
       if session[:started_at] && session[:stopped_at] do
@@ -191,7 +194,7 @@ defmodule ClaudeNotify.MessageFormatter do
     reason = session[:stop_reason] || "unknown"
     count = session[:prompt_count] || 0
 
-    "⚪ #{escape(project)} · idle\nSession time: #{escape(duration)} · #{count} prompts · last turn: #{escape(reason)}"
+    "⚪ #{escape(project)} · #{escape(agent_name(session[:engine]))} idle\nSession time: #{escape(duration)} · #{count} prompts · last turn: #{escape(reason)}"
   end
 
   @doc """
@@ -669,6 +672,9 @@ defmodule ClaudeNotify.MessageFormatter do
   defp engine_name("claude"), do: "Claude"
   defp engine_name("codex"), do: "Codex"
   defp engine_name(other), do: to_string(other)
+
+  defp agent_name("codex"), do: "Codex"
+  defp agent_name(_), do: "Claude Code"
 
   # Inside MarkdownV2 pre blocks (```), only backtick and backslash need escaping
   defp escape_pre(text) when is_binary(text) do

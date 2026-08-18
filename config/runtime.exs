@@ -47,6 +47,26 @@ if config_env() != :test do
     webhook_secret: Dotenvy.env!("CLAUDE_NOTIFY_WEBHOOK_SECRET", :string),
     workspace_roots: workspace_roots,
     claude_chrome_enabled: parse_bool.(System.get_env("CLAUDE_NOTIFY_CLAUDE_CHROME"), false),
+    memory_capture_enabled: parse_bool.(System.get_env("CLAUDE_NOTIFY_MEMORY_CAPTURE"), true),
+    memory_store_path:
+      System.get_env(
+        "CLAUDE_NOTIFY_MEMORY_STORE_PATH",
+        Path.join([System.user_home!(), ".claude_notify", "memory_store.dat"])
+      )
+      |> Path.expand(),
+    memory: %{
+      max_observations_per_session:
+        parse_int.(System.get_env("CLAUDE_NOTIFY_MEMORY_MAX_PER_SESSION"), 500),
+      max_observations_per_project:
+        parse_int.(System.get_env("CLAUDE_NOTIFY_MEMORY_MAX_PER_PROJECT"), 5_000),
+      max_ingest_keys: parse_int.(System.get_env("CLAUDE_NOTIFY_MEMORY_MAX_INGEST_KEYS"), 50_000),
+      max_title_bytes: parse_int.(System.get_env("CLAUDE_NOTIFY_MEMORY_MAX_TITLE_BYTES"), 160),
+      max_body_bytes: parse_int.(System.get_env("CLAUDE_NOTIFY_MEMORY_MAX_BODY_BYTES"), 2_000),
+      max_metadata_entries:
+        parse_int.(System.get_env("CLAUDE_NOTIFY_MEMORY_MAX_METADATA_ENTRIES"), 20),
+      max_collection_entries:
+        parse_int.(System.get_env("CLAUDE_NOTIFY_MEMORY_MAX_FILE_PATHS"), 50)
+    },
     preview: %{
       default_provider: System.get_env("CLAUDE_NOTIFY_PREVIEW_PROVIDER", "auto"),
       ttl_seconds:

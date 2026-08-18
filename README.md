@@ -1,11 +1,11 @@
 # Claude Notify
 
-Elixir app that sends interactive Telegram notifications for Claude Code sessions. Monitor what Claude Code is doing, respond to permission prompts, and send prompts — all from Telegram.
+Elixir app that sends interactive Telegram notifications for Claude Code and Codex terminal sessions. Monitor what either agent is doing, respond to permission prompts, and send prompts — all from Telegram.
 
 ## Features
 
 - **Quiet mode** — ~7 messages per session instead of 50+; no per-tool spam
-- **Edit-in-place activity** — a single message is updated silently showing what Claude is currently doing (tool name, file paths)
+- **Edit-in-place activity** — a single message is updated silently showing what the agent is currently doing (tool name, file paths)
 - **Consolidated diffs** — `git diff` shown inline before permission prompts and at session end so you see exactly what changed
 - **Reply-to-session** — reply to any message to send text to that session's terminal (no need to `/select` first)
 - **Compact session lifecycle** — minimal start/end messages with project name and session ID
@@ -17,8 +17,8 @@ Elixir app that sends interactive Telegram notifications for Claude Code session
 - **Watch mode** — opt in to a live, throttled transcript of a running job; off by default to keep the dispatcher quiet
 - **Message-first tasks** — `/new`, tap a repository, then send ordinary messages instead of memorizing `/run` syntax
 - **Automatic project discovery** — Git repositories under your configured workspace roots appear in Telegram automatically
-- **Unified dashboard** — one live view for Claude Code terminal sessions and queued/running Claude Code or Codex jobs
-- **Idle session continuity** — completed Claude Code turns stay listed as idle, selectable sessions instead of disappearing
+- **Unified dashboard** — one live view for Claude Code and Codex terminal sessions plus queued/running jobs
+- **Idle session continuity** — completed Claude Code and Codex turns stay listed as idle, selectable sessions instead of disappearing
 - **Accurate session lifecycle** — `SessionStart` lists new/resumed terminals immediately, `Stop` marks a turn idle, `SessionEnd` removes a closed terminal, and known sessions survive bot restarts
 - **Sleep-safe development** — macOS idle sleep is prevented automatically while terminal sessions or dispatcher jobs are working, then released when all work becomes idle
 - **Provider-agnostic web previews** — launch a job's web app through Cloudflare Access (email OTP) or Tailscale Serve (tailnet identity), then tear it down automatically
@@ -28,7 +28,7 @@ Elixir app that sends interactive Telegram notifications for Claude Code session
 ## How It Works
 
 ```
-Claude Code (Terminal.app)
+Claude Code or Codex (Terminal.app)
     | hooks (signed curl POST + timestamp + HMAC)
     v
 Elixir App (port 4040)
@@ -81,7 +81,8 @@ The setup script will:
 - Prompt for your Telegram bot token and chat ID (saved to `.env`)
 - Generate or prompt for a webhook signing secret (`CLAUDE_NOTIFY_WEBHOOK_SECRET`)
 - Install Elixir dependencies
-- Register all Claude Code hooks in `~/.claude/settings.json`
+- Register Claude Code hooks in `~/.claude/settings.json`
+- Register Codex hooks in `~/.codex/hooks.json`
 - Install a macOS LaunchAgent (auto-starts on login, auto-restarts on crash)
 - Start the service and verify it's healthy
 
@@ -96,7 +97,7 @@ Without this, responding to prompts from Telegram won't work.
 
 ### 4. Load hook signing env in your shell
 
-Hook scripts sign events with `CLAUDE_NOTIFY_WEBHOOK_SECRET`. Before starting Claude Code in a shell session, load your `.env`:
+Hook scripts sign events with `CLAUDE_NOTIFY_WEBHOOK_SECRET`. Before starting Claude Code or Codex in a shell session, load your `.env`:
 
 ```bash
 set -a
@@ -106,7 +107,7 @@ set +a
 
 ### That's it
 
-Open a Claude Code session in Terminal.app and you'll start getting Telegram notifications.
+For Codex, open `/hooks` once and trust the newly registered Claude Notify hooks. Then open a Claude Code or Codex session in Terminal.app and you'll start getting Telegram notifications.
 
 ## Managing the Service
 
@@ -190,6 +191,17 @@ CLAUDE_NOTIFY_KEEP_AWAKE=true
 # Add --chrome to Claude dispatcher/resume processes (requires a paired extension)
 CLAUDE_NOTIFY_CLAUDE_CHROME=true
 
+# Durable lifecycle observations (disable capture or tune bounded retention)
+CLAUDE_NOTIFY_MEMORY_CAPTURE=true
+# CLAUDE_NOTIFY_MEMORY_STORE_PATH="$HOME/.claude_notify/memory_store.dat"
+# CLAUDE_NOTIFY_MEMORY_MAX_PER_SESSION=500
+# CLAUDE_NOTIFY_MEMORY_MAX_PER_PROJECT=5000
+# CLAUDE_NOTIFY_MEMORY_MAX_INGEST_KEYS=50000
+# CLAUDE_NOTIFY_MEMORY_MAX_TITLE_BYTES=160
+# CLAUDE_NOTIFY_MEMORY_MAX_BODY_BYTES=2000
+# CLAUDE_NOTIFY_MEMORY_MAX_METADATA_ENTRIES=20
+# CLAUDE_NOTIFY_MEMORY_MAX_FILE_PATHS=50
+
 # Optional previews: auto selects the first available secure provider
 CLAUDE_NOTIFY_PREVIEW_PROVIDER=auto
 CLAUDE_NOTIFY_PREVIEW_TTL_SECONDS=7200
@@ -212,6 +224,30 @@ TAILSCALE_PREVIEW_MODE=serve
 ```
 
 Dispatcher settings (job commands, watch mode) are `config.exs`/`runtime.exs` keys, not `.env` variables — see [Job dispatcher](#job-dispatcher) for the full list with defaults.
+
+### Lifecycle observation capture
+
+Terminal hooks and dispatcher jobs write a small, versioned observation stream to
+`~/.claude_notify/memory_store.dat`. Observations share the canonical project ID
+across repository roots, nested directories, and Git worktrees. The stream keeps
+prompts, assistant text, lifecycle outcomes, canonical tool families, and safe
+project-relative file paths. It intentionally never keeps shell arguments, tool
+output, diffs, environment maps, or paths outside the project boundary.
+
+Writes are atomic and mode `0600`, webhook/engine replays are idempotent, and
+retention is bounded independently per session and project. Ingest keys outlive
+evicted observation bodies so an older replay cannot immediately reinsert data.
+An unknown or corrupt on-disk schema fails closed until the store is explicitly
+cleared. File content capture remains disabled by default; project-local content
+exclusions are deliberately staged until any later issue proposes enabling it.
+This is the raw capture foundation; project memory pages and retrieval are
+layered on top separately.
+
+Default field limits are 160 bytes for titles, 2,000 bytes for bodies, 20
+metadata fields, and 50 file paths/list items. Project and session labels are
+capped at 200 bytes; source event IDs at 240; metadata keys at 80; scalar values
+at 1,000; and list values at 500 bytes each. The environment variables above
+configure the continuity-facing title/body, metadata, and file-count bounds.
 
 When `CLAUDE_NOTIFY_CLAUDE_CHROME=true`, every Claude dispatcher and resumed job starts with `--chrome`, including jobs inside isolated worktrees. Bot commands such as `/jobs` remain owned by Telegram; any other slash command, such as a project `/post-shorts` skill or Claude's `/chrome`, is sent verbatim to the selected session/project.
 
@@ -390,6 +426,14 @@ Replace `/path/to/claude_notify` with the actual absolute path to the project.
 chmod +x hooks/*.sh
 ```
 
+### Codex hooks
+
+Codex uses the same lifecycle scripts through `~/.codex/hooks.json`. The setup script merges these entries automatically: `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `PostToolUse`, `Stop`, and `SessionEnd`. Each command is prefixed with `CLAUDE_NOTIFY_ENGINE=codex` so Telegram and the dashboard label the terminal correctly.
+
+After adding or changing Codex hooks, run Codex interactively and open `/hooks` to review and trust them. Codex skips untrusted command hooks.
+
+Codex lifecycle hooks are enabled by default. If your config explicitly sets `[features].hooks = false`, remove that override or set it to `true`.
+
 </details>
 
 ## Job dispatcher
@@ -565,7 +609,7 @@ This covers the hook → Telegram → terminal-injection pipeline. For the job d
 | `TelegramPoller` | GenServer polling `getUpdates`, validating `chat_id`, and handling buttons/text commands |
 | `TerminalInjector` | AppleScript injection into Terminal.app by TTY path (clipboard paste for text input) |
 | `MessageFormatter` | MarkdownV2 formatted messages with emoji tool icons |
-| `TranscriptReader` | Reads Claude Code JSONL transcripts for last assistant response |
+| `TranscriptReader` | Reads Claude Code JSONL transcripts for last assistant response; Codex supplies its response in the Stop event |
 | `PathSafety` | Sanitizes externally provided paths (e.g., transcript paths) |
 
 ## Hooks
@@ -574,10 +618,10 @@ This covers the hook → Telegram → terminal-injection pipeline. For the job d
 |------|-------|---------------|
 | `claude-notify-prompt.sh` | `UserPromptSubmit` | Session ID, prompt text, working dir, TTY path |
 | `claude-notify-stop.sh` | `Stop` | Session ID, stop reason, working dir |
-| `claude-notify-notify.sh` | `Notification` | Session ID, notification message, TTY path |
+| `claude-notify-notify.sh` | Claude `Notification` / Codex `PermissionRequest` | Session ID, permission message, TTY path |
 | `claude-notify-tool.sh` | `PostToolUse` | Session ID, tool name, input, output |
 
-All hooks send signed requests with:
+The same scripts support both agents and tag every event as `claude` or `codex`. All hooks send signed requests with:
 
 - `X-Claude-Notify-Timestamp`
 - `X-Claude-Notify-Signature: sha256=<hmac>`

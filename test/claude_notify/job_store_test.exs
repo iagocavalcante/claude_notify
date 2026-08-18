@@ -26,11 +26,12 @@ defmodule ClaudeNotify.JobStoreTest do
   end
 
   test "create/2 creates a queued job with the given fields", %{store: store} do
-    {:ok, job} = JobStore.create(store, attrs())
+    {:ok, job} = JobStore.create(store, attrs(%{project_id: "project_123"}))
 
     assert job.status == :queued
     assert job.engine == "claude"
     assert job.project == "trainer-gym-ai"
+    assert job.project_id == "project_123"
     assert job.prompt == "do the thing"
     assert job.worktree_path == "/tmp/wt-1"
     assert job.branch == "feat/1"

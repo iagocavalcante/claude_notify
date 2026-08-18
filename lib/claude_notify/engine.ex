@@ -8,8 +8,7 @@ defmodule ClaudeNotify.Engine do
   line, e.g. Claude Code's `--output-format stream-json` - into the internal
   event shape `JobRunner` consumes: `:tool_use`, `:text`, `:result`,
   `:session`, or `:ignore` for engine-internal lines that carry no
-  job-relevant information (system/init chatter, rate-limit telemetry, hook
-  echoes, ...).
+  job-relevant information (rate-limit telemetry, hook echoes, ...).
 
   `parse_event/1` must never raise - malformed or unrecognized lines should
   come back as `{:error, reason}` so `JobRunner` can log and skip them
@@ -58,11 +57,9 @@ defmodule ClaudeNotify.Engine do
   `{:session, session_id}` and a `{:result, %{session_id: session_id}}` with
   a non-nil `session_id` are both legal ways to report the engine's
   session/thread id - `JobRunner` stores it from either. Use `:session` when
-  an engine reports its id separately from, and before, the outcome of the
-  run (e.g. Codex's `thread.started`, which precedes any `turn.completed`/
-  `turn.failed`); use the `:result` event's `session_id` field when an
-  engine's outcome event already carries the id itself (e.g. Claude Code's
-  `result` event, which needs no separate `:session` event).
+  an engine reports its id before the outcome (e.g. Claude's `system/init`
+  and Codex's `thread.started`); retain it on `:result` as well when the
+  engine repeats the identity there.
   """
   @callback parse_event(line :: String.t()) :: {:ok, event()} | :ignore | {:error, term()}
 end

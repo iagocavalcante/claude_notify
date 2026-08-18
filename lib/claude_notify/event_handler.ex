@@ -7,16 +7,24 @@ defmodule ClaudeNotify.EventHandler do
     Telegram,
     ActivityTracker,
     TaskTracker,
-    Dashboard
+    Dashboard,
+    ProjectScope,
+    MemoryCapture
   }
 
   def handle_event(%{"event" => "session_start"} = params) do
     session_id = params["session_id"]
     working_dir = params["working_dir"] || "unknown"
-    opts = params |> Map.take(["tty_path", "term_session_id"]) |> sanitize_opts()
+
+    opts =
+      params
+      |> Map.take(["tty_path", "term_session_id", "engine"])
+      |> attach_project_scope(session_id, working_dir)
+      |> sanitize_opts()
 
     update_session_tty(session_id, working_dir, opts)
     SessionStore.update_status(session_id, :idle, %{session_source: params["source"]})
+    MemoryCapture.terminal(params, SessionStore.get_session(session_id))
     Dashboard.refresh()
     :ok
   end
@@ -26,8 +34,14 @@ defmodule ClaudeNotify.EventHandler do
     prompt = params["prompt"] || ""
     working_dir = params["working_dir"] || "unknown"
 
-    opts = params |> Map.take(["tty_path", "term_session_id"]) |> sanitize_opts()
+    opts =
+      params
+      |> Map.take(["tty_path", "term_session_id", "engine"])
+      |> attach_project_scope(session_id, working_dir)
+      |> sanitize_opts()
+
     {action, session} = SessionStore.register_prompt(session_id, prompt, working_dir, opts)
+    MemoryCapture.terminal(params, session)
 
     case action do
       :new_session ->
@@ -52,7 +66,10 @@ defmodule ClaudeNotify.EventHandler do
     transcript_path = params["transcript_path"]
 
     opts =
-      params |> Map.take(["tty_path", "term_session_id", "transcript_path"]) |> sanitize_opts()
+      params
+      |> Map.take(["tty_path", "term_session_id", "transcript_path", "engine"])
+      |> attach_project_scope(session_id, working_dir)
+      |> sanitize_opts()
 
     # A Stop hook can be the first event observed after this service restarts.
     # Seed/update the terminal metadata so the now-idle session remains listed.
@@ -67,8 +84,16 @@ defmodule ClaudeNotify.EventHandler do
     # Resolve transcript path: from params or from session store
     resolved_transcript = resolve_transcript_path(transcript_path, session_id)
 
-    # Send Claude's response before marking the turn idle.
-    send_claude_response(resolved_transcript, session_id)
+    assistant_response =
+      resolve_assistant_response(params["assistant_response"], resolved_transcript)
+
+    params
+    |> Map.put("assistant_response", assistant_response || "")
+    |> MemoryCapture.terminal(SessionStore.get_session(session_id))
+
+    # Codex includes the final response directly in Stop. Claude falls back to
+    # its transcript, preserving compatibility with older hook payloads.
+    send_agent_response(assistant_response, nil, session_id)
 
     {_action, session} = SessionStore.register_stop(session_id, stop_reason)
     maybe_send_diff(git_diff, session_id)
@@ -80,6 +105,7 @@ defmodule ClaudeNotify.EventHandler do
 
   def handle_event(%{"event" => "session_end"} = params) do
     session_id = params["session_id"]
+    MemoryCapture.terminal(params, SessionStore.get_session(session_id))
     SessionStore.remove_session(session_id)
     ActivityTracker.end_session(session_id)
     TaskTracker.end_session(session_id)
@@ -94,10 +120,14 @@ defmodule ClaudeNotify.EventHandler do
     working_dir = params["working_dir"] || "unknown"
 
     opts =
-      params |> Map.take(["tty_path", "term_session_id"]) |> sanitize_opts()
+      params
+      |> Map.take(["tty_path", "term_session_id", "engine"])
+      |> attach_project_scope(session_id, working_dir)
+      |> sanitize_opts()
 
     update_session_tty(session_id, working_dir, opts)
     SessionStore.update_status(session_id, :active, %{last_tool: tool_name})
+    MemoryCapture.terminal(params, SessionStore.get_session(session_id))
 
     # React 🔥 on prompt message to show Claude is working
     maybe_react_tool(session_id)
@@ -106,7 +136,7 @@ defmodule ClaudeNotify.EventHandler do
     maybe_send_structural_card(tool_name, tool_input, session_id)
 
     detail = extract_tool_detail(tool_name, tool_input)
-    project = project_name(working_dir)
+    project = session_id |> SessionStore.get_session() |> ProjectScope.display_name()
 
     ActivityTracker.track_tool(session_id, %{
       project: project,
@@ -122,16 +152,21 @@ defmodule ClaudeNotify.EventHandler do
     git_diff = params["git_diff"]
 
     opts =
-      params |> Map.take(["tty_path", "term_session_id"]) |> sanitize_opts()
+      params
+      |> Map.take(["tty_path", "term_session_id", "engine"])
+      |> attach_project_scope(session_id, working_dir)
+      |> sanitize_opts()
 
     update_session_tty(session_id, working_dir, opts)
+    MemoryCapture.terminal(params, SessionStore.get_session(session_id))
 
     ActivityTracker.pause_session(session_id)
     SessionStore.update_status(session_id, :waiting_input)
 
     maybe_send_diff(git_diff, session_id)
 
-    text = MessageFormatter.notification_question(message, session_id)
+    engine = session_engine(session_id)
+    text = MessageFormatter.notification_question(message, session_id, engine)
     truncated? = MessageFormatter.notification_truncated?(message)
 
     # Detect numbered options (multi-choice) vs simple yes/no
@@ -151,7 +186,9 @@ defmodule ClaudeNotify.EventHandler do
 
     notify_with_buttons_and_register(text, buttons, session_id,
       full_text:
-        if(truncated?, do: MessageFormatter.notification_question_full(message, session_id))
+        if(truncated?,
+          do: MessageFormatter.notification_question_full(message, session_id, engine)
+        )
     )
 
     Dashboard.refresh()
@@ -251,8 +288,18 @@ defmodule ClaudeNotify.EventHandler do
     end
   end
 
-  defp project_name(dir) when is_binary(dir), do: Path.basename(dir)
-  defp project_name(_), do: "unknown"
+  defp attach_project_scope(opts, session_id, working_dir) do
+    case SessionStore.get_session(session_id) do
+      %{working_dir: ^working_dir, project_scope: scope} when not is_nil(scope) ->
+        Map.put(opts, "project_scope", scope)
+
+      _session ->
+        case ProjectScope.resolve(working_dir) do
+          {:ok, scope} -> Map.put(opts, "project_scope", scope)
+          {:error, _reason} -> opts
+        end
+    end
+  end
 
   defp send_prompt_echo(session_id, prompt) when is_binary(prompt) and prompt != "" do
     message = MessageFormatter.prompt_echo(prompt)
@@ -303,16 +350,45 @@ defmodule ClaudeNotify.EventHandler do
     end
   end
 
-  defp send_claude_response(nil, _session_id), do: :ok
+  defp send_agent_response(text, _transcript_path, session_id)
+       when is_binary(text) and text != "" do
+    notify_agent_response(text, session_id)
+  end
 
-  defp send_claude_response(transcript_path, session_id) do
+  defp send_agent_response(_text, nil, _session_id), do: :ok
+
+  defp send_agent_response(_text, transcript_path, session_id) do
     case ClaudeNotify.TranscriptReader.last_assistant_message(transcript_path) do
       {:ok, text} ->
-        message = MessageFormatter.claude_response_html(text)
-        notify_html_and_register(message, session_id)
+        notify_agent_response(text, session_id)
 
       :error ->
         :ok
+    end
+  end
+
+  defp resolve_assistant_response(text, _transcript_path)
+       when is_binary(text) and text != "",
+       do: text
+
+  defp resolve_assistant_response(_text, nil), do: nil
+
+  defp resolve_assistant_response(_text, transcript_path) do
+    case ClaudeNotify.TranscriptReader.last_assistant_message(transcript_path) do
+      {:ok, text} -> text
+      :error -> nil
+    end
+  end
+
+  defp notify_agent_response(text, session_id) do
+    message = MessageFormatter.agent_response_html(text, session_engine(session_id))
+    notify_html_and_register(message, session_id)
+  end
+
+  defp session_engine(session_id) do
+    case SessionStore.get_session(session_id) do
+      %{engine: engine} when engine in ["claude", "codex"] -> engine
+      _ -> "claude"
     end
   end
 

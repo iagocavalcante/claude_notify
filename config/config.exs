@@ -4,6 +4,16 @@ config :claude_notify,
   port: 4040,
   telegram_base_url: "https://api.telegram.org",
   max_event_concurrency: 8,
+  memory_capture_enabled: true,
+  memory: %{
+    max_observations_per_session: 500,
+    max_observations_per_project: 5_000,
+    max_ingest_keys: 50_000,
+    max_title_bytes: 160,
+    max_body_bytes: 2_000,
+    max_metadata_entries: 20,
+    max_collection_entries: 50
+  },
   claude_chrome_enabled: false,
   keep_awake_while_working: true,
   preview: %{

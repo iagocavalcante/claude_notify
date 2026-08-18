@@ -47,6 +47,7 @@ defmodule ClaudeNotify.ProjectRegistryTest do
 
       assert {:ok, ^repo} = ProjectRegistry.lookup(registry, "w")
       assert {:ok, ^repo} = ProjectRegistry.lookup(registry, "widget")
+      assert {:ok, %{name: "widgets", path: ^repo}} = ProjectRegistry.resolve(registry, "w")
     end
 
     test "a project with no aliases is still looked up by name", %{tmp: tmp} do

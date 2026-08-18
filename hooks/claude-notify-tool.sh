@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Claude Code PostToolUse hook - sends tool use events to claude_notify
+# Claude Code / Codex PostToolUse hook - sends tool use events to claude_notify
 
 source "$(dirname "$0")/claude-notify-common.sh"
 
@@ -13,7 +13,7 @@ TTY_PATH="$(resolve_terminal_tty)"
 # Extract tool_name, tool_input, and tool_response from stdin JSON
 # Pass shell vars as argv to avoid injection
 PAYLOAD=$(echo "$INPUT" | python3 -c '
-import json, sys
+import json, sys, time, uuid
 d = json.load(sys.stdin)
 
 # tool_input is an object - serialize it
@@ -28,6 +28,9 @@ else:
 
 out = {
     "event": "tool_use",
+    "event_id": d.get("event_id") or d.get("hook_event_id") or d.get("tool_use_id") or str(uuid.uuid4()),
+    "observed_at": int(time.time() * 1000),
+    "engine": sys.argv[5],
     "session_id": d.get("session_id", sys.argv[1]),
     "term_session_id": sys.argv[2],
     "tty_path": sys.argv[3],
@@ -38,7 +41,7 @@ out = {
     "transcript_path": d.get("transcript_path", "")
 }
 print(json.dumps(out))
-' "$SESSION_ID" "$TERM_SID" "$TTY_PATH" "$PWD" 2>/dev/null)
+' "$SESSION_ID" "$TERM_SID" "$TTY_PATH" "$PWD" "${CLAUDE_NOTIFY_ENGINE:-claude}" 2>/dev/null)
 
 post_event_payload "$PAYLOAD"
 

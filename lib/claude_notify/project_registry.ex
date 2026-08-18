@@ -95,10 +95,27 @@ defmodule ClaudeNotify.ProjectRegistry do
   @spec lookup(t(), String.t()) ::
           {:ok, String.t()} | {:error, {:unknown_project, String.t(), [String.t()]}}
   def lookup(%__MODULE__{} = registry, name) when is_binary(name) do
+    case resolve(registry, name) do
+      {:ok, %{path: path}} -> {:ok, path}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Resolves a canonical project name or alias to both its canonical name and
+  validated repository path.
+
+  Callers that persist project identity should use this instead of retaining
+  the user-supplied alias.
+  """
+  @spec resolve(t(), String.t()) ::
+          {:ok, %{name: String.t(), path: String.t()}}
+          | {:error, {:unknown_project, String.t(), [String.t()]}}
+  def resolve(%__MODULE__{} = registry, name) when is_binary(name) do
     canonical = Map.get(registry.aliases, name, name)
 
     case Map.fetch(registry.projects, canonical) do
-      {:ok, path} -> {:ok, path}
+      {:ok, path} -> {:ok, %{name: canonical, path: path}}
       :error -> {:error, {:unknown_project, name, known_projects(registry)}}
     end
   end

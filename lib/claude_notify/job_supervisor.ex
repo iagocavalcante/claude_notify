@@ -114,20 +114,14 @@ defmodule ClaudeNotify.JobSupervisor do
     Owns the concurrency-cap and FIFO queue decision for `JobSupervisor` -
     see the parent moduledoc for why this needs to be a process at all.
 
-    ## Where `ProjectRegistry` gets loaded
+    ## Project resolution
 
-    `ClaudeNotify.ProjectRegistry` holds no process state of its own (see its
-    moduledoc) - some caller has to decide when to call `load/1`. This
-    Dispatcher calls it once per `start_job/3` launch attempt, immediately
-    before resolving the job's project name to a repo path. Launch-time
-    loading was chosen over holding a long-lived registry snapshot because
-    it's the simplest option that satisfies this story, and it means a
-    project registered (or edited) between two job launches is picked up
-    without restarting anything. Callers can bypass this per call by passing
-    a pre-loaded registry via `opts[:project_registry]` (tests do this).
-
-    `JobRunner` never talks to `ProjectRegistry` itself - it only ever
-    receives an already-resolved `repo_path`.
+    The Dispatcher resolves every job through `ClaudeNotify.ProjectScope`
+    before constructing its runner. Production uses the supervised canonical
+    registry snapshot; a caller can pass `opts[:project_registry]` to resolve
+    through a fresh or test-specific registry. `JobRunner` receives both the
+    registered repository root and the resolved scope, and never derives
+    identity from a worktree basename.
 
     ## Status transitions
 
@@ -144,7 +138,7 @@ defmodule ClaudeNotify.JobSupervisor do
     use GenServer
     require Logger
 
-    alias ClaudeNotify.{JobStore, ProjectRegistry, JobRunner}
+    alias ClaudeNotify.{JobStore, JobRunner, ProjectScope}
 
     defstruct running: %{}, queue: :queue.new(), cap: 3, dynamic_supervisor: nil
 
@@ -244,22 +238,28 @@ defmodule ClaudeNotify.JobSupervisor do
     end
 
     defp resolve_and_start(job, opts, job_store, state) do
-      registry = Keyword.get_lazy(opts, :project_registry, fn -> ProjectRegistry.load() end)
+      scope_result =
+        case Keyword.fetch(opts, :project_registry) do
+          {:ok, registry} -> ProjectScope.for_project(registry, job.project)
+          :error -> ProjectScope.for_project(job.project)
+        end
 
       with {:ok, engine} <- resolve_engine(opts, job),
-           {:ok, repo_path} <- ProjectRegistry.lookup(registry, job.project),
-           child_spec = job_runner_child_spec(job, engine, repo_path, opts, job_store),
+           {:ok, scope} <- scope_result,
+           child_spec = job_runner_child_spec(job, engine, scope, opts, job_store),
            {:ok, pid} <- DynamicSupervisor.start_child(state.dynamic_supervisor, child_spec) do
         ref = Process.monitor(pid)
         {:ok, %{state | running: Map.put(state.running, ref, job.id)}}
       end
     end
 
-    defp job_runner_child_spec(job, engine, repo_path, opts, job_store) do
+    defp job_runner_child_spec(job, engine, scope, opts, job_store) do
       {JobRunner,
        job_id: job.id,
        engine: engine,
-       repo_path: repo_path,
+       engine_name: job.engine,
+       repo_path: scope.repo_root,
+       project_scope: scope,
        prompt: job.prompt,
        job_store: job_store,
        slug: Keyword.get(opts, :slug, "run"),

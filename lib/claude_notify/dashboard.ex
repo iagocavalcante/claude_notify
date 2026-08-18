@@ -13,7 +13,14 @@ defmodule ClaudeNotify.Dashboard do
 
   require Logger
 
-  alias ClaudeNotify.{Telegram, SessionStore, JobStore, MessageFormatter, PreviewManager}
+  alias ClaudeNotify.{
+    Telegram,
+    SessionStore,
+    JobStore,
+    MessageFormatter,
+    PreviewManager,
+    ProjectScope
+  }
 
   @min_edit_interval 5_000
   @status_icons %{
@@ -244,7 +251,7 @@ defmodule ClaudeNotify.Dashboard do
 
       session_buttons =
         Enum.map(sessions, fn {id, s} ->
-          project = Path.basename(s[:working_dir] || "unknown")
+          project = ProjectScope.display_name(s)
           short_id = String.slice(id, 0, 8)
           [%{text: "Open #{project} · #{short_id}", callback_data: "select:#{id}"}]
         end)
@@ -315,12 +322,13 @@ defmodule ClaudeNotify.Dashboard do
   defp render_session_lines(sessions, now) do
     sessions
     |> Enum.map(fn {id, session} ->
-      project = Path.basename(session[:working_dir] || "unknown")
+      project = ProjectScope.display_name(session)
       short_id = String.slice(id, 0, 8)
       status = session[:status] || :idle
       icon = Map.get(@status_icons, status, "⚪")
       duration = format_duration(max(now - (session[:started_at] || now), 0))
       prompts = session[:prompt_count] || 0
+      engine = engine_name(session[:engine] || "claude")
 
       details =
         "   Terminal #{short_id} · #{session_status_label(status)} · #{duration} · #{prompts} prompts"
@@ -332,7 +340,7 @@ defmodule ClaudeNotify.Dashboard do
         end
 
       [
-        "#{icon} *Claude Code* · `#{MessageFormatter.escape_code_public(project)}`",
+        "#{icon} *#{MessageFormatter.escape_full(engine)}* · `#{MessageFormatter.escape_code_public(project)}`",
         MessageFormatter.escape_full(details)
       ] ++ last_tool
     end)

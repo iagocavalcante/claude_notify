@@ -110,6 +110,8 @@ defmodule ClaudeNotify.SessionStore do
             last_activity: now,
             status: :active,
             last_tool: nil,
+            project_scope: opts["project_scope"],
+            engine: normalize_engine(opts["engine"]),
             tty_path: opts["tty_path"],
             term_session_id: opts["term_session_id"]
           }
@@ -151,6 +153,8 @@ defmodule ClaudeNotify.SessionStore do
             last_activity: now,
             status: :active,
             last_tool: nil,
+            project_scope: opts["project_scope"],
+            engine: normalize_engine(opts["engine"]),
             tty_path: opts["tty_path"],
             term_session_id: opts["term_session_id"]
           }
@@ -205,6 +209,8 @@ defmodule ClaudeNotify.SessionStore do
           first_prompt: nil,
           started_at: now,
           last_tool: nil,
+          project_scope: nil,
+          engine: "claude",
           tty_path: nil,
           term_session_id: nil
         }
@@ -364,7 +370,15 @@ defmodule ClaudeNotify.SessionStore do
     |> maybe_put(:tty_path, opts["tty_path"])
     |> maybe_put(:term_session_id, opts["term_session_id"])
     |> maybe_put(:transcript_path, opts["transcript_path"])
+    |> maybe_put(:project_scope, opts["project_scope"])
+    |> maybe_put_engine(opts["engine"])
   end
+
+  defp maybe_put_engine(session, nil), do: session
+  defp maybe_put_engine(session, engine), do: Map.put(session, :engine, normalize_engine(engine))
+
+  defp normalize_engine("codex"), do: "codex"
+  defp normalize_engine(_), do: "claude"
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, _key, "unknown"), do: map

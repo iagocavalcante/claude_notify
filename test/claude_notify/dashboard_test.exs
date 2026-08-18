@@ -25,6 +25,7 @@ defmodule ClaudeNotify.DashboardTest do
       {"idle-session-987654",
        %{
          working_dir: "/Users/me/Workspaces/backend",
+         engine: "codex",
          status: :idle,
          started_at: @now - 3_600,
          last_activity: @now - 30,

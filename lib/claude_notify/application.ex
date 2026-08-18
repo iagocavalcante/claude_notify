@@ -10,6 +10,8 @@ defmodule ClaudeNotify.Application do
 
     children =
       [
+        ClaudeNotify.ProjectScope,
+        ClaudeNotify.MemoryStore,
         ClaudeNotify.SessionStore,
         ClaudeNotify.ActivityTracker,
         ClaudeNotify.TaskTracker,

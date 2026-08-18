@@ -72,6 +72,7 @@ defmodule ClaudeNotify.TelegramPoller do
     JobTranscript,
     PreviewManager,
     ProjectRegistry,
+    ProjectScope,
     WorktreeManager
   }
 
@@ -536,6 +537,7 @@ defmodule ClaudeNotify.TelegramPoller do
       JobStore.create(job_store, %{
         engine: original_job.engine,
         project: original_job.project,
+        project_id: original_job.project_id,
         prompt: prompt
       })
 
@@ -560,7 +562,7 @@ defmodule ClaudeNotify.TelegramPoller do
 
   defp inject_reply_text(text, session) do
     tty_path = session[:tty_path]
-    project = Path.basename(session[:working_dir] || "unknown")
+    project = ProjectScope.display_name(session)
 
     case TerminalInjector.send_text(tty_path, text) do
       :ok ->
@@ -905,7 +907,7 @@ defmodule ClaudeNotify.TelegramPoller do
         state
 
       session ->
-        project = Path.basename(session[:working_dir] || "unknown")
+        project = ProjectScope.display_name(session)
         short_id = String.slice(session_id, 0, 8)
 
         text =
@@ -990,10 +992,11 @@ defmodule ClaudeNotify.TelegramPoller do
     else
       buttons =
         Enum.map(sessions, fn {id, session} ->
-          project = Path.basename(session[:working_dir] || "unknown")
+          project = ProjectScope.display_name(session)
+          engine = engine_display_name(session[:engine] || "claude")
           short_id = String.slice(id, 0, 8)
           status = session_status_display(session[:status])
-          label = "#{project} · #{status} (#{short_id})"
+          label = "#{engine} · #{project} · #{status} (#{short_id})"
           [label, "select:#{id}"]
         end)
 
@@ -1097,16 +1100,21 @@ defmodule ClaudeNotify.TelegramPoller do
   defp launch_job(engine, project, prompt, state) do
     registry = registry(state)
 
-    case ProjectRegistry.lookup(registry, project) do
+    case ProjectScope.for_project(registry, project) do
       {:error, {:unknown_project, _name, known}} ->
         send_unknown_project(state, known)
         state
 
-      {:ok, _repo_path} ->
+      {:ok, scope} ->
         job_store = state.job_store
 
         {:ok, job} =
-          JobStore.create(job_store, %{engine: engine, project: project, prompt: prompt})
+          JobStore.create(job_store, %{
+            engine: engine,
+            project: scope.name,
+            project_id: scope.id,
+            prompt: prompt
+          })
 
         send_and_track_activity_message(
           state,
@@ -2241,7 +2249,7 @@ defmodule ClaudeNotify.TelegramPoller do
           MessageFormatter.escape_full("Terminal session: none")
 
         session ->
-          project = Path.basename(session[:working_dir] || "unknown")
+          project = ProjectScope.display_name(session)
           short = String.slice(selected, 0, 8)
 
           "Terminal session: `#{MessageFormatter.escape_code_public(project)}` \\(`#{MessageFormatter.escape_code_public(short)}`\\)"

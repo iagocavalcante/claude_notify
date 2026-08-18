@@ -4,9 +4,10 @@ defmodule ClaudeNotify.RouterTest do
   import Plug.Test
   import Plug.Conn
 
-  alias ClaudeNotify.{Router, SessionStore, ReplayCache}
+  alias ClaudeNotify.{MemoryStore, ReplayCache, Router, SessionStore}
 
   setup do
+    wait_for_event_tasks()
     SessionStore.clear()
     ReplayCache.clear()
     :ok
@@ -116,6 +117,52 @@ defmodule ClaudeNotify.RouterTest do
     assert second_conn.status == 403
   end
 
+  test "durable capture stays behind the bounded queue and preserves overload responses" do
+    :sys.suspend(MemoryStore)
+
+    on_exit(fn ->
+      try do
+        :sys.resume(MemoryStore)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+
+    max_children = Application.fetch_env!(:claude_notify, :max_event_concurrency)
+
+    statuses =
+      for index <- 1..max_children do
+        %{
+          "event" => "prompt",
+          "event_id" => "saturation-#{index}",
+          "session_id" => "saturation-#{index}",
+          "prompt" => "hold #{index}",
+          "working_dir" => File.cwd!()
+        }
+        |> signed_events_conn()
+        |> Router.call(Router.init([]))
+        |> Map.fetch!(:status)
+      end
+
+    assert Enum.all?(statuses, &(&1 == 202))
+
+    overloaded =
+      signed_events_conn(%{
+        "event" => "prompt",
+        "event_id" => "saturation-overflow",
+        "session_id" => "saturation-overflow",
+        "prompt" => "overflow",
+        "working_dir" => File.cwd!()
+      })
+      |> Router.call(Router.init([]))
+
+    assert overloaded.status == 503
+    assert Jason.decode!(overloaded.resp_body)["error"] == "event queue overloaded"
+
+    :sys.resume(MemoryStore)
+    wait_for_event_tasks()
+  end
+
   test "GET /nonexistent returns 404" do
     conn =
       conn(:get, "/nonexistent")
@@ -148,5 +195,18 @@ defmodule ClaudeNotify.RouterTest do
 
     :crypto.mac(:hmac, :sha256, secret, "#{timestamp}.#{body}")
     |> Base.encode16(case: :lower)
+  end
+
+  defp wait_for_event_tasks(attempts \\ 300)
+
+  defp wait_for_event_tasks(0), do: flunk("event tasks did not drain")
+
+  defp wait_for_event_tasks(attempts) do
+    if Task.Supervisor.children(ClaudeNotify.EventTaskSupervisor) == [] do
+      :ok
+    else
+      Process.sleep(10)
+      wait_for_event_tasks(attempts - 1)
+    end
   end
 end

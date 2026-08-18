@@ -1,10 +1,11 @@
 defmodule ClaudeNotify.EventHandlerTest do
   use ExUnit.Case, async: false
 
-  alias ClaudeNotify.{EventHandler, SessionStore}
+  alias ClaudeNotify.{EventHandler, MemoryStore, ProjectRegistry, ProjectScope, SessionStore}
 
   setup do
     SessionStore.clear()
+    MemoryStore.clear()
     :ok
   end
 
@@ -23,6 +24,94 @@ defmodule ClaudeNotify.EventHandlerTest do
     assert session.prompt_count == 0
     assert session.working_dir == "/tmp/project"
     assert session.tty_path == "/dev/ttys009"
+  end
+
+  test "session_start stores the canonical project scope for a nested cwd" do
+    tmp = Path.join(System.tmp_dir!(), "event_scope_#{System.unique_integer([:positive])}")
+    repo = Path.join(tmp, "canonical-project")
+    nested = Path.join([repo, "apps", "web"])
+    File.mkdir_p!(nested)
+    {_, 0} = System.cmd("git", ["init", "--quiet", repo])
+
+    registry =
+      ProjectRegistry.load(
+        projects: [%{name: "stable-name", path: repo}],
+        workspace_roots: [],
+        config_path: Path.join(tmp, "missing.json")
+      )
+
+    previous_registry = ProjectScope.registry()
+    :ok = ProjectScope.reload(registry)
+
+    on_exit(fn ->
+      ProjectScope.reload(previous_registry)
+      File.rm_rf!(tmp)
+    end)
+
+    assert :ok =
+             EventHandler.handle_event(%{
+               "event" => "session_start",
+               "engine" => "claude",
+               "session_id" => "scoped-terminal",
+               "working_dir" => nested,
+               "source" => "startup",
+               "tty_path" => "/dev/ttys012"
+             })
+
+    session = SessionStore.get_session("scoped-terminal")
+    assert session.project_scope.name == "stable-name"
+    assert session.project_scope.repo_root != session.project_scope.cwd
+    assert String.starts_with?(session.project_scope.id, "project_")
+
+    assert [observation] = MemoryStore.list(project_id: session.project_scope.id)
+    assert observation.kind == :session_start
+    assert observation.session_id == "scoped-terminal"
+  end
+
+  test "Codex lifecycle events register an interactive Codex terminal" do
+    assert :ok =
+             EventHandler.handle_event(%{
+               "event" => "session_start",
+               "engine" => "codex",
+               "session_id" => "codex-sess",
+               "working_dir" => "/tmp/project",
+               "source" => "startup",
+               "tty_path" => "/dev/ttys010"
+             })
+
+    EventHandler.handle_event(%{
+      "event" => "prompt",
+      "engine" => "codex",
+      "session_id" => "codex-sess",
+      "prompt" => "fix the tests",
+      "working_dir" => "/tmp/project",
+      "tty_path" => "/dev/ttys010"
+    })
+
+    session = SessionStore.get_session("codex-sess")
+    assert session.engine == "codex"
+    assert session.status == :active
+    assert session.prompt_count == 1
+    assert session.tty_path == "/dev/ttys010"
+  end
+
+  test "Codex Stop uses the assistant response included by the hook" do
+    SessionStore.register_prompt("codex-stop", "hello", "/tmp/project", %{
+      "engine" => "codex",
+      "tty_path" => "/dev/ttys011"
+    })
+
+    EventHandler.handle_event(%{
+      "event" => "stop",
+      "engine" => "codex",
+      "session_id" => "codex-stop",
+      "working_dir" => "/tmp/project",
+      "tty_path" => "/dev/ttys011",
+      "assistant_response" => "Done from Codex"
+    })
+
+    assert SessionStore.get_session("codex-stop").status == :idle
+    assert SessionStore.get_session("codex-stop").engine == "codex"
   end
 
   test "handle_event with prompt event registers session" do

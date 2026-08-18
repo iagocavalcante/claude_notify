@@ -6,6 +6,7 @@ PLIST_NAME="com.claude-notify.plist"
 PLIST_PATH="$HOME/Library/LaunchAgents/$PLIST_NAME"
 LOG_DIR="$HOME/Library/Logs"
 SETTINGS_FILE="$HOME/.claude/settings.json"
+CODEX_HOOKS_FILE="$HOME/.codex/hooks.json"
 
 echo "=== Claude Notify Setup ==="
 echo ""
@@ -172,7 +173,64 @@ else
   echo "See README for manual setup."
 fi
 
-# --- 6. Create run.sh ---
+# --- 6. Register Codex hooks ---
+echo ""
+echo "Configuring Codex hooks..."
+
+mkdir -p "$HOME/.codex"
+
+CODEX_HOOKS_JSON=$(python3 -c "
+import json, os
+
+hooks_file = '$CODEX_HOOKS_FILE'
+project_dir = '$PROJECT_DIR'
+
+if os.path.exists(hooks_file):
+    with open(hooks_file) as f:
+        config = json.load(f)
+else:
+    config = {'description': 'Claude Notify terminal session hooks.'}
+
+hooks = config.get('hooks', {})
+hook_map = {
+    'SessionStart': ('claude-notify-session-start.sh', 'startup|resume|clear'),
+    'UserPromptSubmit': ('claude-notify-prompt.sh', ''),
+    'Stop': ('claude-notify-stop.sh', ''),
+    'SessionEnd': ('claude-notify-session-end.sh', ''),
+    'PermissionRequest': ('claude-notify-notify.sh', ''),
+    'PostToolUse': ('claude-notify-tool.sh', ''),
+}
+
+for event, (script, matcher) in hook_map.items():
+    script_path = f'{project_dir}/hooks/{script}'
+    command = f'CLAUDE_NOTIFY_ENGINE=codex {script_path}'
+    entry = {'matcher': matcher, 'hooks': [{'type': 'command', 'command': command}]}
+
+    groups = hooks.setdefault(event, [])
+    already = any(
+        script_path in handler.get('command', '')
+        for group in groups
+        for handler in group.get('hooks', [])
+    )
+    if not already:
+        groups.append(entry)
+
+config['hooks'] = hooks
+with open(hooks_file, 'w') as f:
+    json.dump(config, f, indent=2)
+
+print('OK')
+")
+
+if [ "$CODEX_HOOKS_JSON" = "OK" ]; then
+  echo "Codex hooks registered in $CODEX_HOOKS_FILE"
+  echo "Open /hooks once in Codex to review and trust the new hooks."
+else
+  echo "WARNING: Could not configure Codex hooks automatically."
+  echo "See README for manual setup."
+fi
+
+# --- 7. Create run.sh ---
 # Detect the interactive-shell paths launchd does not inherit. Capture the
 # current CLI directories and include common user-level install locations so
 # Claude Code/Codex keep resolving after routine package-manager upgrades.
@@ -224,7 +282,7 @@ exec mix run --no-halt
 RUNEOF
 chmod +x "$PROJECT_DIR/run.sh"
 
-# --- 7. Install LaunchAgent ---
+# --- 8. Install LaunchAgent ---
 echo ""
 echo "Installing LaunchAgent (auto-start on login)..."
 
@@ -262,7 +320,7 @@ launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
 
 echo "Service installed and started."
 
-# --- 8. Verify ---
+# --- 9. Verify ---
 echo ""
 echo "Waiting for app to start..."
 sleep 4

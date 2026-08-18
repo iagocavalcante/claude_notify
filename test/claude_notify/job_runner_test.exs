@@ -58,7 +58,15 @@ end
 defmodule ClaudeNotify.JobRunnerTest do
   use ExUnit.Case, async: false
 
-  alias ClaudeNotify.{Engine, JobRunner, JobStore, JobSupervisor, JobTranscript, ProjectRegistry}
+  alias ClaudeNotify.{
+    Engine,
+    JobRunner,
+    JobStore,
+    JobSupervisor,
+    JobTranscript,
+    MemoryStore,
+    ProjectRegistry
+  }
 
   @moduletag :tmp_dir
 
@@ -149,6 +157,7 @@ defmodule ClaudeNotify.JobRunnerTest do
   end
 
   setup %{tmp_dir: tmp_dir} do
+    MemoryStore.clear()
     repo_path = create_fixture_repo(tmp_dir)
     base_dir = Path.join(tmp_dir, "worktrees_base")
     previous_base_dir = Application.get_env(:claude_notify, :worktree_base_dir)
@@ -201,7 +210,7 @@ defmodule ClaudeNotify.JobRunnerTest do
     end
 
     test "parse_event/1 parses the verified init/text/result lines" do
-      assert :ignore =
+      assert {:ok, {:session, "abc"}} =
                Engine.Claude.parse_event(
                  ~s({"type":"system","subtype":"init","session_id":"abc"})
                )
@@ -318,6 +327,7 @@ defmodule ClaudeNotify.JobRunnerTest do
 
       final = wait_for_status(store, job.id, :failed)
       assert final.status == :failed
+      assert final.engine_session_id == "fixture-session-crash"
     end
 
     test "a malformed stream-json line is skipped, not fatal", %{
@@ -513,6 +523,42 @@ defmodule ClaudeNotify.JobRunnerTest do
         project_registry: registry,
         dispatcher: dispatcher
       ]
+    end
+
+    test "captures an ordered, sanitized dispatcher lifecycle", %{
+      store: store,
+      script: script,
+      dispatcher: dispatcher,
+      registry: registry
+    } do
+      {:ok, job} = JobStore.create(store, job_attrs())
+
+      assert :started =
+               JobSupervisor.start_job(
+                 job,
+                 common_opts(store, script, registry, dispatcher)
+               )
+
+      wait_for_status(store, job.id, :completed)
+
+      observations = MemoryStore.list(job_id: job.id)
+
+      assert Enum.map(observations, & &1.kind) == [
+               :user_prompt,
+               :session_start,
+               :assistant_text,
+               :tool_use,
+               :result,
+               :job_completed
+             ]
+
+      assert Enum.map(observations, & &1.sequence) == Enum.to_list(1..6)
+      assert Enum.uniq(Enum.map(observations, & &1.project_id)) |> length() == 1
+
+      tool = Enum.find(observations, &(&1.kind == :tool_use))
+      assert tool.body == ""
+      assert tool.metadata["tool_family"] == "shell"
+      refute inspect(tool) =~ "echo hi"
     end
 
     test "a 4th concurrent job queues until a slot frees (cap 3)", %{

@@ -88,7 +88,7 @@ defmodule ClaudeNotify.JobRunner do
   use GenServer, restart: :temporary
   require Logger
 
-  alias ClaudeNotify.{JobStore, JobTranscript, WorktreeManager}
+  alias ClaudeNotify.{JobStore, JobTranscript, MemoryCapture, WorktreeManager}
 
   # Bounded tail of raw engine stdout lines, kept regardless of whether they
   # parsed into a recognized event - the only source for a failed job's
@@ -100,7 +100,9 @@ defmodule ClaudeNotify.JobRunner do
   defstruct [
     :job_id,
     :engine,
+    :engine_name,
     :repo_path,
+    :project_scope,
     :prompt,
     :job_store,
     :job_transcript,
@@ -118,6 +120,7 @@ defmodule ClaudeNotify.JobRunner do
     files_touched: MapSet.new(),
     current_tool: nil,
     current_detail: nil,
+    event_sequence: 0,
     raw_lines: []
   ]
 
@@ -148,7 +151,9 @@ defmodule ClaudeNotify.JobRunner do
     state = %__MODULE__{
       job_id: Keyword.fetch!(opts, :job_id),
       engine: Keyword.fetch!(opts, :engine),
+      engine_name: Keyword.get(opts, :engine_name, "claude"),
       repo_path: Keyword.fetch!(opts, :repo_path),
+      project_scope: Keyword.get(opts, :project_scope),
       prompt: Keyword.fetch!(opts, :prompt),
       job_store: Keyword.get(opts, :job_store, JobStore),
       job_transcript: Keyword.get(opts, :job_transcript, JobTranscript),
@@ -173,14 +178,26 @@ defmodule ClaudeNotify.JobRunner do
            JobStore.update(state.job_store, state.job_id, %{
              worktree_path: worktree.path,
              branch: worktree.branch
-           }),
-         {:ok, port} <- launch_engine(state, worktree) do
-      {:noreply, %{state | worktree: worktree, port: port}}
+           }) do
+      launched_state =
+        state
+        |> put_worktree(worktree)
+        |> capture_dispatcher(:user_prompt, %{body: state.prompt})
+
+      case launch_engine(launched_state, worktree) do
+        {:ok, port} ->
+          {:noreply, %{launched_state | port: port}}
+
+        {:error, reason} ->
+          Logger.error("JobRunner: job #{state.job_id} failed to launch: #{inspect(reason)}")
+          failed_state = fail_job(launched_state, launch_error_message(reason))
+          {:stop, :normal, %{failed_state | finalized: true}}
+      end
     else
       {:error, reason} ->
         Logger.error("JobRunner: job #{state.job_id} failed to launch: #{inspect(reason)}")
-        fail_job(state, launch_error_message(reason))
-        {:stop, :normal, %{state | finalized: true}}
+        failed_state = fail_job(state, launch_error_message(reason))
+        {:stop, :normal, %{failed_state | finalized: true}}
     end
   end
 
@@ -200,13 +217,20 @@ defmodule ClaudeNotify.JobRunner do
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
     final_status = if status == 0, do: :completed, else: :failed
     extras = terminal_extras(state, final_status)
+    kind = if final_status == :completed, do: :job_completed, else: :job_failed
+
+    final_state =
+      capture_dispatcher(state, kind, %{
+        body: state.last_summary || raw_tail(state) || "",
+        status: final_status
+      })
 
     case JobStore.update_status(state.job_store, state.job_id, final_status, extras) do
-      {:ok, _job} -> notify_completed(state, final_status)
+      {:ok, _job} -> notify_completed(final_state, final_status)
       {:error, _reason} -> :ok
     end
 
-    {:stop, :normal, %{state | finalized: true}}
+    {:stop, :normal, %{final_state | finalized: true}}
   end
 
   @impl true
@@ -219,7 +243,7 @@ defmodule ClaudeNotify.JobRunner do
     # Safety net: something crashed before the normal exit_status path could
     # finalize the job (e.g. an uncaught exception in a callback above).
     # The job is assumed to already be :running - see moduledoc.
-    fail_job(state)
+    _state = fail_job(state)
     :ok
   end
 
@@ -227,6 +251,19 @@ defmodule ClaudeNotify.JobRunner do
 
   defp create_worktree(state) do
     WorktreeManager.create(state.repo_path, to_string(state.job_id), state.slug)
+  end
+
+  defp put_worktree(state, worktree) do
+    scope =
+      case state.project_scope do
+        %{__struct__: _module} = existing ->
+          %{existing | cwd: Path.expand(worktree.path), worktree_root: Path.expand(worktree.path)}
+
+        existing ->
+          existing
+      end
+
+    %{state | worktree: worktree, project_scope: scope}
   end
 
   defp launch_engine(state, worktree) do
@@ -267,15 +304,23 @@ defmodule ClaudeNotify.JobRunner do
   end
 
   defp fail_job(state, error_override \\ nil) do
+    captured_state =
+      capture_dispatcher(state, :job_failed, %{
+        body: error_override || state.last_summary || raw_tail(state) || "",
+        status: :failed
+      })
+
     extras =
       state
       |> terminal_extras(:failed)
       |> maybe_put_error_override(error_override)
 
     case JobStore.update_status(state.job_store, state.job_id, :failed, extras) do
-      {:ok, _job} -> notify_completed(state, :failed)
+      {:ok, _job} -> notify_completed(captured_state, :failed)
       {:error, _reason} -> :ok
     end
+
+    captured_state
   end
 
   defp maybe_put_error_override(extras, nil), do: extras
@@ -365,18 +410,24 @@ defmodule ClaudeNotify.JobRunner do
         state
         |> maybe_store_session_id(session_id)
         |> Map.put(:last_summary, summary || state.last_summary)
+        |> capture_dispatcher(:result, %{body: summary || "", status: result[:status]})
 
       {:ok, {:session, session_id}} ->
-        maybe_store_session_id(state, session_id)
+        state
+        |> maybe_store_session_id(session_id)
+        |> capture_dispatcher(:session_start, %{})
 
       {:ok, {:tool_use, detail}} ->
         state
         |> track_progress(detail)
+        |> capture_dispatcher(:tool_use, %{detail: detail})
         |> record_transcript_tool_use(detail)
         |> notify_progress()
 
       {:ok, {:text, text}} ->
-        record_transcript_text(state, text)
+        state
+        |> capture_dispatcher(:assistant_text, %{body: text})
+        |> record_transcript_text(text)
 
       :ignore ->
         state
@@ -395,6 +446,22 @@ defmodule ClaudeNotify.JobRunner do
   defp maybe_store_session_id(state, session_id) do
     JobStore.update(state.job_store, state.job_id, %{engine_session_id: session_id})
     %{state | session_id: session_id}
+  end
+
+  defp capture_dispatcher(state, kind, attrs) do
+    sequence = state.event_sequence + 1
+
+    capture_attrs =
+      Map.merge(attrs, %{
+        kind: kind,
+        sequence: sequence,
+        job_id: state.job_id,
+        engine: state.engine_name,
+        session_id: state.session_id
+      })
+
+    MemoryCapture.dispatcher(state.project_scope, capture_attrs)
+    %{state | event_sequence: sequence}
   end
 
   # -- Progress tracking (for opts[:notifier]) --
