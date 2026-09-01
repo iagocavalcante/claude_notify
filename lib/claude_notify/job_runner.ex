@@ -67,22 +67,15 @@ defmodule ClaudeNotify.JobRunner do
   keeps `JobTranscript`'s memory bounded to currently-running jobs (see its
   moduledoc's cleanup policy).
 
-  ## Resuming (`opts[:resume_session_id]`)
+  ## Conversational continuation
 
   When `opts[:resume_session_id]` is set, `launch_engine/2` calls
   `engine.resume_command/3` instead of `engine.build_command/2`, so the
-  engine CLI is told to continue an earlier conversation. This job still
-  gets its own brand-new worktree cut from the repo's current default
-  branch (see `create_worktree/1`), same as any other job - it does NOT
-  check out the original job's branch. That's a real limitation: the
-  engine's own memory of the earlier turn may reference files that only
-  exist on the *original* job's branch, not on this fresh one. It's an
-  acceptable starting point only because the job rules already require the
-  engine to commit and leave its worktree clean before finishing, so in the
-  common case there's nothing left uncommitted to lose - but a resumed run
-  that expects to see uncommitted state from its earlier turn will not find
-  it here. See `ClaudeNotify.TelegramPoller`'s reply-to-job handling, which
-  is the only current caller of this option.
+  engine CLI is told to continue an earlier conversation. The Telegram chat
+  harness also supplies `opts[:existing_worktree]`, after validating it
+  against `git worktree list`, so later turns see the exact committed and
+  uncommitted files produced by earlier turns. A fresh job without that
+  option still receives its own isolated worktree as before.
   """
 
   use GenServer, restart: :temporary
@@ -173,6 +166,7 @@ defmodule ClaudeNotify.JobRunner do
       job_transcript: Keyword.get(opts, :job_transcript, JobTranscript),
       slug: Keyword.get(opts, :slug, "run"),
       engine_opts: Keyword.get(opts, :engine_opts, []),
+      worktree: Keyword.get(opts, :existing_worktree),
       resume_session_id: Keyword.get(opts, :resume_session_id),
       notifier: Keyword.get(opts, :notifier, fn _event -> :ok end)
     }
@@ -267,6 +261,9 @@ defmodule ClaudeNotify.JobRunner do
   end
 
   # -- Launch --
+
+  defp create_worktree(%{worktree: %WorktreeManager.Worktree{} = worktree}),
+    do: {:ok, worktree}
 
   defp create_worktree(state) do
     WorktreeManager.create(state.repo_path, to_string(state.job_id), state.slug)

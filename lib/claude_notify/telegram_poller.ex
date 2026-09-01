@@ -64,6 +64,7 @@ defmodule ClaudeNotify.TelegramPoller do
   alias ClaudeNotify.{
     Telegram,
     SessionStore,
+    ConversationStore,
     TerminalInjector,
     MessageFormatter,
     Dashboard,
@@ -96,6 +97,8 @@ defmodule ClaudeNotify.TelegramPoller do
   # covers both briefly instead of getting two menu rows.
   @bot_commands [
     {"new", "Choose a project and start a task"},
+    {"agent", "Choose Claude or Codex for the current chat"},
+    {"fresh", "Start a fresh conversation in the selected project"},
     {"sessions", "List and select terminal sessions, including idle"},
     {"approve", "Send Yes to the selected session"},
     {"cancel", "Send Escape to the selected session, or cancel a job by id"},
@@ -122,6 +125,7 @@ defmodule ClaudeNotify.TelegramPoller do
     pid_file = ensure_pid_lock()
     send(self(), :register_commands)
     send(self(), :poll)
+    Process.send_after(self(), {:recover_conversations, 1}, 1_000)
 
     {:ok,
      %{
@@ -132,6 +136,7 @@ defmodule ClaudeNotify.TelegramPoller do
        telegram: Keyword.get(opts, :telegram, Telegram),
        terminal_injector: Keyword.get(opts, :terminal_injector, TerminalInjector),
        job_store: Keyword.get(opts, :job_store, JobStore),
+       conversation_store: Keyword.get(opts, :conversation_store, ConversationStore),
        job_transcript: Keyword.get(opts, :job_transcript, JobTranscript),
        memory_pages: Keyword.get(opts, :memory_pages, MemoryPages),
        project_registry: Keyword.get(opts, :project_registry),
@@ -163,6 +168,25 @@ defmodule ClaudeNotify.TelegramPoller do
     end
 
     {:noreply, state}
+  end
+
+  def handle_info({:recover_conversations, attempt}, state) do
+    conversations = persisted_conversations(state)
+
+    recovered =
+      Enum.reduce(conversations, state, fn
+        %{head_job_id: job_id, pending: [_ | _]}, acc when is_integer(job_id) ->
+          launch_next_pending_turn(acc, job_id)
+
+        _conversation, acc ->
+          acc
+      end)
+
+    if attempt < 3 and Enum.any?(conversations, &match?(%{pending: [_ | _]}, &1)) do
+      Process.send_after(self(), {:recover_conversations, attempt + 1}, 2_000)
+    end
+
+    {:noreply, recovered}
   end
 
   def handle_info(:poll, state) do
@@ -203,7 +227,8 @@ defmodule ClaudeNotify.TelegramPoller do
   # run (see moduledoc).
   @impl true
   def handle_info({:watch_completed, job_id, transcript}, state) do
-    {:noreply, finalize_watch_on_completion(state, job_id, transcript)}
+    state = finalize_watch_on_completion(state, job_id, transcript)
+    {:noreply, launch_next_pending_turn(state, job_id)}
   end
 
   # The trailing edit of a throttled watch: fires `watch_edit_interval_ms`
@@ -503,7 +528,7 @@ defmodule ClaudeNotify.TelegramPoller do
         handle_text_command(chat_id, text, state)
 
       job ->
-        resume_job(job, text, state)
+        continue_or_queue_job(chat_id, job, text, state)
     end
   end
 
@@ -513,58 +538,77 @@ defmodule ClaudeNotify.TelegramPoller do
     |> Enum.find(fn job -> message_id in (job.telegram_message_ids || []) end)
   end
 
-  defp resume_job(%{status: status} = job, text, state) when status in [:completed, :failed] do
-    case job.engine_session_id do
-      nil ->
-        state.telegram.send_message_with_retry(
-          MessageFormatter.escape_full("Job ##{job.id} has no recorded session to resume from.")
-        )
+  defp continue_or_queue_job(chat_id, job, text, state) do
+    case active_conversation(state, chat_id) do
+      %{head_job_id: head_id} when is_integer(head_id) and head_id != job.id ->
+        case JobStore.get(state.job_store, head_id) do
+          %{status: status} when status in [:queued, :running, :awaiting_input] ->
+            queue_conversation_turn(chat_id, text, selected_engine(state, chat_id), state)
 
-        state
+          _ ->
+            resume_job(chat_id, job, text, state)
+        end
 
-      session_id ->
-        launch_resumed_job(job, session_id, text, state)
+      _ ->
+        resume_job(chat_id, job, text, state)
     end
   end
 
-  defp resume_job(job, _text, state) do
-    state.telegram.send_message_with_retry(
-      MessageFormatter.escape_full(
-        "Job ##{job.id} is #{job.status} and can't be resumed right now."
-      )
-    )
+  defp resume_job(chat_id, %{status: status} = job, text, state)
+       when status in [:completed, :failed] do
+    case job.engine_session_id do
+      nil ->
+        launch_continuation_job(chat_id, job, job.engine, text, state)
 
-    state
+      session_id ->
+        launch_resumed_job(chat_id, job, session_id, text, state)
+    end
   end
 
-  defp launch_resumed_job(original_job, session_id, prompt, state) do
+  defp resume_job(chat_id, job, text, state) do
+    state = activate_conversation(state, chat_id, job)
+    queue_conversation_turn(chat_id, text, job.engine, state)
+  end
+
+  defp launch_resumed_job(chat_id, original_job, session_id, prompt, state) do
+    launch_continuation_job(chat_id, original_job, original_job.engine, prompt, state,
+      resume_session_id: session_id
+    )
+  end
+
+  defp launch_continuation_job(chat_id, original_job, engine, prompt, state, opts \\ []) do
     job_store = state.job_store
 
     {:ok, new_job} =
       JobStore.create(job_store, %{
-        engine: original_job.engine,
+        engine: engine,
         project: original_job.project,
         project_id: original_job.project_id,
+        parent_job_id: original_job.id,
         prompt: prompt
       })
 
     send_and_track_activity_message(
       state,
       new_job.id,
-      "Job ##{new_job.id} (#{original_job.project}, #{original_job.engine}): " <>
-        "resuming job ##{original_job.id}..."
+      continuation_starting_text(new_job, original_job, prompt)
     )
 
-    opts =
+    launch_opts =
       state.job_launch_opts
       |> Keyword.put_new(:job_store, job_store)
       |> Keyword.put_new(:project_registry, registry(state))
       |> Keyword.put_new(:job_transcript, state.job_transcript)
       |> Keyword.put_new(:notifier, default_job_notifier(state))
-      |> Keyword.put(:resume_session_id, session_id)
+      |> Keyword.put(:resume_session_id, opts[:resume_session_id])
+      |> maybe_reuse_worktree(state, original_job)
 
-    JobSupervisor.start_job(new_job, opts)
+    clear_previous_job_actions(state, original_job)
+    JobSupervisor.start_job(new_job, launch_opts)
+
     state
+    |> activate_conversation(chat_id, new_job)
+    |> put_selected_project(chat_id, new_job.project, engine)
   end
 
   defp inject_reply_text(text, session) do
@@ -739,6 +783,16 @@ defmodule ClaudeNotify.TelegramPoller do
       String.starts_with?(trimmed, "/new") ->
         send_project_picker(chat_id, state, 0)
         state
+
+      trimmed == "/agent" ->
+        send_agent_picker(chat_id, state)
+        state
+
+      String.starts_with?(trimmed, "/agent ") ->
+        handle_agent_command(chat_id, trimmed, state)
+
+      String.starts_with?(trimmed, "/fresh") ->
+        handle_fresh_command(chat_id, state)
 
       String.starts_with?(trimmed, "/sessions") or String.starts_with?(trimmed, "/select") ->
         send_session_list(chat_id)
@@ -946,14 +1000,381 @@ defmodule ClaudeNotify.TelegramPoller do
   # --- Text injection ---
 
   defp handle_text_input(chat_id, text, state) do
-    case Map.get(Map.get(state, :selected_projects, %{}), chat_id) do
-      project when is_binary(project) ->
-        engine = Map.get(Map.get(state, :selected_engines, %{}), chat_id, "claude")
-        launch_job(engine, project, text, state)
+    selected_session = Map.get(Map.get(state, :selected_sessions, %{}), chat_id)
 
-      nil ->
+    cond do
+      is_binary(selected_session) and SessionStore.get_session(selected_session) ->
+        handle_terminal_text_input(chat_id, text, state)
+
+      project = selected_project(state, chat_id) ->
+        handle_conversation_turn(chat_id, selected_engine(state, chat_id), project, text, state)
+
+      true ->
         handle_terminal_text_input(chat_id, text, state)
     end
+  end
+
+  # --- Durable conversational harness ---
+
+  defp handle_conversation_turn(chat_id, engine, project, text, state) do
+    case active_conversation(state, chat_id) do
+      %{project: ^project, head_job_id: head_job_id} when is_integer(head_job_id) ->
+        case JobStore.get(state.job_store, head_job_id) do
+          %{status: status} when status in [:queued, :running, :awaiting_input] ->
+            queue_conversation_turn(chat_id, text, engine, state)
+
+          %{status: status} = job when status in [:completed, :failed] ->
+            launch_continuation_for_engine(chat_id, job, engine, text, state)
+
+          _missing_or_discarded ->
+            launch_job(engine, project, text, state, chat_id)
+        end
+
+      %{project: ^project, head_job_id: nil} ->
+        launch_job(engine, project, text, state, chat_id)
+
+      _missing_or_changed ->
+        state
+        |> ensure_project_conversation(chat_id, project, engine)
+        |> then(&launch_job(engine, project, text, &1, chat_id))
+    end
+  end
+
+  defp launch_continuation_for_engine(chat_id, job, engine, text, state) do
+    resume_id = if job.engine == engine, do: job.engine_session_id
+
+    launch_continuation_job(chat_id, job, engine, text, state, resume_session_id: resume_id)
+  end
+
+  defp queue_conversation_turn(chat_id, text, engine, state) do
+    case conversation_store(state) do
+      nil ->
+        state.telegram.send_message_with_retry(
+          MessageFormatter.escape_full(
+            "The current turn is still working. Send this again after it completes."
+          )
+        )
+
+      store ->
+        case ConversationStore.enqueue(store, chat_id, text, engine) do
+          {:ok, position} ->
+            state.telegram.send_message_with_retry(
+              MessageFormatter.escape_full(
+                "Queued as the next chat turn (#{position} pending) · #{engine_display_name(engine)}."
+              )
+            )
+
+          {:error, :queue_full} ->
+            state.telegram.send_message_with_retry(
+              MessageFormatter.escape_full(
+                "The follow-up queue is full. Wait for the current turn or cancel it."
+              )
+            )
+
+          {:error, :no_conversation} ->
+            state.telegram.send_message_with_retry(
+              MessageFormatter.escape_full(
+                "The current job is still working. Reply again after it completes."
+              )
+            )
+
+          {:error, reason} ->
+            Logger.warning("TelegramPoller: could not queue chat turn: #{inspect(reason)}")
+
+            state.telegram.send_message_with_retry(
+              MessageFormatter.escape_full(
+                "I could not save that follow-up safely. Please retry."
+              )
+            )
+        end
+    end
+
+    state
+  end
+
+  defp launch_next_pending_turn(state, completed_job_id) do
+    case conversation_store(state) do
+      nil ->
+        state
+
+      store ->
+        conversations =
+          case ConversationStore.list(store) do
+            items when is_list(items) ->
+              items
+
+            {:error, reason} ->
+              Logger.warning(
+                "TelegramPoller: could not read pending chat turns: #{inspect(reason)}"
+              )
+
+              []
+          end
+
+        conversations
+        |> Enum.filter(&(&1.head_job_id == completed_job_id))
+        |> Enum.reduce(state, fn conversation, acc ->
+          case {JobStore.get(acc.job_store, completed_job_id),
+                ConversationStore.pop_pending(store, conversation.chat_id)} do
+            {%{status: status} = job, {:ok, turn}} when status in [:completed, :failed] ->
+              acc
+              |> put_selected_project(conversation.chat_id, conversation.project, turn.engine)
+              |> persist_engine_selection(conversation.chat_id, turn.engine)
+              |> then(
+                &launch_continuation_for_engine(
+                  conversation.chat_id,
+                  job,
+                  turn.engine,
+                  turn.prompt,
+                  &1
+                )
+              )
+
+            _ ->
+              acc
+          end
+        end)
+    end
+  catch
+    :exit, reason ->
+      Logger.warning("TelegramPoller: pending chat turn recovery failed: #{inspect(reason)}")
+      state
+  end
+
+  defp handle_agent_command(chat_id, command, state) do
+    engine = command |> String.replace_prefix("/agent", "") |> String.trim() |> String.downcase()
+
+    if engine in @known_engines do
+      case selected_project(state, chat_id) do
+        nil ->
+          state.telegram.send_message_with_retry(
+            MessageFormatter.escape_full("Choose a project with /new before selecting an agent.")
+          )
+
+          state
+
+        project ->
+          state.telegram.send_message_with_retry(
+            MessageFormatter.escape_full(
+              "#{engine_display_name(engine)} will handle the next turn in #{project}. The workspace stays the same."
+            )
+          )
+
+          state
+          |> Map.put(
+            :selected_engines,
+            Map.put(Map.get(state, :selected_engines, %{}), chat_id, engine)
+          )
+          |> persist_engine_selection(chat_id, engine)
+      end
+    else
+      state.telegram.send_message_with_retry(
+        MessageFormatter.escape_full("Usage: /agent claude | /agent codex")
+      )
+
+      state
+    end
+  end
+
+  defp send_agent_picker(chat_id, state) do
+    case selected_project(state, chat_id) do
+      nil ->
+        send_project_picker(chat_id, state, 0)
+
+      project ->
+        engine = selected_engine(state, chat_id)
+
+        state.telegram.send_with_buttons_retry(
+          [
+            "*Choose the next agent*",
+            "",
+            MessageFormatter.escape_full("Project: #{project}"),
+            MessageFormatter.escape_full(
+              "Switching agents keeps the same workspace and uses the durable handoff."
+            )
+          ]
+          |> Enum.join("\n"),
+          engine_buttons(engine)
+        )
+    end
+  end
+
+  defp handle_fresh_command(chat_id, state) do
+    case {selected_project(state, chat_id), conversation_store(state)} do
+      {nil, _} ->
+        state.telegram.send_message_with_retry(
+          MessageFormatter.escape_full("Choose a project with /new first.")
+        )
+
+      {_project, nil} ->
+        state.telegram.send_message_with_retry(
+          MessageFormatter.escape_full("Send your next message to start a fresh conversation.")
+        )
+
+      {project, store} ->
+        case ConversationStore.fresh(store, chat_id) do
+          {:ok, _conversation} ->
+            state.telegram.send_message_with_retry(
+              MessageFormatter.escape_full(
+                "Fresh conversation ready in #{project} · #{engine_display_name(selected_engine(state, chat_id))}."
+              )
+            )
+
+          {:error, _reason} ->
+            state.telegram.send_message_with_retry(
+              MessageFormatter.escape_full(
+                "Could not reset the conversation. Use /new to choose again."
+              )
+            )
+        end
+    end
+
+    state
+  end
+
+  defp selected_project(state, chat_id) do
+    Map.get(Map.get(state, :selected_projects, %{}), chat_id) ||
+      case active_conversation(state, chat_id) do
+        %{project: project} -> project
+        _ -> nil
+      end
+  end
+
+  defp selected_engine(state, chat_id) do
+    Map.get(Map.get(state, :selected_engines, %{}), chat_id) ||
+      case active_conversation(state, chat_id) do
+        %{engine: engine} -> engine
+        _ -> "claude"
+      end
+  end
+
+  defp active_conversation(state, chat_id) do
+    case conversation_store(state) do
+      nil ->
+        nil
+
+      store ->
+        case ConversationStore.get(store, chat_id) do
+          {:error, _reason} -> nil
+          conversation -> conversation
+        end
+    end
+  catch
+    :exit, reason ->
+      Logger.warning("TelegramPoller: conversation state unavailable: #{inspect(reason)}")
+      nil
+  end
+
+  defp conversation_store(state), do: Map.get(state, :conversation_store)
+
+  defp persisted_conversations(state) do
+    case conversation_store(state) do
+      nil ->
+        []
+
+      store ->
+        case ConversationStore.list(store) do
+          conversations when is_list(conversations) -> conversations
+          _ -> []
+        end
+    end
+  catch
+    :exit, _reason -> []
+  end
+
+  defp ensure_project_conversation(state, chat_id, project, engine) do
+    case ProjectScope.for_project(registry(state), project) do
+      {:ok, scope} -> persist_project_selection(state, chat_id, scope, engine)
+      {:error, _reason} -> state
+    end
+  end
+
+  defp persist_project_selection(state, chat_id, scope, engine) do
+    case conversation_store(state) do
+      nil ->
+        state
+
+      store ->
+        case ConversationStore.select_project(store, chat_id, scope, engine) do
+          {:ok, _conversation} ->
+            state
+
+          {:error, reason} ->
+            Logger.warning(
+              "TelegramPoller: project chat state was not persisted: #{inspect(reason)}"
+            )
+
+            state
+        end
+    end
+  end
+
+  defp persist_engine_selection(state, chat_id, engine) do
+    case conversation_store(state) do
+      nil ->
+        state
+
+      store ->
+        case ConversationStore.select_engine(store, chat_id, engine) do
+          {:ok, _conversation} ->
+            state
+
+          {:error, :no_conversation} ->
+            state
+
+          {:error, reason} ->
+            Logger.warning(
+              "TelegramPoller: agent selection was not persisted: #{inspect(reason)}"
+            )
+
+            state
+        end
+    end
+  end
+
+  defp activate_conversation(state, chat_id, job) do
+    state = ensure_project_conversation_if_missing(state, chat_id, job)
+
+    case conversation_store(state) do
+      nil ->
+        state
+
+      store ->
+        case ConversationStore.bind_job(store, chat_id, job) do
+          {:ok, _conversation} ->
+            state
+
+          {:error, reason} ->
+            Logger.warning("TelegramPoller: job chat state was not persisted: #{inspect(reason)}")
+            state
+        end
+    end
+  end
+
+  defp ensure_project_conversation_if_missing(state, chat_id, job) do
+    case active_conversation(state, chat_id) do
+      %{project: project} when project == job.project ->
+        state
+
+      _ ->
+        ensure_project_conversation(state, chat_id, job.project, job.engine)
+    end
+  end
+
+  defp put_selected_project(state, chat_id, project, engine) do
+    state
+    |> Map.put(
+      :selected_projects,
+      Map.put(Map.get(state, :selected_projects, %{}), chat_id, project)
+    )
+    |> Map.put(
+      :selected_engines,
+      Map.put(Map.get(state, :selected_engines, %{}), chat_id, engine)
+    )
+    |> Map.put(
+      :selected_sessions,
+      Map.delete(Map.get(state, :selected_sessions, %{}), chat_id)
+    )
   end
 
   defp handle_terminal_text_input(chat_id, text, state) do
@@ -1041,7 +1462,10 @@ defmodule ClaudeNotify.TelegramPoller do
            "",
            MessageFormatter.escape_full("Quick start: /new → choose a project → send your task."),
            MessageFormatter.escape_full(
-             "Reply to a completed task to continue its conversation."
+             "After the first task, just keep chatting: follow-ups reuse the same agent session and workspace."
+           ),
+           MessageFormatter.escape_full(
+             "Use /agent to hand the current workspace between Claude and Codex, or /fresh for a clean conversation."
            ),
            MessageFormatter.escape_full(
              "Use /sessions when you want to control an open terminal session."
@@ -1280,7 +1704,7 @@ defmodule ClaudeNotify.TelegramPoller do
     end
   end
 
-  defp launch_job(engine, project, prompt, state) do
+  defp launch_job(engine, project, prompt, state, chat_id \\ nil) do
     registry = registry(state)
 
     case ProjectScope.for_project(registry, project) do
@@ -1314,7 +1738,12 @@ defmodule ClaudeNotify.TelegramPoller do
 
         JobSupervisor.start_job(job, opts)
         Dashboard.refresh()
-        state
+
+        if is_nil(chat_id) do
+          state
+        else
+          activate_conversation(state, chat_id, job)
+        end
     end
   end
 
@@ -1657,7 +2086,7 @@ defmodule ClaudeNotify.TelegramPoller do
         state
 
       project ->
-        engine = Map.get(Map.get(state, :selected_engines, %{}), chat_id, "claude")
+        engine = selected_engine(state, chat_id)
         Telegram.answer_callback_query(callback_id, "Working in #{project.name}")
 
         text =
@@ -1668,7 +2097,7 @@ defmodule ClaudeNotify.TelegramPoller do
             "Agent: *#{engine_display_name(engine)}*",
             "",
             MessageFormatter.escape_full(
-              "Send your task as a normal message. Reply to the completed task to continue that conversation."
+              "Send a normal message to start. Every follow-up stays in this workspace until you use /fresh or /new."
             )
           ]
           |> Enum.join("\n")
@@ -1676,27 +2105,18 @@ defmodule ClaudeNotify.TelegramPoller do
         buttons = engine_buttons(engine)
         state.telegram.send_with_buttons_retry(text, buttons)
 
-        state
-        |> Map.put(
-          :selected_projects,
-          Map.put(Map.get(state, :selected_projects, %{}), chat_id, project.name)
-        )
-        |> Map.put(
-          :selected_engines,
-          Map.put(Map.get(state, :selected_engines, %{}), chat_id, engine)
-        )
-        |> Map.put(
-          :selected_sessions,
-          Map.delete(Map.get(state, :selected_sessions, %{}), chat_id)
-        )
+        state = put_selected_project(state, chat_id, project.name, engine)
+
+        case ProjectScope.for_project(registry(state), project.name) do
+          {:ok, scope} -> persist_project_selection(state, chat_id, scope, engine)
+          {:error, _reason} -> state
+        end
     end
   end
 
   defp handle_engine_select(callback_id, chat_id, engine, state)
        when engine in @known_engines do
-    selected_projects = Map.get(state, :selected_projects, %{})
-
-    case Map.get(selected_projects, chat_id) do
+    case selected_project(state, chat_id) do
       nil ->
         Telegram.answer_callback_query(callback_id, "Choose a project first")
         send_project_picker(chat_id, state, 0)
@@ -1707,15 +2127,16 @@ defmodule ClaudeNotify.TelegramPoller do
 
         state.telegram.send_message_with_retry(
           MessageFormatter.escape_full(
-            "#{engine_display_name(engine)} selected for #{project}. Send your task when ready."
+            "#{engine_display_name(engine)} will handle the next turn in #{project}. The workspace stays the same."
           )
         )
 
-        Map.put(
-          state,
+        state
+        |> Map.put(
           :selected_engines,
           Map.put(Map.get(state, :selected_engines, %{}), chat_id, engine)
         )
+        |> persist_engine_selection(chat_id, engine)
     end
   end
 
@@ -1756,6 +2177,78 @@ defmodule ClaudeNotify.TelegramPoller do
       "I'll keep this message updated."
     ]
     |> Enum.join("\n")
+  end
+
+  defp continuation_starting_text(job, previous, prompt) do
+    preview = prompt |> String.replace(~r/\s+/, " ") |> String.slice(0, 160)
+
+    transition =
+      if job.engine == previous.engine,
+        do: "continuing the conversation",
+        else:
+          "handoff from #{engine_display_name(previous.engine)} to #{engine_display_name(job.engine)}"
+
+    [
+      "💬 #{job.project} · #{engine_display_name(job.engine)}",
+      "Job ##{job.id} · #{transition}",
+      "",
+      "“#{preview}#{if String.length(prompt) > 160, do: "…", else: ""}”",
+      "",
+      "Same workspace · I'll keep this message updated."
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp maybe_reuse_worktree(opts, state, job) do
+    with path when is_binary(path) <- job.worktree_path,
+         branch when is_binary(branch) <- job.branch,
+         {:ok, scope} <- ProjectScope.for_project(registry(state), job.project),
+         {:ok, worktree} <- WorktreeManager.reuse(scope.repo_root, path, branch) do
+      Keyword.put(opts, :existing_worktree, worktree)
+    else
+      _ ->
+        # Native session history can describe files that no longer exist if
+        # its worktree has been discarded. Fall back to a fresh engine turn;
+        # portable project memory remains available through StartupContext.
+        Keyword.delete(opts, :resume_session_id)
+    end
+  end
+
+  defp clear_previous_job_actions(state, %{telegram_message_ids: [message_id | _]}) do
+    state.telegram.edit_message_reply_markup_with_retry(message_id, [])
+  end
+
+  defp clear_previous_job_actions(_state, _job), do: :ok
+
+  defp conversation_hint(state, job_id) do
+    case conversation_for_job(state, job_id) do
+      %{pending: [_ | _]} ->
+        "\n\n<i>Your next queued message will start automatically.</i>"
+
+      %{} ->
+        "\n\n<i>Send your next message to continue in this workspace.</i>"
+
+      nil ->
+        ""
+    end
+  end
+
+  defp conversation_for_job(state, job_id) do
+    case conversation_store(state) do
+      nil ->
+        nil
+
+      store ->
+        case ConversationStore.list(store) do
+          conversations when is_list(conversations) ->
+            Enum.find(conversations, &(&1.head_job_id == job_id))
+
+          _ ->
+            nil
+        end
+    end
+  catch
+    :exit, _reason -> nil
   end
 
   defp send_run_usage(state) do
@@ -1882,7 +2375,10 @@ defmodule ClaudeNotify.TelegramPoller do
   defp deliver_completion_report(state, job, :completed, summary) do
     notify_preparing(state, "typing")
     diffstat = job_diffstat(state, job)
-    text = MessageFormatter.job_completed_html(job, diffstat, summary)
+
+    text =
+      MessageFormatter.job_completed_html(job, diffstat, summary) <>
+        conversation_hint(state, job.id)
 
     buttons = [
       ["Show diff", "jobdiff:#{job.id}"],
@@ -1896,7 +2392,9 @@ defmodule ClaudeNotify.TelegramPoller do
 
   defp deliver_completion_report(state, job, :failed, _summary) do
     notify_preparing(state, "typing")
-    text = MessageFormatter.job_failed_html(job, job.error_tail)
+
+    text =
+      MessageFormatter.job_failed_html(job, job.error_tail) <> conversation_hint(state, job.id)
 
     buttons = [
       ["Show output", "jobshowoutput:#{job.id}"],
@@ -2394,27 +2892,56 @@ defmodule ClaudeNotify.TelegramPoller do
     System.cmd(cmd, args, cd: cwd, stderr_to_stdout: true)
   end
 
-  defp send_start(_chat_id, state) do
+  defp send_start(chat_id, state) do
+    current = active_conversation(state, chat_id)
+
+    current_lines =
+      case current do
+        nil ->
+          [MessageFormatter.escape_full("Start by choosing where to work.")]
+
+        conversation ->
+          [
+            "*Current chat*",
+            MessageFormatter.escape_full(
+              "#{conversation.project} · #{engine_display_name(conversation.engine)} · #{length(conversation.pending)} queued"
+            ),
+            MessageFormatter.escape_full(
+              "Send a message to continue, /agent to switch agents, or /fresh to reset."
+            )
+          ]
+      end
+
     text =
-      [
-        "*Your coding agent, in Telegram*",
-        "",
-        MessageFormatter.escape_full(
-          "Choose a local project, send a task, and follow Claude or Codex from this chat."
-        ),
-        "",
-        MessageFormatter.escape_full(
-          "Your repository stays isolated in a temporary git worktree. Nothing is pushed until you tap Create PR."
-        ),
-        "",
-        MessageFormatter.escape_full("Start by choosing where to work.")
-      ]
+      ([
+         "*Your coding agent, in Telegram*",
+         "",
+         MessageFormatter.escape_full(
+           "Choose a local project, then chat naturally with Claude or Codex."
+         ),
+         "",
+         MessageFormatter.escape_full(
+           "Your conversation keeps one isolated git worktree. Nothing is pushed until you tap Create PR."
+         ),
+         ""
+       ] ++ current_lines)
       |> Enum.join("\n")
 
-    state.telegram.send_with_button_rows_retry(text, [
-      [["New task", "nav:new"]],
-      [["Open sessions", "nav:sessions"], ["Recent jobs", "nav:jobs"]]
-    ])
+    rows =
+      if current do
+        [
+          [["New project chat", "nav:new"]],
+          engine_buttons(current.engine),
+          [["Open sessions", "nav:sessions"], ["Recent jobs", "nav:jobs"]]
+        ]
+      else
+        [
+          [["New project chat", "nav:new"]],
+          [["Open sessions", "nav:sessions"], ["Recent jobs", "nav:jobs"]]
+        ]
+      end
+
+    state.telegram.send_with_button_rows_retry(text, rows)
   end
 
   defp send_status(chat_id, state) do
@@ -2423,8 +2950,9 @@ defmodule ClaudeNotify.TelegramPoller do
       |> map_size()
 
     selected = Map.get(state.selected_sessions, chat_id)
-    selected_project = Map.get(Map.get(state, :selected_projects, %{}), chat_id)
-    selected_engine = Map.get(Map.get(state, :selected_engines, %{}), chat_id, "claude")
+    selected_project = selected_project(state, chat_id)
+    selected_engine = selected_engine(state, chat_id)
+    conversation = active_conversation(state, chat_id)
 
     selected_line =
       case selected && SessionStore.get_session(selected) do
@@ -2445,14 +2973,30 @@ defmodule ClaudeNotify.TelegramPoller do
         MessageFormatter.escape_full("Authorized: yes"),
         MessageFormatter.escape_full("Terminal sessions: #{active}"),
         MessageFormatter.escape_full(
-          "New tasks: #{selected_project || "choose with /new"} · #{engine_display_name(selected_engine)}"
+          "Project chat: #{selected_project || "choose with /new"} · #{engine_display_name(selected_engine)}"
         ),
+        conversation_status_line(conversation, state),
         selected_line
       ]
       |> Enum.join("\n")
 
     body = %{chat_id: chat_id, text: text, parse_mode: "MarkdownV2"}
     Telegram.api_post_public("sendMessage", body)
+  end
+
+  defp conversation_status_line(nil, _state),
+    do: MessageFormatter.escape_full("Conversation turn: not started")
+
+  defp conversation_status_line(conversation, state) do
+    status =
+      case conversation.head_job_id && JobStore.get(state.job_store, conversation.head_job_id) do
+        nil -> "ready for a fresh turn"
+        job -> "job ##{job.id} · #{job.status}"
+      end
+
+    MessageFormatter.escape_full(
+      "Conversation turn: #{status} · #{length(conversation.pending)} queued"
+    )
   end
 
   defp register_bot_commands(telegram) do

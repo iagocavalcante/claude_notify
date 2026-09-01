@@ -87,6 +87,27 @@ defmodule ClaudeNotify.WorktreeManagerTest do
     end
   end
 
+  describe "reuse/3" do
+    test "returns only an exact Git-registered app worktree", %{repo_path: repo_path} do
+      {:ok, worktree} = WorktreeManager.create(repo_path, "43", "chat")
+
+      assert {:ok, reused} =
+               WorktreeManager.reuse(repo_path, worktree.path, worktree.branch)
+
+      assert reused.path == worktree.path
+      assert reused.branch == worktree.branch
+
+      assert {:error, :unregistered_worktree} =
+               WorktreeManager.reuse(repo_path, repo_path, worktree.branch)
+
+      assert {:error, :unregistered_worktree} =
+               WorktreeManager.reuse(repo_path, worktree.path, "main")
+
+      assert {:error, :missing_worktree} =
+               WorktreeManager.reuse(repo_path, Path.join(repo_path, "missing"), worktree.branch)
+    end
+  end
+
   describe "discard/1" do
     test "removes the worktree directory and deletes the branch", %{repo_path: repo_path} do
       {:ok, worktree} = WorktreeManager.create(repo_path, "7", "cleanup")

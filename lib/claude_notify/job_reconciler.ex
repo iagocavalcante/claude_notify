@@ -12,10 +12,12 @@ defmodule ClaudeNotify.JobReconciler do
     * On-disk worktrees with no matching `JobStore` record are orphans -
       listed and reported to the authorized Telegram chat with a cleanup
       prompt. They are never auto-deleted.
-    * Worktrees belonging to `:completed`/`:discarded` jobs older than the
-      configured retention window (`:claude_notify,
-      :job_worktree_retention_seconds`, default 7 days, judged against the
-      job's `updated_at`) are swept via `ClaudeNotify.WorktreeManager.discard/1`.
+    * Worktrees whose newest referencing job is `:completed`/`:discarded`
+      and older than the configured retention window (`:claude_notify,
+      :job_worktree_retention_seconds`, default 7 days, judged against that
+      newest job's `updated_at`) are swept via
+      `ClaudeNotify.WorktreeManager.discard/1`. This protects worktrees shared
+      by sequential conversational turns from cleanup by an older turn.
 
   Meant to be started as a one-shot `Task` from `ClaudeNotify.Application`,
   after `JobStore` and `JobSupervisor` are already up. Never raises: any
@@ -149,9 +151,20 @@ defmodule ClaudeNotify.JobReconciler do
 
     job_store
     |> JobStore.list()
+    |> newest_job_per_worktree()
     |> Enum.filter(&past_retention?(&1, now, retention_seconds))
     |> Enum.map(&sweep_job_worktree(&1, registry))
     |> Enum.reject(&is_nil/1)
+  end
+
+  # Conversational turns deliberately share one worktree. Only its newest
+  # job record may own retention cleanup; otherwise an older completed turn
+  # could delete the workspace underneath a newer turn.
+  defp newest_job_per_worktree(jobs) do
+    jobs
+    |> Enum.filter(&is_binary(&1.worktree_path))
+    |> Enum.group_by(& &1.worktree_path)
+    |> Enum.map(fn {_path, grouped} -> Enum.max_by(grouped, & &1.id) end)
   end
 
   defp past_retention?(job, now, retention_seconds) do

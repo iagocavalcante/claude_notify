@@ -65,6 +65,34 @@ defmodule ClaudeNotify.WorktreeManager do
   end
 
   @doc """
+  Resolves an existing app-owned worktree for a later conversational turn.
+
+  The supplied path and branch must exactly match `git worktree list`; callers
+  cannot turn this into arbitrary-directory execution by editing persisted job
+  metadata. The returned struct can be passed to `JobRunner` as
+  `:existing_worktree`.
+  """
+  def reuse(repo_path, path, branch)
+      when is_binary(repo_path) and is_binary(path) and is_binary(branch) do
+    expanded_path = Path.expand(path)
+
+    with true <- File.dir?(expanded_path),
+         {:ok, worktrees} <- list(repo_path),
+         %Worktree{} = worktree <-
+           Enum.find(worktrees, fn worktree ->
+             Path.expand(worktree.path) == expanded_path and worktree.branch == branch
+           end) do
+      {:ok, worktree}
+    else
+      false -> {:error, :missing_worktree}
+      nil -> {:error, :unregistered_worktree}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def reuse(_repo_path, _path, _branch), do: {:error, :invalid_worktree}
+
+  @doc """
   Discards a job's worktree: removes the worktree directory (forcing past
   any uncommitted changes) and deletes its branch. Idempotent — safe to call
   more than once for the same worktree.

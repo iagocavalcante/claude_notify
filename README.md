@@ -16,6 +16,8 @@ Elixir app that sends interactive Telegram notifications for Claude Code and Cod
 - **Job dispatcher** — run a coding-agent CLI (`claude` or `codex`) headlessly against a discovered or registered project in its own isolated git worktree, with progress/completion reports and a `Create PR` button as the only push path
 - **Watch mode** — opt in to a live, throttled transcript of a running job; off by default to keep the dispatcher quiet
 - **Message-first tasks** — `/new`, tap a repository, then send ordinary messages instead of memorizing `/run` syntax
+- **Durable project chats** — follow-up messages automatically resume the same Claude/Codex conversation and exact worktree; messages sent while busy queue as later turns and survive service restarts
+- **One-command agent handoff** — `/agent` switches the next turn between Claude and Codex while preserving the workspace and delivering bounded project memory
 - **Automatic project discovery** — Git repositories under your configured workspace roots appear in Telegram automatically
 - **Unified dashboard** — one live view for Claude Code and Codex terminal sessions plus queued/running jobs
 - **Idle session continuity** — completed Claude Code and Codex turns stay listed as idle, selectable sessions instead of disappearing
@@ -139,6 +141,8 @@ This table also drives Telegram's native "/" command menu, which self-registers 
 | Command | Description |
 |---------|-------------|
 | `/new` | Choose a project and start a task with normal messages |
+| `/agent [claude\|codex]` | Choose the agent for the current project chat |
+| `/fresh` | Start a fresh conversation and worktree in the selected project |
 | `/sessions` | List and select terminal sessions, including idle |
 | `/approve` | Send Yes to the selected session |
 | `/cancel` | Send Escape to the selected session (bare, no id) |
@@ -155,9 +159,9 @@ This table also drives Telegram's native "/" command menu, which self-registers 
 | `/unpreview <preview-id>` | Stop a preview and remove its provider route/resources |
 | `/help` | Show available commands |
 
-Reply to any message to send text to that session. If only one session is active, it is auto-selected. Standalone `yes`, `no`, `yes!`, `esc`, or a digit from `1` to `9` uses the same direct response keystroke as the matching permission button. Replying to a dispatcher job's activity message resumes that job instead — see [Job dispatcher](#job-dispatcher).
+Reply to any terminal message to send text to that terminal session. If only one session is active, it is auto-selected. Standalone `yes`, `no`, `yes!`, `esc`, or a digit from `1` to `9` uses the same direct response keystroke as the matching permission button.
 
-Registered bot commands in the table above are handled by Claude Notify. Every other slash command is forwarded verbatim to the selected destination, so project skills such as `/post-shorts make three variants` work like they do in Claude Code. A selected terminal session receives the text in its existing Terminal.app tab; a selected project starts an isolated dispatcher job with that text as its prompt.
+Registered bot commands in the table above are handled by Claude Notify. Every other slash command is forwarded verbatim to the selected destination, so project skills such as `/post-shorts make three variants` work like they do in Claude Code. A selected terminal session receives the text in its existing Terminal.app tab. A selected project behaves as a durable chat: the first message creates an isolated dispatcher workspace, later messages resume it, and follow-ups sent while the agent is busy run sequentially from a bounded durable queue.
 
 ## Security Model
 
@@ -197,6 +201,7 @@ CLAUDE_NOTIFY_CLAUDE_CHROME=true
 CLAUDE_NOTIFY_MEMORY_CAPTURE=true
 # CLAUDE_NOTIFY_MEMORY_STORE_PATH="$HOME/.claude_notify/memory_store.dat"
 # CLAUDE_NOTIFY_HANDOFF_STORE_PATH="$HOME/.claude_notify/handoffs.dat"
+# CLAUDE_NOTIFY_CONVERSATION_STORE_PATH="$HOME/.claude_notify/conversations.dat"
 # CLAUDE_NOTIFY_MEMORY_PAGES_ROOT="$HOME/.claude_notify/memory"
 # CLAUDE_NOTIFY_MEMORY_BRIEFING_INJECTION=false
 # CLAUDE_NOTIFY_MEMORY_MAX_PER_SESSION=500
@@ -214,6 +219,8 @@ CLAUDE_NOTIFY_MEMORY_CAPTURE=true
 # CLAUDE_NOTIFY_MEMORY_MAX_SEARCH_RESULTS=8
 # CLAUDE_NOTIFY_MEMORY_MAX_SNIPPET_BYTES=700
 # CLAUDE_NOTIFY_MEMORY_MAX_BRIEFING_BYTES=6000
+# CLAUDE_NOTIFY_CONVERSATION_MAX_PENDING=10
+# CLAUDE_NOTIFY_CONVERSATION_MAX_PROMPT_BYTES=8000
 
 # Optional previews: auto selects the first available secure provider
 CLAUDE_NOTIFY_PREVIEW_PROVIDER=auto
@@ -506,7 +513,11 @@ File entries take precedence over application-config entries with the same name.
 
 ### Commands
 
-**`/new`** — opens a paginated project picker. Tap a repository, optionally switch between Claude and Codex, then send your task as a normal Telegram message. The selection stays active for later new tasks. Reply to a completed task's message when you want to continue that specific agent conversation instead. Use `/sessions` to switch from project-task mode to an already-open terminal session.
+**`/new`** — opens a paginated project picker and establishes a fresh durable project chat. Tap a repository, optionally switch between Claude and Codex, then send your task as a normal Telegram message. Later ordinary messages automatically continue the latest native agent session in the exact same worktree. A message sent while a turn is running is durably queued and starts after that turn completes. The selected project, agent, conversation head, and pending turns survive app restarts. Use `/sessions` to switch temporarily to an already-open terminal session.
+
+**`/agent [claude|codex]`** — changes the agent for the next turn without changing the current worktree. A same-agent turn uses native Claude/Codex resume. A cross-agent turn starts the other engine in that workspace and consumes the bounded durable handoff produced by the previous turn. With no argument, `/agent` shows one-tap agent buttons.
+
+**`/fresh`** — clears the active conversation chain and pending turns while retaining the selected project and agent. The next message receives a new isolated worktree. `/new` is the broader reset when the project should change too.
 
 **`/run [claude|codex] <project> <prompt>`** — launches a job. `<project>` is a discovered name, explicit name, or alias; the rest of the message after it is the prompt verbatim. The engine defaults to `claude` when omitted.
 
@@ -533,9 +544,7 @@ command also works when replying to a tracked terminal or dispatcher message.
 
 **`/watch <id>` / `/unwatch <id>`** — see [Watch mode](#watch-mode) below; equivalent to tapping the `[Watch]`/`[Unwatch]` button on the job's activity message.
 
-**Reply to a job's activity message to resume it.** This does not continue the same job in place — it creates a **new** job (new id, new worktree, new branch) with `resume_session_id` set to the original job's `engine_session_id`, and your reply text as its prompt. Only a `:completed` or `:failed` job can be resumed this way (a job with no recorded `engine_session_id` — e.g. it failed before the engine ever reported one — can't be resumed at all); resuming a job that's still `:queued`/`:running`/`:awaiting_input` replies with an error instead.
-
-  **Resume limitation:** the new job still gets a brand-new worktree cut from the repo's *current default branch* — it does **not** check out the original job's branch. The engine's own memory of the earlier conversation may reference files or state that only exist on the *original* job's branch. Portable handoff context remains available when it comes from another session or engine, but the handoff matching the native resume session is intentionally omitted to avoid duplication.
+**Reply to a job's activity message to make it the active chat and continue it.** Each turn remains a separate immutable job record for auditability, but the new turn reuses the original app-owned worktree and branch after validating them against `git worktree list`. Same-agent turns pass the recorded native session id to Claude/Codex. If that session id or worktree is unavailable, the turn falls back safely to a fresh engine invocation with portable project memory. Replies to a busy chat are queued instead of rejected.
 
 ### Report buttons and the human gate
 
@@ -605,6 +614,9 @@ These are the main dispatcher keys under `config :claude_notify, ...`. Environme
 | `:watch_edit_interval_ms` | `2_000` | Minimum time between throttled watch-message edits |
 | `:worktree_base_dir` | `~/.claude_notify/worktrees` | Base directory job worktrees are created under |
 | `:job_store_path` | `~/.claude_notify/job_store.dat` | Where `ClaudeNotify.JobStore` persists job records to disk |
+| `:conversation_store_path` | `~/.claude_notify/conversations.dat` | Durable selected project/agent, job head, and pending chat turns; set with `CLAUDE_NOTIFY_CONVERSATION_STORE_PATH` |
+| `:memory.conversation_max_pending` | `10` | Maximum durable follow-up turns per chat; set with `CLAUDE_NOTIFY_CONVERSATION_MAX_PENDING` |
+| `:memory.conversation_max_prompt_bytes` | `8_000` | Maximum UTF-8 bytes retained for one queued turn; set with `CLAUDE_NOTIFY_CONVERSATION_MAX_PROMPT_BYTES` |
 
 ### Dispatcher architecture
 
@@ -615,6 +627,8 @@ WorktreeManager   — creates/discards the job's isolated git worktree + branch 
       |
 JobStore          — persists job records (status, worktree/branch, engine_session_id) to disk
       |
+ConversationStore — persists each Telegram project's active agent, job chain, and queued turns
+      |
 JobSupervisor /   — enforces the concurrency cap + FIFO queue, then supervises one
   Dispatcher        JobRunner process per running job
       |
@@ -624,8 +638,8 @@ JobRunner         — drives the engine CLI as a Port, parses its output, record
 Engine.Claude /   — engine-specific command building + event parsing; Claude can connect
   Engine.Codex      to the paired browser extension when --chrome is enabled
       |
-TelegramPoller    — the only caller of the above: guides /new and parses /run /jobs /cancel /projects /memory
-                     /watch /unwatch and reply-to-job text, renders activity/report
+TelegramPoller    — the only caller of the above: guides /new and parses /agent /fresh /run /jobs
+                     /cancel /projects /memory /watch /unwatch and ordinary chat turns, renders activity/report
                      messages and buttons, and is the sole path that can push or open a PR
 ```
 
@@ -643,6 +657,7 @@ This covers the hook → Telegram → terminal-injection pipeline. For the job d
 | `SessionStore` | GenServer tracking active sessions (ID, working dir, TTY path, transcript path) |
 | `Telegram` | Telegram Bot API client (send messages, inline keyboards, long polling) |
 | `TelegramPoller` | GenServer polling `getUpdates`, validating `chat_id`, and handling buttons/text commands |
+| `ConversationStore` | Persists project-chat selection, active job/worktree chain, and bounded queued turns |
 | `TerminalInjector` | AppleScript injection into Terminal.app by TTY path (clipboard paste for text input) |
 | `MessageFormatter` | MarkdownV2 formatted messages with emoji tool icons |
 | `TranscriptReader` | Reads Claude Code JSONL transcripts for last assistant response; Codex supplies its response in the Stop event |

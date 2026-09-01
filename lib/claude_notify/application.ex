@@ -19,6 +19,7 @@ defmodule ClaudeNotify.Application do
         ClaudeNotify.TaskTracker,
         ClaudeNotify.Dashboard,
         ClaudeNotify.JobStore,
+        ClaudeNotify.ConversationStore,
         ClaudeNotify.PreviewManager
       ] ++
         keep_awake_child() ++

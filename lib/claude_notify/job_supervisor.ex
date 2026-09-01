@@ -48,7 +48,7 @@ defmodule ClaudeNotify.JobSupervisor do
     * `:dispatcher` - the Dispatcher process to call, defaults to
       `ClaudeNotify.JobSupervisor.Dispatcher`.
     * `:job_store`, `:engine_module`, `:project_registry`, `:slug`,
-      `:engine_opts`, `:resume_session_id`, `:notifier` - forwarded to the
+      `:engine_opts`, `:resume_session_id`, `:existing_worktree`, `:notifier` - forwarded to the
       Dispatcher; see its moduledoc.
   """
   def start_job(job, opts \\ []) do
@@ -264,7 +264,9 @@ defmodule ClaudeNotify.JobSupervisor do
        job_store: job_store,
        slug: Keyword.get(opts, :slug, "run"),
        engine_opts: Keyword.get(opts, :engine_opts, []),
+       existing_worktree: Keyword.get(opts, :existing_worktree),
        resume_session_id: Keyword.get(opts, :resume_session_id),
+       job_transcript: Keyword.get(opts, :job_transcript, ClaudeNotify.JobTranscript),
        notifier: Keyword.get(opts, :notifier, fn _event -> :ok end)}
     end
 

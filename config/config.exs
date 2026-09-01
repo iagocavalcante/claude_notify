@@ -21,7 +21,9 @@ config :claude_notify,
     max_page_bytes: 12_000,
     max_search_results: 8,
     max_search_snippet_bytes: 700,
-    max_briefing_bytes: 6_000
+    max_briefing_bytes: 6_000,
+    conversation_max_pending: 10,
+    conversation_max_prompt_bytes: 8_000
   },
   claude_chrome_enabled: false,
   keep_awake_while_working: true,

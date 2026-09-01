@@ -215,6 +215,37 @@ defmodule ClaudeNotify.JobReconcilerTest do
       assert Enum.any?(remaining, &(&1.path == worktree.path))
     end
 
+    test "an older completed turn cannot sweep a worktree shared with a newer chat turn", %{
+      repo_path: repo_path,
+      store: store,
+      registry: registry
+    } do
+      {:ok, first} = JobStore.create(store, job_attrs())
+      {:ok, worktree} = WorktreeManager.create(repo_path, to_string(first.id), "chat")
+
+      {:ok, _} =
+        JobStore.update(store, first.id, %{
+          worktree_path: worktree.path,
+          branch: worktree.branch
+        })
+
+      {:ok, _} = JobStore.update_status(store, first.id, :running, %{})
+      {:ok, _} = JobStore.update_status(store, first.id, :completed, %{})
+
+      {:ok, second} =
+        JobStore.create(store, job_attrs(%{parent_job_id: first.id}))
+
+      {:ok, _} =
+        JobStore.update(store, second.id, %{
+          worktree_path: worktree.path,
+          branch: worktree.branch
+        })
+
+      assert :ok = reconcile(store, registry, retention_seconds: 0)
+      assert {:ok, remaining} = WorktreeManager.list(repo_path)
+      assert Enum.any?(remaining, &(&1.path == worktree.path))
+    end
+
     test "gracefully skips sweeping a job whose project is no longer registered", %{store: store} do
       {:ok, job} =
         JobStore.create(

@@ -62,6 +62,12 @@ if config_env() != :test do
         Path.join([System.user_home!(), ".claude_notify", "handoffs.dat"])
       )
       |> Path.expand(),
+    conversation_store_path:
+      System.get_env(
+        "CLAUDE_NOTIFY_CONVERSATION_STORE_PATH",
+        Path.join([System.user_home!(), ".claude_notify", "conversations.dat"])
+      )
+      |> Path.expand(),
     memory_pages_root:
       System.get_env(
         "CLAUDE_NOTIFY_MEMORY_PAGES_ROOT",
@@ -93,7 +99,11 @@ if config_env() != :test do
       max_search_snippet_bytes:
         parse_int.(System.get_env("CLAUDE_NOTIFY_MEMORY_MAX_SNIPPET_BYTES"), 700),
       max_briefing_bytes:
-        parse_int.(System.get_env("CLAUDE_NOTIFY_MEMORY_MAX_BRIEFING_BYTES"), 6_000)
+        parse_int.(System.get_env("CLAUDE_NOTIFY_MEMORY_MAX_BRIEFING_BYTES"), 6_000),
+      conversation_max_pending:
+        parse_int.(System.get_env("CLAUDE_NOTIFY_CONVERSATION_MAX_PENDING"), 10),
+      conversation_max_prompt_bytes:
+        parse_int.(System.get_env("CLAUDE_NOTIFY_CONVERSATION_MAX_PROMPT_BYTES"), 8_000)
     },
     preview: %{
       default_provider: System.get_env("CLAUDE_NOTIFY_PREVIEW_PROVIDER", "auto"),
