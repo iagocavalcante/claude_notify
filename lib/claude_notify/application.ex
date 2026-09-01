@@ -11,6 +11,7 @@ defmodule ClaudeNotify.Application do
     children =
       [
         ClaudeNotify.ProjectScope,
+        ClaudeNotify.ReplayCache,
         ClaudeNotify.MemoryStore,
         ClaudeNotify.HandoffStore,
         ClaudeNotify.MemoryPages,

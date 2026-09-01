@@ -84,6 +84,7 @@ defmodule ClaudeNotify.JobReconcilerTest do
 
       assert_received {:telegram_edit, 111, text}
       assert text =~ "interrupted"
+      assert text =~ "\\#"
       assert_received {:telegram_edit, 222, ^text}
     end
 
@@ -98,6 +99,7 @@ defmodule ClaudeNotify.JobReconcilerTest do
       refute_received {:telegram_edit, _, _}
       assert_received {:telegram_send, summary}
       assert summary =~ "interrupted"
+      assert summary =~ "\\-"
     end
 
     test "queued and already-terminal jobs are left untouched", %{

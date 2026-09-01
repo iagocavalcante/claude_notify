@@ -28,7 +28,7 @@ defmodule ClaudeNotify.JobReconciler do
 
   require Logger
 
-  alias ClaudeNotify.{JobStore, ProjectRegistry, Telegram, WorktreeManager}
+  alias ClaudeNotify.{JobStore, MessageFormatter, ProjectRegistry, Telegram, WorktreeManager}
   alias ClaudeNotify.WorktreeManager.Worktree
 
   @default_retention_seconds 60 * 60 * 24 * 7
@@ -103,6 +103,7 @@ defmodule ClaudeNotify.JobReconciler do
   defp notify_interrupted(telegram, job) do
     text =
       "Job ##{job.id} (#{job.project}) was interrupted by an app restart and is now marked failed."
+      |> MessageFormatter.escape_full()
 
     Enum.each(job.telegram_message_ids, fn message_id ->
       case telegram.edit_message_text(message_id, text) do
@@ -198,7 +199,11 @@ defmodule ClaudeNotify.JobReconciler do
   defp report_summary(_telegram, [], [], []), do: :ok
 
   defp report_summary(telegram, interrupted, orphans, swept) do
-    telegram.send_message(summary_text(interrupted, orphans, swept))
+    interrupted
+    |> summary_text(orphans, swept)
+    |> MessageFormatter.escape_full()
+    |> telegram.send_message()
+
     :ok
   end
 

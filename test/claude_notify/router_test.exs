@@ -128,6 +128,26 @@ defmodule ClaudeNotify.RouterTest do
     assert second_conn.status == 403
   end
 
+  test "replay cache has one supervised owner under concurrent first requests" do
+    owner = Process.whereis(ReplayCache)
+
+    assert is_pid(owner)
+    assert :ets.info(:claude_notify_replay_cache, :owner) == owner
+
+    results =
+      1..32
+      |> Task.async_stream(
+        fn _ -> ReplayCache.check_and_put("concurrent-request", 60) end,
+        max_concurrency: 32,
+        ordered: false
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.count(results, &(&1 == :ok)) == 1
+    assert Enum.count(results, &(&1 == :replay)) == 31
+    assert Process.alive?(owner)
+  end
+
   test "POST /api/context authenticates, claims cross-engine context, and retries idempotently",
        %{
          tmp_dir: tmp_dir
