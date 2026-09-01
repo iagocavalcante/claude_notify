@@ -4,11 +4,11 @@ Elixir app that sends interactive Telegram notifications for Claude Code and Cod
 
 ## Features
 
-- **Quiet mode** — ~7 messages per session instead of 50+; no per-tool spam
+- **Meaningful live chat** — assistant commentary and final answers appear as they are produced, while raw per-tool noise stays in one edit-in-place activity card
 - **Edit-in-place activity** — a single message is updated silently showing what the agent is currently doing (tool name, file paths)
 - **Consolidated diffs** — `git diff` shown inline before permission prompts and at session end so you see exactly what changed
 - **Reply-to-session** — reply to any message to send text to that session's terminal (no need to `/select` first)
-- **Compact session lifecycle** — minimal start/end messages with project name and session ID
+- **Restart-safe terminal companion** — the selected Claude/Codex terminal, transcript cursor, reply routing, and bounded recent chat survive bot restarts
 - **Interactive approvals** — respond to permission prompts with Yes / No / Yes (don't ask) / Esc directly from Telegram
 - **Numbered option support** — for multi-choice prompts, choose options `1..9` from inline buttons
 - **Safer terminal injection** — text input is sent via clipboard paste with TTY validation
@@ -144,6 +144,7 @@ This table also drives Telegram's native "/" command menu, which self-registers 
 | `/agent [claude\|codex]` | Choose the agent for the current project chat |
 | `/fresh` | Start a fresh conversation and worktree in the selected project |
 | `/sessions` | List and select terminal sessions, including idle |
+| `/history [count]` | Show up to 30 recent user/assistant messages from the selected terminal session |
 | `/approve` | Send Yes to the selected session |
 | `/cancel` | Send Escape to the selected session (bare, no id) |
 | `/dashboard` | Show Claude Code and Codex terminal sessions and jobs |
@@ -159,7 +160,9 @@ This table also drives Telegram's native "/" command menu, which self-registers 
 | `/unpreview <preview-id>` | Stop a preview and remove its provider route/resources |
 | `/help` | Show available commands |
 
-Reply to any terminal message to send text to that terminal session. If only one session is active, it is auto-selected. Standalone `yes`, `no`, `yes!`, `esc`, or a digit from `1` to `9` uses the same direct response keystroke as the matching permission button.
+Reply to any terminal message to send text to that terminal session. Selecting or replying to a terminal makes it the persistent destination for that Telegram chat, including after Claude Notify restarts. If only one session is open, it is auto-selected. A successful Telegram prompt is not echoed by the bot; assistant messages reply to the original Telegram message. Standalone `yes`, `no`, `yes!`, `esc`, or a digit from `1` to `9` uses the same direct response keystroke as the matching permission button.
+
+Already-running Claude Code and Codex terminals do not need to be relaunched. Use `/sessions` once, select the existing terminal, and continue chatting. At the next lifecycle hook Claude Notify attaches to the transcript without replaying the old conversation, then forwards newly written assistant commentary and answers incrementally. `/history` shows the bounded chat captured since attachment.
 
 Registered bot commands in the table above are handled by Claude Notify. Every other slash command is forwarded verbatim to the selected destination, so project skills such as `/post-shorts make three variants` work like they do in Claude Code. A selected terminal session receives the text in its existing Terminal.app tab. A selected project behaves as a durable chat: the first message creates an isolated dispatcher workspace, later messages resume it, and follow-ups sent while the agent is busy run sequentially from a bounded durable queue.
 
@@ -654,13 +657,13 @@ This covers the hook → Telegram → terminal-injection pipeline. For the job d
 | `Router` | Plug HTTP server — receives hook events on `POST /api/events` and signed startup claims on `POST /api/context` |
 | `EventAuth` | Verifies webhook timestamp + HMAC signature and replay protection |
 | `EventHandler` | Routes events to session store and Telegram |
-| `SessionStore` | GenServer tracking active sessions (ID, working dir, TTY path, transcript path) |
+| `SessionStore` | Persistent GenServer tracking terminal metadata, Telegram bindings, transcript cursors, reply routing, and bounded chat history |
 | `Telegram` | Telegram Bot API client (send messages, inline keyboards, long polling) |
 | `TelegramPoller` | GenServer polling `getUpdates`, validating `chat_id`, and handling buttons/text commands |
 | `ConversationStore` | Persists project-chat selection, active job/worktree chain, and bounded queued turns |
 | `TerminalInjector` | AppleScript injection into Terminal.app by TTY path (clipboard paste for text input) |
 | `MessageFormatter` | MarkdownV2 formatted messages with emoji tool icons |
-| `TranscriptReader` | Reads Claude Code JSONL transcripts for last assistant response; Codex supplies its response in the Stop event |
+| `TranscriptReader` | Incrementally tails Claude Code and Codex JSONL transcripts from restart-safe byte cursors; Stop payloads remain the compatibility fallback |
 | `PathSafety` | Sanitizes externally provided paths (e.g., transcript paths) |
 | `HandoffStore` / `StartupContext` | Persist typed checkpoints and claim/render bounded untrusted context |
 | `MemoryPages` | Writes project Markdown pages and owns the rebuildable SQLite FTS5 index |

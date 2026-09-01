@@ -100,6 +100,7 @@ defmodule ClaudeNotify.TelegramPoller do
     {"agent", "Choose Claude or Codex for the current chat"},
     {"fresh", "Start a fresh conversation in the selected project"},
     {"sessions", "List and select terminal sessions, including idle"},
+    {"history", "Show recent chat from the selected terminal session"},
     {"approve", "Send Yes to the selected session"},
     {"cancel", "Send Escape to the selected session, or cancel a job by id"},
     {"dashboard", "Show Claude Code and Codex sessions and jobs"},
@@ -438,12 +439,18 @@ defmodule ClaudeNotify.TelegramPoller do
 
       state
     else
-      acknowledge_inbound(chat_id, message)
+      acknowledge_inbound(chat_id, message, state.telegram)
 
       case message do
         %{"text" => text, "reply_to_message" => %{"message_id" => reply_mid}}
         when is_binary(text) and text != "" ->
-          handle_reply_to(chat_id, String.trim(text), reply_mid, state)
+          handle_reply_to(
+            chat_id,
+            String.trim(text),
+            reply_mid,
+            message["message_id"],
+            state
+          )
 
         %{"photo" => photos} when is_list(photos) and photos != [] ->
           handle_photo(chat_id, message, state)
@@ -452,7 +459,7 @@ defmodule ClaudeNotify.TelegramPoller do
           handle_document(chat_id, message, state)
 
         %{"text" => text} when is_binary(text) ->
-          handle_text_command(chat_id, text, state)
+          handle_text_command(chat_id, text, state, message["message_id"])
 
         _ ->
           Telegram.send_message(
@@ -468,13 +475,13 @@ defmodule ClaudeNotify.TelegramPoller do
 
   # Fires typing indicator + optional ack reaction on every gated inbound
   # message. Telegram displays "typing…" for ~5s or until our next message.
-  defp acknowledge_inbound(chat_id, message) do
-    Telegram.send_chat_action(chat_id, "typing")
+  defp acknowledge_inbound(chat_id, message, telegram) do
+    telegram.send_chat_action(chat_id, "typing")
 
     case Application.get_env(:claude_notify, :telegram_ack_reaction) do
       emoji when is_binary(emoji) and emoji != "" ->
         case message["message_id"] do
-          mid when is_integer(mid) -> Telegram.set_message_reaction(mid, emoji)
+          mid when is_integer(mid) -> telegram.set_message_reaction(mid, emoji)
           _ -> :ok
         end
 
@@ -483,22 +490,24 @@ defmodule ClaudeNotify.TelegramPoller do
     end
   end
 
-  defp handle_reply_to(chat_id, text, reply_message_id, state) do
+  defp handle_reply_to(chat_id, text, reply_message_id, inbound_message_id, state) do
     if String.starts_with?(String.trim(text), "/memory") do
       handle_memory_command(chat_id, String.trim(text), state, reply_message_id)
     else
       case SessionStore.lookup_session_by_message(reply_message_id) do
         nil ->
           # Not a tracked terminal-session message - try a job message next.
-          handle_reply_to_job(chat_id, text, reply_message_id, state)
+          handle_reply_to_job(chat_id, text, reply_message_id, inbound_message_id, state)
 
         session_id ->
           session = SessionStore.get_session(session_id)
 
           if session do
+            state = bind_terminal_chat(state, chat_id, session_id)
+
             case shortcut_response(text) do
               nil ->
-                inject_reply_text(text, session)
+                inject_reply_text(text, session, inbound_message_id, state)
 
               response ->
                 if inject_response(state, session_id, response) == :ok do
@@ -508,12 +517,12 @@ defmodule ClaudeNotify.TelegramPoller do
                     MessageFormatter.escape_full("#{response_label(response)} (#{short})")
                   )
                 end
-            end
 
-            state
+                state
+            end
           else
             # Session expired, fall back to text command
-            handle_text_command(chat_id, text, state)
+            handle_text_command(chat_id, text, state, inbound_message_id)
           end
       end
     end
@@ -521,11 +530,11 @@ defmodule ClaudeNotify.TelegramPoller do
 
   # --- Reply-to-job routing (resume) ---
 
-  defp handle_reply_to_job(chat_id, text, reply_message_id, state) do
+  defp handle_reply_to_job(chat_id, text, reply_message_id, inbound_message_id, state) do
     case find_job_by_message(state.job_store, reply_message_id) do
       nil ->
         # Not a tracked job message either, treat as a regular text command.
-        handle_text_command(chat_id, text, state)
+        handle_text_command(chat_id, text, state, inbound_message_id)
 
       job ->
         continue_or_queue_job(chat_id, job, text, state)
@@ -611,17 +620,24 @@ defmodule ClaudeNotify.TelegramPoller do
     |> put_selected_project(chat_id, new_job.project, engine)
   end
 
-  defp inject_reply_text(text, session) do
+  defp inject_reply_text(text, session, inbound_message_id, state) do
     tty_path = session[:tty_path]
     project = ProjectScope.display_name(session)
+    injector = Map.get(state, :terminal_injector, TerminalInjector)
 
-    case TerminalInjector.send_text(tty_path, text) do
+    case injector.send_text(tty_path, text) do
       :ok ->
-        Telegram.send_message(MessageFormatter.escape_full("✓ Sent to #{project}"))
+        mark_terminal_prompt(session.id, text, inbound_message_id)
+        state
 
       {:error, reason} ->
         Logger.warning("TelegramPoller: reply inject failed: #{inspect(reason)}")
-        Telegram.send_message(MessageFormatter.escape_full("Failed to send to #{project}"))
+
+        state.telegram.send_message_with_retry(
+          MessageFormatter.escape_full("Failed to send to #{project}")
+        )
+
+        state
     end
   end
 
@@ -769,7 +785,7 @@ defmodule ClaudeNotify.TelegramPoller do
     end
   end
 
-  defp handle_text_command(chat_id, text, state) do
+  defp handle_text_command(chat_id, text, state, inbound_message_id) do
     trimmed = String.trim(text)
 
     cond do
@@ -797,6 +813,9 @@ defmodule ClaudeNotify.TelegramPoller do
       String.starts_with?(trimmed, "/sessions") or String.starts_with?(trimmed, "/select") ->
         send_session_list(chat_id)
         state
+
+      String.starts_with?(trimmed, "/history") ->
+        handle_history_command(chat_id, trimmed, state)
 
       String.starts_with?(trimmed, "/switch") or trimmed == "/s" ->
         send_session_list(chat_id)
@@ -883,11 +902,11 @@ defmodule ClaudeNotify.TelegramPoller do
         # Bot-owned commands are handled above. Everything else belongs to
         # the selected Claude/Codex surface, including project skills such as
         # /post-shorts and built-in interactive commands such as /chrome.
-        handle_text_input(chat_id, trimmed, state)
+        handle_text_input(chat_id, trimmed, state, inbound_message_id)
 
       true ->
         case shortcut_response(trimmed) do
-          nil -> handle_text_input(chat_id, trimmed, state)
+          nil -> handle_text_input(chat_id, trimmed, state, inbound_message_id)
           response -> handle_shortcut_command(chat_id, response, state)
         end
     end
@@ -915,7 +934,10 @@ defmodule ClaudeNotify.TelegramPoller do
 
   # Auto-selects the only known terminal session, including an idle one.
   defp resolve_session(chat_id, state) do
-    case Map.get(state.selected_sessions, chat_id) do
+    selected_session =
+      Map.get(state.selected_sessions, chat_id) || SessionStore.bound_session(chat_id)
+
+    case selected_session do
       nil ->
         sessions =
           SessionStore.terminal_sessions()
@@ -924,8 +946,8 @@ defmodule ClaudeNotify.TelegramPoller do
         case sessions do
           [{id, _}] ->
             # Auto-select the only open terminal session, even when idle.
-            new_selected = Map.put(state.selected_sessions, chat_id, id)
-            {:ok, id, %{state | selected_sessions: new_selected}}
+            state = bind_terminal_chat(state, chat_id, id)
+            {:ok, id, state}
 
           [] ->
             Telegram.send_message(
@@ -954,9 +976,11 @@ defmodule ClaudeNotify.TelegramPoller do
             )
 
             new_selected = Map.delete(state.selected_sessions, chat_id)
+            SessionStore.unbind_chat(chat_id)
             {:error, :no_session, %{state | selected_sessions: new_selected}}
 
           _session ->
+            state = bind_terminal_chat(state, chat_id, session_id)
             {:ok, session_id, state}
         end
     end
@@ -986,6 +1010,7 @@ defmodule ClaudeNotify.TelegramPoller do
           |> Enum.join("\n")
 
         Telegram.send_message(text)
+        SessionStore.bind_chat(chat_id, session_id)
         new_selected = Map.put(state.selected_sessions, chat_id, session_id)
 
         state
@@ -999,18 +1024,18 @@ defmodule ClaudeNotify.TelegramPoller do
 
   # --- Text injection ---
 
-  defp handle_text_input(chat_id, text, state) do
-    selected_session = Map.get(Map.get(state, :selected_sessions, %{}), chat_id)
+  defp handle_text_input(chat_id, text, state, inbound_message_id) do
+    selected_session = selected_terminal_session(state, chat_id)
 
     cond do
       is_binary(selected_session) and SessionStore.get_session(selected_session) ->
-        handle_terminal_text_input(chat_id, text, state)
+        handle_terminal_text_input(chat_id, text, inbound_message_id, state)
 
       project = selected_project(state, chat_id) ->
         handle_conversation_turn(chat_id, selected_engine(state, chat_id), project, text, state)
 
       true ->
-        handle_terminal_text_input(chat_id, text, state)
+        handle_terminal_text_input(chat_id, text, inbound_message_id, state)
     end
   end
 
@@ -1362,6 +1387,8 @@ defmodule ClaudeNotify.TelegramPoller do
   end
 
   defp put_selected_project(state, chat_id, project, engine) do
+    SessionStore.unbind_chat(chat_id)
+
     state
     |> Map.put(
       :selected_projects,
@@ -1377,24 +1404,22 @@ defmodule ClaudeNotify.TelegramPoller do
     )
   end
 
-  defp handle_terminal_text_input(chat_id, text, state) do
+  defp handle_terminal_text_input(chat_id, text, inbound_message_id, state) do
     case resolve_session(chat_id, state) do
       {:ok, session_id, state} ->
         session = SessionStore.get_session(session_id)
         tty_path = session[:tty_path]
         short_id = String.slice(session_id, 0, 8)
-        truncated = String.slice(text, 0, 100)
+        injector = Map.get(state, :terminal_injector, TerminalInjector)
 
-        case TerminalInjector.send_text(tty_path, text) do
+        case injector.send_text(tty_path, text) do
           :ok ->
-            Telegram.send_message(
-              MessageFormatter.escape_full("Sent to #{short_id}: #{truncated}")
-            )
+            mark_terminal_prompt(session_id, text, inbound_message_id)
 
           {:error, reason} ->
             Logger.warning("TelegramPoller: send_text failed: #{inspect(reason)}")
 
-            Telegram.send_message(
+            state.telegram.send_message_with_retry(
               MessageFormatter.escape_full(
                 "Failed to send to #{short_id} (tty: #{tty_path || "none"}): #{inspect(reason)}"
               )
@@ -1447,6 +1472,87 @@ defmodule ClaudeNotify.TelegramPoller do
 
       Telegram.api_post_public("sendMessage", body)
     end
+  end
+
+  defp handle_history_command(chat_id, command, state) do
+    limit = history_limit(command)
+
+    case resolve_session(chat_id, state) do
+      {:ok, session_id, state} ->
+        session = SessionStore.get_session(session_id)
+        entries = SessionStore.history(session_id, limit)
+        project = ProjectScope.display_name(session)
+        engine = engine_display_name(session[:engine] || "claude")
+        short_id = String.slice(session_id, 0, 8)
+
+        body =
+          case entries do
+            [] ->
+              "<i>No captured chat yet. New messages will appear here as this session continues.</i>"
+
+            _ ->
+              entries
+              |> Enum.map(&history_entry_html(&1, engine))
+              |> Enum.join("\n\n")
+          end
+
+        text =
+          "<b>#{MessageFormatter.html_escape_public(project)} · #{MessageFormatter.html_escape_public(short_id)}</b>\n\n" <>
+            body
+
+        state.telegram.send_html_with_retry(text)
+        state
+
+      {:error, :no_session, state} ->
+        state
+    end
+  end
+
+  defp history_limit(command) do
+    case command |> String.split(~r/\s+/, parts: 2) |> List.last() |> Integer.parse() do
+      {limit, ""} when limit > 0 -> min(limit, 30)
+      _ -> 12
+    end
+  end
+
+  defp history_entry_html(%{role: role, text: text}, engine) do
+    label =
+      case role do
+        :user -> "You"
+        :question -> "#{engine} · question"
+        :assistant -> engine
+      end
+
+    "<b>#{MessageFormatter.html_escape_public(label)}</b>\n" <>
+      MessageFormatter.agent_markdown_html(text)
+  end
+
+  defp bind_terminal_chat(state, chat_id, session_id) do
+    SessionStore.bind_chat(chat_id, session_id)
+
+    state
+    |> Map.put(
+      :selected_sessions,
+      Map.put(Map.get(state, :selected_sessions, %{}), chat_id, session_id)
+    )
+    |> clear_selected_project(chat_id)
+  end
+
+  defp clear_selected_project(%{selected_projects: projects} = state, chat_id) do
+    %{state | selected_projects: Map.delete(projects, chat_id)}
+  end
+
+  defp clear_selected_project(state, _chat_id), do: state
+
+  defp mark_terminal_prompt(session_id, text, message_id) when is_integer(message_id) do
+    SessionStore.mark_telegram_prompt(session_id, text, message_id)
+  end
+
+  defp mark_terminal_prompt(_session_id, _text, _message_id), do: :ok
+
+  defp selected_terminal_session(state, chat_id) do
+    Map.get(Map.get(state, :selected_sessions, %{}), chat_id) ||
+      SessionStore.bound_session(chat_id)
   end
 
   defp send_help(chat_id) do
@@ -1590,7 +1696,7 @@ defmodule ClaudeNotify.TelegramPoller do
   end
 
   defp selected_memory_scope(chat_id, state) do
-    selected_session = Map.get(state.selected_sessions, chat_id)
+    selected_session = selected_terminal_session(state, chat_id)
 
     session_scope =
       case selected_session && SessionStore.get_session(selected_session) do
@@ -2949,7 +3055,7 @@ defmodule ClaudeNotify.TelegramPoller do
       SessionStore.terminal_sessions()
       |> map_size()
 
-    selected = Map.get(state.selected_sessions, chat_id)
+    selected = selected_terminal_session(state, chat_id)
     selected_project = selected_project(state, chat_id)
     selected_engine = selected_engine(state, chat_id)
     conversation = active_conversation(state, chat_id)

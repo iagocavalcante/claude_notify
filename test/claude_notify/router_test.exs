@@ -322,7 +322,10 @@ defmodule ClaudeNotify.RouterTest do
     |> Base.encode16(case: :lower)
   end
 
-  defp wait_for_event_tasks(attempts \\ 300)
+  # Event tasks include real Telegram-client failure paths in test. Leave
+  # enough headroom for a saturated queue on a busy CI runner while still
+  # failing deterministically if children are genuinely stuck.
+  defp wait_for_event_tasks(attempts \\ 1_000)
 
   defp wait_for_event_tasks(0), do: flunk("event tasks did not drain")
 

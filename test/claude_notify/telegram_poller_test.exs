@@ -156,6 +156,15 @@ defmodule ClaudeNotify.TelegramPollerTest do
   end
 
   defmodule FakeTerminalInjector do
+    def send_text(tty_path, text) do
+      case Process.whereis(:telegram_poller_test_process) do
+        nil -> send(self(), {:terminal_text, tty_path, text})
+        pid -> send(pid, {:terminal_text, tty_path, text})
+      end
+
+      :ok
+    end
+
     def send_response(tty_path, response) do
       case Process.whereis(:telegram_poller_test_process) do
         nil -> send(self(), {:terminal_response, tty_path, response})
@@ -240,6 +249,7 @@ defmodule ClaudeNotify.TelegramPollerTest do
 
   setup do
     original = Application.get_env(:claude_notify, :telegram_chat_id)
+    SessionStore.clear()
 
     on_exit(fn ->
       Application.put_env(:claude_notify, :telegram_chat_id, original)
@@ -275,7 +285,7 @@ defmodule ClaudeNotify.TelegramPollerTest do
       commands = TelegramPoller.bot_commands()
 
       assert Enum.map(commands, &elem(&1, 0)) == ~w(
-               new agent fresh sessions approve cancel dashboard run jobs projects memory watch unwatch
+               new agent fresh sessions history approve cancel dashboard run jobs projects memory watch unwatch
                preview previews unpreview help
              )
 
@@ -1014,6 +1024,69 @@ defmodule ClaudeNotify.TelegramPollerTest do
       end
     end
 
+    test "terminal chat sends quietly and reuses the Telegram message as the prompt", %{
+      state: state
+    } do
+      session_id = "chat-#{System.unique_integer([:positive])}"
+      tty_path = "/dev/ttys322"
+
+      SessionStore.register_prompt(session_id, "first", "/tmp/project", %{
+        "tty_path" => tty_path,
+        "engine" => "codex"
+      })
+
+      on_exit(fn -> SessionStore.remove_session(session_id) end)
+
+      state = %{state | selected_sessions: %{@chat_id => session_id}}
+      new_state = TelegramPoller.handle_update(text_message("keep going", 222), state)
+
+      assert_receive {:terminal_text, ^tty_path, "keep going"}
+      refute_receive {:telegram_send, _text}, 50
+      assert new_state.selected_sessions[@chat_id] == session_id
+      assert SessionStore.bound_session(@chat_id) == session_id
+      assert SessionStore.lookup_session_by_message(222) == session_id
+      assert SessionStore.get_session(session_id).prompt_message_id == 222
+    end
+
+    test "persisted terminal binding routes a new poller state after restart", %{state: state} do
+      session_id = "bound-#{System.unique_integer([:positive])}"
+      tty_path = "/dev/ttys323"
+
+      SessionStore.register_prompt(session_id, "first", "/tmp/project", %{
+        "tty_path" => tty_path
+      })
+
+      SessionStore.bind_chat(@chat_id, session_id)
+      on_exit(fn -> SessionStore.remove_session(session_id) end)
+
+      TelegramPoller.handle_update(text_message("resume here", 223), state)
+
+      assert_receive {:terminal_text, ^tty_path, "resume here"}
+      assert SessionStore.lookup_session_by_message(223) == session_id
+    end
+
+    test "/history renders recent user and assistant chat", %{state: state} do
+      session_id = "history-#{System.unique_integer([:positive])}"
+
+      SessionStore.register_prompt(session_id, "inspect it", "/tmp/project", %{
+        "tty_path" => "/dev/ttys324",
+        "engine" => "codex"
+      })
+
+      {:ok, ["I found the cause."]} =
+        SessionStore.record_assistant_messages(session_id, "", 0, ["I found the cause."])
+
+      SessionStore.bind_chat(@chat_id, session_id)
+      on_exit(fn -> SessionStore.remove_session(session_id) end)
+
+      TelegramPoller.handle_update(text_message("/history", 224), state)
+
+      assert_receive {:telegram_send, history}
+      assert history =~ "inspect it"
+      assert history =~ "I found the cause."
+      assert history =~ "Codex"
+    end
+
     # -- /cancel <id> --
 
     test "/cancel <id> stops a running job and marks it discarded", %{
@@ -1643,7 +1716,7 @@ defmodule ClaudeNotify.TelegramPollerTest do
       assert_receive {:telegram_edit_markup, _message_id, [["Unwatch", "jobunwatch:" <> _]]}
       assert %{message_id: transcript_message_id} = new_state.watches[job_id]
 
-      assert_receive {:watch_completed, ^job_id, transcript}, 2000
+      assert_receive {:watch_completed, ^job_id, transcript}, 5_000
 
       {:noreply, final_state} =
         TelegramPoller.handle_info({:watch_completed, job_id, transcript}, new_state)

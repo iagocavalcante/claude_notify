@@ -19,6 +19,7 @@ out = {
     "session_id": d.get("session_id", "unknown"),
     "working_dir": d.get("cwd", "unknown"),
     "source": d.get("source", "startup"),
+    "transcript_path": d.get("transcript_path", ""),
     "term_session_id": sys.argv[1],
     "tty_path": sys.argv[2]
 }

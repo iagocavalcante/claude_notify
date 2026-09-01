@@ -50,7 +50,13 @@ config :claude_notify,
     }
   },
   webhook_max_skew_seconds: 300,
-  transcript_allowed_roots: ["/tmp", Path.join(System.user_home!(), ".claude")],
+  transcript_allowed_roots: [
+    "/tmp",
+    Path.join(System.user_home!(), ".claude"),
+    Path.join(System.user_home!(), ".codex")
+  ],
+  terminal_history_max_entries: 60,
+  terminal_history_max_entry_bytes: 6_000,
   # Git repositories below these directories are discovered automatically and
   # become selectable from Telegram. Override with
   # CLAUDE_NOTIFY_WORKSPACE_ROOTS (comma-separated absolute paths).

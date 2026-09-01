@@ -19,12 +19,13 @@ defmodule ClaudeNotify.EventHandler do
 
     opts =
       params
-      |> Map.take(["tty_path", "term_session_id", "engine"])
+      |> Map.take(["tty_path", "term_session_id", "transcript_path", "engine"])
       |> attach_project_scope(session_id, working_dir)
       |> sanitize_opts()
 
     update_session_tty(session_id, working_dir, opts)
     SessionStore.update_status(session_id, :idle, %{session_source: params["source"]})
+    checkpoint_transcript(session_id, params["transcript_path"])
     MemoryCapture.terminal(params, SessionStore.get_session(session_id))
     Dashboard.refresh()
     :ok
@@ -37,7 +38,7 @@ defmodule ClaudeNotify.EventHandler do
 
     opts =
       params
-      |> Map.take(["tty_path", "term_session_id", "engine"])
+      |> Map.take(["tty_path", "term_session_id", "transcript_path", "engine"])
       |> attach_project_scope(session_id, working_dir)
       |> sanitize_opts()
 
@@ -55,8 +56,10 @@ defmodule ClaudeNotify.EventHandler do
         :ok
     end
 
-    # Send prompt echo on every prompt (not just new sessions)
+    # A Telegram-authored prompt is already visible in the chat. Claim it as
+    # this turn's reply target instead of sending a duplicate bot echo.
     send_prompt_echo(session_id, prompt)
+    checkpoint_transcript(session_id, params["transcript_path"])
   end
 
   def handle_event(%{"event" => "stop"} = params) do
@@ -85,8 +88,17 @@ defmodule ClaudeNotify.EventHandler do
     # Resolve transcript path: from params or from session store
     resolved_transcript = resolve_transcript_path(transcript_path, session_id)
 
+    transcript_messages = drain_transcript(session_id, resolved_transcript)
+
+    fallback_messages =
+      deliver_assistant_candidates(session_id, [nonempty(params["assistant_response"])])
+
+    delivered_messages = transcript_messages ++ fallback_messages
+
     assistant_response =
-      resolve_assistant_response(params["assistant_response"], resolved_transcript)
+      nonempty(params["assistant_response"]) ||
+        List.last(transcript_messages) ||
+        latest_assistant_history(session_id)
 
     session_before_stop = SessionStore.get_session(session_id)
 
@@ -96,14 +108,13 @@ defmodule ClaudeNotify.EventHandler do
 
     Continuity.terminal(session_before_stop, :turn_stop)
 
-    # Codex includes the final response directly in Stop. Claude falls back to
-    # its transcript, preserving compatibility with older hook payloads.
-    send_agent_response(assistant_response, nil, session_id)
-
     {_action, session} = SessionStore.register_stop(session_id, stop_reason)
     maybe_send_diff(git_diff, session_id)
-    message = MessageFormatter.session_stopped_compact(session)
-    notify_and_register(message, session_id)
+
+    if delivered_messages == [] do
+      message = MessageFormatter.session_stopped_compact(session)
+      notify_and_register(message, session_id)
+    end
 
     Dashboard.refresh()
   end
@@ -128,13 +139,14 @@ defmodule ClaudeNotify.EventHandler do
 
     opts =
       params
-      |> Map.take(["tty_path", "term_session_id", "engine"])
+      |> Map.take(["tty_path", "term_session_id", "transcript_path", "engine"])
       |> attach_project_scope(session_id, working_dir)
       |> sanitize_opts()
 
     update_session_tty(session_id, working_dir, opts)
     SessionStore.update_status(session_id, :active, %{last_tool: tool_name})
     MemoryCapture.terminal(params, SessionStore.get_session(session_id))
+    drain_transcript(session_id, params["transcript_path"])
 
     # React 🔥 on prompt message to show Claude is working
     maybe_react_tool(session_id)
@@ -160,15 +172,17 @@ defmodule ClaudeNotify.EventHandler do
 
     opts =
       params
-      |> Map.take(["tty_path", "term_session_id", "engine"])
+      |> Map.take(["tty_path", "term_session_id", "transcript_path", "engine"])
       |> attach_project_scope(session_id, working_dir)
       |> sanitize_opts()
 
     update_session_tty(session_id, working_dir, opts)
     MemoryCapture.terminal(params, SessionStore.get_session(session_id))
+    drain_transcript(session_id, params["transcript_path"])
 
     ActivityTracker.pause_session(session_id)
     SessionStore.update_status(session_id, :waiting_input)
+    SessionStore.append_history(session_id, :question, message)
 
     maybe_send_diff(git_diff, session_id)
 
@@ -309,17 +323,24 @@ defmodule ClaudeNotify.EventHandler do
   end
 
   defp send_prompt_echo(session_id, prompt) when is_binary(prompt) and prompt != "" do
-    message = MessageFormatter.prompt_echo(prompt)
-
-    case Telegram.send_message_with_retry(message) do
-      {:ok, %{"result" => %{"message_id" => mid}}} ->
-        SessionStore.register_message(mid, session_id)
-        SessionStore.set_prompt_message_id(session_id, mid)
+    case SessionStore.claim_telegram_prompt(session_id, prompt) do
+      {:ok, mid} ->
         Telegram.set_message_reaction(mid, "👀")
         :ok
 
-      _ ->
-        :ok
+      :none ->
+        message = MessageFormatter.prompt_echo(prompt)
+
+        case Telegram.send_message_with_retry(message) do
+          {:ok, %{"result" => %{"message_id" => mid}}} ->
+            SessionStore.register_message(mid, session_id)
+            SessionStore.set_prompt_message_id(session_id, mid)
+            Telegram.set_message_reaction(mid, "👀")
+            :ok
+
+          _ ->
+            :ok
+        end
     end
   end
 
@@ -357,35 +378,89 @@ defmodule ClaudeNotify.EventHandler do
     end
   end
 
-  defp send_agent_response(text, _transcript_path, session_id)
-       when is_binary(text) and text != "" do
-    notify_agent_response(text, session_id)
-  end
-
-  defp send_agent_response(_text, nil, _session_id), do: :ok
-
-  defp send_agent_response(_text, transcript_path, session_id) do
-    case ClaudeNotify.TranscriptReader.last_assistant_message(transcript_path) do
-      {:ok, text} ->
-        notify_agent_response(text, session_id)
-
-      :error ->
+  defp checkpoint_transcript(session_id, transcript_path) do
+    case resolve_transcript_path(transcript_path, session_id) do
+      nil ->
         :ok
+
+      path ->
+        case ClaudeNotify.TranscriptReader.position(path) do
+          {:ok, cursor} -> SessionStore.checkpoint_transcript(session_id, path, cursor)
+          :error -> :ok
+        end
     end
   end
 
-  defp resolve_assistant_response(text, _transcript_path)
-       when is_binary(text) and text != "",
-       do: text
+  defp drain_transcript(session_id, transcript_path) do
+    case resolve_transcript_path(transcript_path, session_id) do
+      nil ->
+        []
 
-  defp resolve_assistant_response(_text, nil), do: nil
+      path ->
+        session = SessionStore.get_session(session_id) || %{}
 
-  defp resolve_assistant_response(_text, transcript_path) do
-    case ClaudeNotify.TranscriptReader.last_assistant_message(transcript_path) do
-      {:ok, text} -> text
-      :error -> nil
+        cursor =
+          if session[:transcript_cursor_path] == path,
+            do: session[:transcript_cursor],
+            else: nil
+
+        case ClaudeNotify.TranscriptReader.assistant_messages_since(path, cursor) do
+          {:ok, messages, next_cursor} ->
+            case SessionStore.record_assistant_messages(
+                   session_id,
+                   path,
+                   next_cursor,
+                   messages
+                 ) do
+              {:ok, accepted} ->
+                Enum.each(accepted, &notify_agent_response(&1, session_id))
+                accepted
+
+              {:error, :not_found} ->
+                []
+            end
+
+          :error ->
+            []
+        end
     end
   end
+
+  defp deliver_assistant_candidates(session_id, candidates) do
+    session = SessionStore.get_session(session_id) || %{}
+    path = session[:transcript_cursor_path] || session[:transcript_path] || ""
+    cursor = session[:transcript_cursor] || 0
+
+    messages = Enum.reject(candidates, &is_nil/1)
+
+    case SessionStore.record_assistant_messages(session_id, path, cursor, messages) do
+      {:ok, accepted} ->
+        Enum.each(accepted, &notify_agent_response(&1, session_id))
+        accepted
+
+      {:error, :not_found} ->
+        []
+    end
+  end
+
+  defp latest_assistant_history(session_id) do
+    session_id
+    |> SessionStore.history(12)
+    |> Enum.reverse()
+    |> Enum.find_value(fn
+      %{role: :assistant, text: text} -> text
+      _entry -> nil
+    end)
+  end
+
+  defp nonempty(text) when is_binary(text) do
+    case String.trim(text) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp nonempty(_text), do: nil
 
   defp notify_agent_response(text, session_id) do
     message = MessageFormatter.agent_response_html(text, session_engine(session_id))

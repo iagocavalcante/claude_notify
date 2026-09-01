@@ -249,6 +249,70 @@ defmodule ClaudeNotify.EventHandlerTest do
     assert session.prompt_count == 2
   end
 
+  test "Telegram-authored prompt keeps its inbound message as the reply target" do
+    SessionStore.register_prompt("telegram-sess", "first", "/tmp/test", %{
+      "tty_path" => "/dev/ttys013"
+    })
+
+    SessionStore.mark_telegram_prompt("telegram-sess", "continue", 501)
+
+    EventHandler.handle_event(%{
+      "event" => "prompt",
+      "session_id" => "telegram-sess",
+      "prompt" => "continue",
+      "working_dir" => "/tmp/test",
+      "tty_path" => "/dev/ttys013"
+    })
+
+    session = SessionStore.get_session("telegram-sess")
+    assert session.prompt_message_id == 501
+    refute Map.has_key?(session, :pending_telegram_prompt)
+  end
+
+  test "tool hooks stream newly appended assistant commentary into session history" do
+    transcript_path =
+      Path.join("/tmp", "stream_transcript_#{System.unique_integer([:positive])}.jsonl")
+
+    File.write!(transcript_path, "")
+
+    EventHandler.handle_event(%{
+      "event" => "prompt",
+      "session_id" => "stream-sess",
+      "prompt" => "inspect the issue",
+      "working_dir" => "/tmp/test",
+      "transcript_path" => transcript_path
+    })
+
+    assistant_msg =
+      Jason.encode!(%{
+        "type" => "response_item",
+        "payload" => %{
+          "type" => "message",
+          "role" => "assistant",
+          "content" => [%{"type" => "output_text", "text" => "I found the failing path."}]
+        }
+      })
+
+    File.write!(transcript_path, assistant_msg <> "\n", [:append])
+
+    EventHandler.handle_event(%{
+      "event" => "tool_use",
+      "engine" => "codex",
+      "session_id" => "stream-sess",
+      "working_dir" => "/tmp/test",
+      "transcript_path" => transcript_path,
+      "tool_name" => "Read",
+      "tool_input" => ~s({"file_path":"lib/foo.ex"}),
+      "tool_output" => ""
+    })
+
+    assert Enum.any?(SessionStore.history("stream-sess"), fn entry ->
+             entry.role == :assistant and entry.text == "I found the failing path."
+           end)
+
+    File.rm(transcript_path)
+  end
+
   test "stop event reads transcript and sends Claude response" do
     transcript_path =
       Path.join("/tmp", "test_transcript_#{System.unique_integer([:positive])}.jsonl")

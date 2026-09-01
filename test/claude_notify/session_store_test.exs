@@ -192,6 +192,48 @@ defmodule ClaudeNotify.SessionStoreTest do
     assert SessionStore.remove_session("sess-1") == :not_found
   end
 
+  test "Telegram prompt claims reuse the inbound message once" do
+    SessionStore.register_prompt("sess-1", "hello", "/tmp/project", %{
+      "tty_path" => "/dev/ttys001"
+    })
+
+    assert :ok = SessionStore.mark_telegram_prompt("sess-1", "continue", 91)
+    assert SessionStore.bound_session(123) == nil
+    assert SessionStore.lookup_session_by_message(91) == "sess-1"
+    assert {:ok, 91} = SessionStore.claim_telegram_prompt("sess-1", "continue")
+    assert :none = SessionStore.claim_telegram_prompt("sess-1", "continue")
+  end
+
+  test "assistant history is bounded and duplicate transcript messages are suppressed" do
+    previous_entries = Application.get_env(:claude_notify, :terminal_history_max_entries)
+    Application.put_env(:claude_notify, :terminal_history_max_entries, 3)
+
+    on_exit(fn ->
+      Application.put_env(:claude_notify, :terminal_history_max_entries, previous_entries)
+    end)
+
+    SessionStore.register_prompt("sess-1", "first", "/tmp/project")
+
+    assert {:ok, ["one", "two"]} =
+             SessionStore.record_assistant_messages("sess-1", "/tmp/chat.jsonl", 10, [
+               "one",
+               "one",
+               "two"
+             ])
+
+    SessionStore.append_history("sess-1", :user, "next")
+
+    assert [
+             %{role: :assistant, text: "one"},
+             %{role: :assistant, text: "two"},
+             %{role: :user, text: "next"}
+           ] = SessionStore.history("sess-1", 10)
+
+    session = SessionStore.get_session("sess-1")
+    assert session.transcript_cursor == 10
+    assert session.transcript_cursor_path == "/tmp/chat.jsonl"
+  end
+
   test "sessions and reply routing survive a store restart" do
     path = Path.join(System.tmp_dir!(), "session-store-#{System.unique_integer([:positive])}.dat")
 
@@ -206,6 +248,16 @@ defmodule ClaudeNotify.SessionStoreTest do
     })
 
     GenServer.cast(store, {:register_message, 77, "persisted"})
+    GenServer.call(store, {:bind_chat, 123_456, "persisted"})
+
+    GenServer.call(store, {
+      :record_assistant_messages,
+      "persisted",
+      "/tmp/chat.jsonl",
+      42,
+      ["still here"]
+    })
+
     GenServer.call(store, {:lookup_message, 0})
     GenServer.stop(store)
 
@@ -216,6 +268,11 @@ defmodule ClaudeNotify.SessionStoreTest do
              GenServer.call(restored, {:get_session, "persisted"})
 
     assert GenServer.call(restored, {:lookup_message, 77}) == "persisted"
+    assert GenServer.call(restored, {:bound_session, 123_456}) == "persisted"
+
+    assert [%{role: :user, text: "hello"}, %{role: :assistant, text: "still here"}] =
+             GenServer.call(restored, {:history, "persisted", 12})
+
     File.rm(path)
   end
 end

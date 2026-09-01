@@ -25,6 +25,7 @@ out = {
     "session_id": d.get("session_id", sys.argv[1]),
     "prompt": d.get("prompt", sys.argv[2])[:500],
     "working_dir": d.get("cwd", sys.argv[3]),
+    "transcript_path": d.get("transcript_path", ""),
     "term_session_id": sys.argv[4],
     "tty_path": sys.argv[5]
 }

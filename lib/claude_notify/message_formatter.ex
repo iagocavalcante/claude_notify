@@ -515,6 +515,9 @@ defmodule ClaudeNotify.MessageFormatter do
   """
   def escape_code_public(text), do: escape_code(text)
 
+  @doc false
+  def html_escape_public(text), do: html_escape(text)
+
   defp bounded_agent_markdown_html(text, max_bytes) do
     source = to_string(text)
     render_bounded_markdown(source, max_bytes, min(String.length(source), 2_800))
