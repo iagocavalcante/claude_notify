@@ -70,6 +70,7 @@ defmodule ClaudeNotify.TelegramPoller do
     JobStore,
     JobSupervisor,
     JobTranscript,
+    MemoryPages,
     PreviewManager,
     ProjectRegistry,
     ProjectScope,
@@ -102,6 +103,7 @@ defmodule ClaudeNotify.TelegramPoller do
     {"run", "Launch a dispatcher job: [claude|codex] <project> <prompt>"},
     {"jobs", "List known dispatcher jobs and their status"},
     {"projects", "Choose a project working directory"},
+    {"memory", "Search or brief the selected project's durable memory"},
     {"watch", "Watch a dispatcher job's live transcript"},
     {"unwatch", "Stop watching a dispatcher job"},
     {"preview", "Open a secure web preview for a job"},
@@ -131,6 +133,7 @@ defmodule ClaudeNotify.TelegramPoller do
        terminal_injector: Keyword.get(opts, :terminal_injector, TerminalInjector),
        job_store: Keyword.get(opts, :job_store, JobStore),
        job_transcript: Keyword.get(opts, :job_transcript, JobTranscript),
+       memory_pages: Keyword.get(opts, :memory_pages, MemoryPages),
        project_registry: Keyword.get(opts, :project_registry),
        job_launch_opts: Keyword.get(opts, :job_launch_opts, []),
        preview_module: Keyword.get(opts, :preview_module, PreviewManager),
@@ -456,34 +459,38 @@ defmodule ClaudeNotify.TelegramPoller do
   end
 
   defp handle_reply_to(chat_id, text, reply_message_id, state) do
-    case SessionStore.lookup_session_by_message(reply_message_id) do
-      nil ->
-        # Not a tracked terminal-session message - try a job message next.
-        handle_reply_to_job(chat_id, text, reply_message_id, state)
+    if String.starts_with?(String.trim(text), "/memory") do
+      handle_memory_command(chat_id, String.trim(text), state, reply_message_id)
+    else
+      case SessionStore.lookup_session_by_message(reply_message_id) do
+        nil ->
+          # Not a tracked terminal-session message - try a job message next.
+          handle_reply_to_job(chat_id, text, reply_message_id, state)
 
-      session_id ->
-        session = SessionStore.get_session(session_id)
+        session_id ->
+          session = SessionStore.get_session(session_id)
 
-        if session do
-          case shortcut_response(text) do
-            nil ->
-              inject_reply_text(text, session)
+          if session do
+            case shortcut_response(text) do
+              nil ->
+                inject_reply_text(text, session)
 
-            response ->
-              if inject_response(state, session_id, response) == :ok do
-                short = String.slice(session_id, 0, 8)
+              response ->
+                if inject_response(state, session_id, response) == :ok do
+                  short = String.slice(session_id, 0, 8)
 
-                state.telegram.send_message_with_retry(
-                  MessageFormatter.escape_full("#{response_label(response)} (#{short})")
-                )
-              end
+                  state.telegram.send_message_with_retry(
+                    MessageFormatter.escape_full("#{response_label(response)} (#{short})")
+                  )
+                end
+            end
+
+            state
+          else
+            # Session expired, fall back to text command
+            handle_text_command(chat_id, text, state)
           end
-
-          state
-        else
-          # Session expired, fall back to text command
-          handle_text_command(chat_id, text, state)
-        end
+      end
     end
   end
 
@@ -774,6 +781,9 @@ defmodule ClaudeNotify.TelegramPoller do
       String.starts_with?(trimmed, "/jobs") ->
         handle_jobs_command(state)
 
+      String.starts_with?(trimmed, "/memory") ->
+        handle_memory_command(chat_id, trimmed, state, nil)
+
       String.starts_with?(trimmed, "/projects") ->
         handle_projects_command(chat_id, state)
 
@@ -1044,6 +1054,179 @@ defmodule ClaudeNotify.TelegramPoller do
 
     body = %{chat_id: chat_id, text: text, parse_mode: "MarkdownV2"}
     Telegram.api_post_public("sendMessage", body)
+  end
+
+  # --- Durable project memory ---
+
+  defp handle_memory_command(chat_id, command, state, reply_message_id) do
+    argument = command |> String.replace_prefix("/memory", "") |> String.trim()
+
+    case resolve_memory_scope(chat_id, state, reply_message_id) do
+      {:ok, scope} ->
+        deliver_memory_result(state, scope, argument)
+
+      {:error, :no_project} ->
+        state.telegram.send_message_with_retry(
+          MessageFormatter.escape_full(
+            "Choose a project with /projects, select a terminal session, or reply to a project/job message first."
+          )
+        )
+    end
+
+    state
+  end
+
+  defp deliver_memory_result(state, _scope, "") do
+    state.telegram.send_message_with_retry(
+      MessageFormatter.escape_full(
+        "Usage: /memory <query> | /memory recent | /memory brief | /memory status"
+      )
+    )
+  end
+
+  defp deliver_memory_result(state, scope, "recent") do
+    case MemoryPages.recent(Map.get(state, :memory_pages, MemoryPages), scope.id) do
+      {:ok, []} ->
+        send_memory_markdown(state, "**#{scope.name} memory**\n\nNo episodic pages yet.")
+
+      {:ok, results} ->
+        send_memory_markdown(state, format_memory_recent(scope.name, results))
+
+      {:error, reason} ->
+        send_memory_error(state, reason)
+    end
+  end
+
+  defp deliver_memory_result(state, scope, "brief") do
+    case MemoryPages.briefing(Map.get(state, :memory_pages, MemoryPages), scope.id) do
+      {:ok, briefing} -> send_memory_markdown(state, "**#{scope.name} briefing**\n\n#{briefing}")
+      {:error, reason} -> send_memory_error(state, reason)
+    end
+  end
+
+  defp deliver_memory_result(state, scope, "status") do
+    case MemoryPages.status(Map.get(state, :memory_pages, MemoryPages), scope.id) do
+      {:ok, status} ->
+        health = if status.healthy?, do: "healthy", else: "needs reindex/inspection"
+
+        send_memory_markdown(
+          state,
+          """
+          **#{scope.name} memory status**
+
+          - Source pages: #{status.source_pages}
+          - Indexed pages: #{status.indexed_pages}
+          - Corrupt pages: #{length(status.corrupt_pages)}
+          - Corrupt index rows: #{length(status.corrupt_index_rows)}
+          - Index: #{health}
+          """
+        )
+
+      {:error, reason} ->
+        send_memory_error(state, reason)
+    end
+  end
+
+  defp deliver_memory_result(state, scope, query) do
+    case MemoryPages.search(Map.get(state, :memory_pages, MemoryPages), scope.id, query) do
+      {:ok, []} ->
+        send_memory_markdown(state, "**#{scope.name} memory**\n\nNo results for “#{query}”.")
+
+      {:ok, results} ->
+        send_memory_markdown(state, format_memory_search(scope.name, query, results))
+
+      {:error, reason} ->
+        send_memory_error(state, reason)
+    end
+  end
+
+  defp resolve_memory_scope(chat_id, state, reply_message_id) do
+    reply_scope =
+      case reply_message_id do
+        id when is_integer(id) ->
+          case SessionStore.lookup_session_by_message(id) do
+            nil ->
+              case find_job_by_message(state.job_store, id) do
+                nil -> nil
+                job -> scope_for_project(state, job.project)
+              end
+
+            session_id ->
+              case SessionStore.get_session(session_id) do
+                %{project_scope: scope} when not is_nil(scope) -> {:ok, scope}
+                _ -> nil
+              end
+          end
+
+        _ ->
+          nil
+      end
+
+    reply_scope || selected_memory_scope(chat_id, state) || {:error, :no_project}
+  end
+
+  defp selected_memory_scope(chat_id, state) do
+    selected_session = Map.get(state.selected_sessions, chat_id)
+
+    session_scope =
+      case selected_session && SessionStore.get_session(selected_session) do
+        %{project_scope: scope} when not is_nil(scope) -> {:ok, scope}
+        _ -> nil
+      end
+
+    session_scope ||
+      case Map.get(Map.get(state, :selected_projects, %{}), chat_id) do
+        project when is_binary(project) -> scope_for_project(state, project)
+        _ -> nil
+      end
+  end
+
+  defp scope_for_project(state, project) do
+    case state.project_registry do
+      nil -> ProjectScope.for_project(project)
+      project_registry -> ProjectScope.for_project(project_registry, project)
+    end
+  end
+
+  defp format_memory_recent(project, results) do
+    rows =
+      Enum.map(results, fn result ->
+        "- **#{result.title}** — #{result.engine}, #{memory_timestamp(result.created_at)} (`#{Path.basename(result.path)}`)"
+      end)
+
+    Enum.join(["**#{project} recent memory**", "" | rows], "\n")
+  end
+
+  defp format_memory_search(project, query, results) do
+    rows =
+      Enum.map(results, fn result ->
+        """
+        **#{result.title}** — #{result.engine}, #{memory_timestamp(result.created_at)}
+        #{result.snippet}
+        Source: `#{Path.basename(result.path)}`
+        """
+      end)
+
+    Enum.join(["**#{project} memory: “#{query}”**" | rows], "\n")
+  end
+
+  defp memory_timestamp(value) when is_integer(value) do
+    case DateTime.from_unix(value, :millisecond) do
+      {:ok, timestamp} -> Calendar.strftime(timestamp, "%Y-%m-%d %H:%M UTC")
+      {:error, _reason} -> "unknown time"
+    end
+  end
+
+  defp memory_timestamp(_), do: "unknown time"
+
+  defp send_memory_markdown(state, markdown) do
+    state.telegram.send_html_with_retry(MessageFormatter.agent_markdown_html(markdown))
+  end
+
+  defp send_memory_error(state, reason) do
+    state.telegram.send_message_with_retry(
+      MessageFormatter.escape_full("Project memory is unavailable: #{inspect(reason)}")
+    )
   end
 
   # --- Job commands ---

@@ -24,6 +24,7 @@ Elixir app that sends interactive Telegram notifications for Claude Code and Cod
 - **Provider-agnostic web previews** — launch a job's web app through Cloudflare Access (email OTP) or Tailscale Serve (tailnet identity), then tear it down automatically
 - **Reliable rich replies** — coding-agent Markdown renders cleanly in Telegram; long replies are delivered completely in balanced HTML chunks and visually attached to their prompt
 - **Terminal-parity skills and Chrome** — Claude slash commands pass through Telegram, and isolated Claude jobs can use a paired Claude in Chrome extension
+- **Durable cross-agent memory** — Claude and Codex exchange bounded project handoffs, while completed work remains searchable as app-owned Markdown
 
 ## How It Works
 
@@ -146,6 +147,7 @@ This table also drives Telegram's native "/" command menu, which self-registers 
 | `/jobs` | List known dispatcher jobs and their status |
 | `/cancel <id>` | Cancel dispatcher job `<id>` |
 | `/projects` | Choose from discovered and registered projects |
+| `/memory <query\|recent\|brief\|status>` | Search or inspect the selected project's durable memory |
 | `/watch <id>` | Watch dispatcher job `<id>`'s live transcript |
 | `/unwatch <id>` | Stop watching dispatcher job `<id>` |
 | `/preview <job-id> [cloudflare\|tailscale]` | Start a secure preview using the default or selected provider |
@@ -167,7 +169,7 @@ Registered bot commands in the table above are handled by Claude Notify. Every o
 - Replayed signed payloads are rejected.
 - Preview creation is available only through the authorized Telegram chat. Cloudflare policies allow only configured OTP emails; Tailscale Serve obeys tailnet identity and grants. Tailscale Funnel is public and must be explicitly enabled.
 - Tunnel tokens are passed to `cloudflared` through its environment, never placed in Telegram messages, process arguments, or the persistent preview store.
-- The HTTP surface exposes exactly two routes — `GET /health` and `POST /api/events` — anything else, including any `/debug/*` path, returns a plain `404`.
+- The HTTP surface exposes exactly three routes — `GET /health`, asynchronous `POST /api/events`, and signed `POST /api/context` for bounded startup claims. Anything else, including `/debug/*`, returns `404`.
 
 ## Configuration
 
@@ -194,6 +196,9 @@ CLAUDE_NOTIFY_CLAUDE_CHROME=true
 # Durable lifecycle observations (disable capture or tune bounded retention)
 CLAUDE_NOTIFY_MEMORY_CAPTURE=true
 # CLAUDE_NOTIFY_MEMORY_STORE_PATH="$HOME/.claude_notify/memory_store.dat"
+# CLAUDE_NOTIFY_HANDOFF_STORE_PATH="$HOME/.claude_notify/handoffs.dat"
+# CLAUDE_NOTIFY_MEMORY_PAGES_ROOT="$HOME/.claude_notify/memory"
+# CLAUDE_NOTIFY_MEMORY_BRIEFING_INJECTION=false
 # CLAUDE_NOTIFY_MEMORY_MAX_PER_SESSION=500
 # CLAUDE_NOTIFY_MEMORY_MAX_PER_PROJECT=5000
 # CLAUDE_NOTIFY_MEMORY_MAX_INGEST_KEYS=50000
@@ -201,6 +206,14 @@ CLAUDE_NOTIFY_MEMORY_CAPTURE=true
 # CLAUDE_NOTIFY_MEMORY_MAX_BODY_BYTES=2000
 # CLAUDE_NOTIFY_MEMORY_MAX_METADATA_ENTRIES=20
 # CLAUDE_NOTIFY_MEMORY_MAX_FILE_PATHS=50
+# CLAUDE_NOTIFY_HANDOFF_MAX_SUMMARY_BYTES=4000
+# CLAUDE_NOTIFY_HANDOFF_MAX_ITEM_BYTES=500
+# CLAUDE_NOTIFY_HANDOFF_MAX_ITEMS=20
+# CLAUDE_NOTIFY_MEMORY_MAX_CONTEXT_BYTES=8000
+# CLAUDE_NOTIFY_MEMORY_MAX_PAGE_BYTES=12000
+# CLAUDE_NOTIFY_MEMORY_MAX_SEARCH_RESULTS=8
+# CLAUDE_NOTIFY_MEMORY_MAX_SNIPPET_BYTES=700
+# CLAUDE_NOTIFY_MEMORY_MAX_BRIEFING_BYTES=6000
 
 # Optional previews: auto selects the first available secure provider
 CLAUDE_NOTIFY_PREVIEW_PROVIDER=auto
@@ -240,8 +253,26 @@ evicted observation bodies so an older replay cannot immediately reinsert data.
 An unknown or corrupt on-disk schema fails closed until the store is explicitly
 cleared. File content capture remains disabled by default; project-local content
 exclusions are deliberately staged until any later issue proposes enabling it.
-This is the raw capture foundation; project memory pages and retrieval are
-layered on top separately.
+At substantive stop/job boundaries, the observation stream deterministically
+produces a typed portable handoff. A newer automatic checkpoint supersedes the
+prior open one from the same source. Claims are atomic and retry-safe: the same
+receiving session gets the same accepted handoff after a timeout or restart,
+while later sessions cannot consume it. Native engine resume suppresses the
+same engine-session handoff so context is not duplicated.
+
+Completed substantive sessions and jobs also write readable episodic Markdown
+under `~/.claude_notify/memory/projects/<project-id>/episodes/`. Markdown is the
+source of truth; `memory-index.sqlite3` is a derived SQLite FTS5 index that can
+be deleted and rebuilt. `/memory <query>`, `/memory recent`, `/memory brief`,
+and `/memory status` always stay inside the selected canonical project.
+
+Session-start hooks synchronously call the dedicated signed `/api/context`
+route with a two-second hard timeout, then print any claimed handoff to agent
+stdout. Dispatcher jobs receive the same context after their non-negotiable
+worktree rules. Injected text is delimited and explicitly labeled untrusted
+historical evidence; current instructions and the checkout remain authoritative.
+Optional recurring briefing injection is disabled by default because it spends
+tokens on every start (`CLAUDE_NOTIFY_MEMORY_BRIEFING_INJECTION=true` enables it).
 
 Default field limits are 160 bytes for titles, 2,000 bytes for bodies, 20
 metadata fields, and 50 file paths/list items. Project and session labels are
@@ -495,11 +526,16 @@ An unregistered project name replies with the list of known projects instead of 
 
 **`/projects`** — opens the same paginated working-directory picker as `/new`.
 
+**`/memory <query>`** — runs bounded lexical search inside the selected session
+or project's canonical memory. `recent` lists episodic pages, `brief` renders a
+deterministic project briefing, and `status` reports Markdown/index health. The
+command also works when replying to a tracked terminal or dispatcher message.
+
 **`/watch <id>` / `/unwatch <id>`** — see [Watch mode](#watch-mode) below; equivalent to tapping the `[Watch]`/`[Unwatch]` button on the job's activity message.
 
 **Reply to a job's activity message to resume it.** This does not continue the same job in place — it creates a **new** job (new id, new worktree, new branch) with `resume_session_id` set to the original job's `engine_session_id`, and your reply text as its prompt. Only a `:completed` or `:failed` job can be resumed this way (a job with no recorded `engine_session_id` — e.g. it failed before the engine ever reported one — can't be resumed at all); resuming a job that's still `:queued`/`:running`/`:awaiting_input` replies with an error instead.
 
-  **Resume limitation:** the new job still gets a brand-new worktree cut from the repo's *current default branch* — it does **not** check out the original job's branch. The engine's own memory of the earlier conversation may reference files or state that only exist on the *original* job's branch. This is an acceptable gap only because every job is required to commit and leave its worktree clean before finishing — in the common case there's nothing uncommitted left to lose — but a resume that expects to see uncommitted state from its earlier turn will not find it.
+  **Resume limitation:** the new job still gets a brand-new worktree cut from the repo's *current default branch* — it does **not** check out the original job's branch. The engine's own memory of the earlier conversation may reference files or state that only exist on the *original* job's branch. Portable handoff context remains available when it comes from another session or engine, but the handoff matching the native resume session is intentionally omitted to avoid duplication.
 
 ### Report buttons and the human gate
 
@@ -588,7 +624,7 @@ JobRunner         — drives the engine CLI as a Port, parses its output, record
 Engine.Claude /   — engine-specific command building + event parsing; Claude can connect
   Engine.Codex      to the paired browser extension when --chrome is enabled
       |
-TelegramPoller    — the only caller of the above: guides /new and parses /run /jobs /cancel /projects
+TelegramPoller    — the only caller of the above: guides /new and parses /run /jobs /cancel /projects /memory
                      /watch /unwatch and reply-to-job text, renders activity/report
                      messages and buttons, and is the sole path that can push or open a PR
 ```
@@ -601,7 +637,7 @@ This covers the hook → Telegram → terminal-injection pipeline. For the job d
 
 | Module | Role |
 |--------|------|
-| `Router` | Plug HTTP server — receives hook events on `POST /api/events` |
+| `Router` | Plug HTTP server — receives hook events on `POST /api/events` and signed startup claims on `POST /api/context` |
 | `EventAuth` | Verifies webhook timestamp + HMAC signature and replay protection |
 | `EventHandler` | Routes events to session store and Telegram |
 | `SessionStore` | GenServer tracking active sessions (ID, working dir, TTY path, transcript path) |
@@ -611,6 +647,9 @@ This covers the hook → Telegram → terminal-injection pipeline. For the job d
 | `MessageFormatter` | MarkdownV2 formatted messages with emoji tool icons |
 | `TranscriptReader` | Reads Claude Code JSONL transcripts for last assistant response; Codex supplies its response in the Stop event |
 | `PathSafety` | Sanitizes externally provided paths (e.g., transcript paths) |
+| `HandoffStore` / `StartupContext` | Persist typed checkpoints and claim/render bounded untrusted context |
+| `MemoryPages` | Writes project Markdown pages and owns the rebuildable SQLite FTS5 index |
+| `Continuity` | Deterministically derives handoffs/pages from normalized observations |
 
 ## Hooks
 
@@ -625,3 +664,7 @@ The same scripts support both agents and tag every event as `claude` or `codex`.
 
 - `X-Claude-Notify-Timestamp`
 - `X-Claude-Notify-Signature: sha256=<hmac>`
+
+Event signatures cover `<timestamp>.<raw-body>`. The startup claim route uses
+the separate domain `<timestamp>./api/context.<raw-body>`, preventing a signed
+lifecycle event from being replayed against the context endpoint.

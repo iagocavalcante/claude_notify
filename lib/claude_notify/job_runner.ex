@@ -88,7 +88,14 @@ defmodule ClaudeNotify.JobRunner do
   use GenServer, restart: :temporary
   require Logger
 
-  alias ClaudeNotify.{JobStore, JobTranscript, MemoryCapture, WorktreeManager}
+  alias ClaudeNotify.{
+    Continuity,
+    JobStore,
+    JobTranscript,
+    MemoryCapture,
+    StartupContext,
+    WorktreeManager
+  }
 
   # Bounded tail of raw engine stdout lines, kept regardless of whether they
   # parsed into a recognized event - the only source for a failed job's
@@ -140,6 +147,13 @@ defmodule ClaudeNotify.JobRunner do
 
   @doc "Prepends the job rules (worktree isolation, commit-at-end, no push) to `prompt`."
   def wrap_prompt(prompt), do: @job_rules <> prompt
+
+  @doc false
+  def wrap_prompt(prompt, ""), do: wrap_prompt(prompt)
+
+  def wrap_prompt(prompt, context) do
+    @job_rules <> context <> "\n\n## Current dispatcher task\n\n" <> prompt
+  end
 
   @doc "Test/introspection helper: the job id this runner is driving."
   def job_id(pid), do: GenServer.call(pid, :job_id)
@@ -225,9 +239,14 @@ defmodule ClaudeNotify.JobRunner do
         status: final_status
       })
 
+    finalize_continuity(final_state, final_status)
+
     case JobStore.update_status(state.job_store, state.job_id, final_status, extras) do
-      {:ok, _job} -> notify_completed(final_state, final_status)
-      {:error, _reason} -> :ok
+      {:ok, _job} ->
+        notify_completed(final_state, final_status)
+
+      {:error, _reason} ->
+        :ok
     end
 
     {:stop, :normal, %{final_state | finalized: true}}
@@ -267,7 +286,7 @@ defmodule ClaudeNotify.JobRunner do
   end
 
   defp launch_engine(state, worktree) do
-    wrapped_prompt = wrap_prompt(state.prompt)
+    wrapped_prompt = wrap_prompt(state.prompt, portable_context(state))
     engine_opts = Keyword.put(state.engine_opts, :cwd, worktree.path)
 
     {cmd, args} =
@@ -315,9 +334,14 @@ defmodule ClaudeNotify.JobRunner do
       |> terminal_extras(:failed)
       |> maybe_put_error_override(error_override)
 
+    finalize_continuity(captured_state, :failed)
+
     case JobStore.update_status(state.job_store, state.job_id, :failed, extras) do
-      {:ok, _job} -> notify_completed(captured_state, :failed)
-      {:error, _reason} -> :ok
+      {:ok, _job} ->
+        notify_completed(captured_state, :failed)
+
+      {:error, _reason} ->
+        :ok
     end
 
     captured_state
@@ -378,6 +402,34 @@ defmodule ClaudeNotify.JobRunner do
     )
 
     JobTranscript.discard(state.job_transcript, state.job_id)
+  end
+
+  defp finalize_continuity(state, status) do
+    Continuity.dispatcher(state.project_scope, %{
+      id: state.job_id,
+      engine: state.engine_name,
+      engine_session_id: state.session_id,
+      status: status
+    })
+  end
+
+  defp portable_context(state) do
+    case StartupContext.for_scope(state.project_scope, %{
+           session_id: "job:#{state.job_id}",
+           job_id: state.job_id,
+           engine: state.engine_name,
+           resume_session_id: state.resume_session_id
+         }) do
+      {:ok, context} ->
+        context
+
+      {:error, reason} ->
+        Logger.warning(
+          "JobRunner: portable context unavailable for job #{state.job_id}: #{inspect(reason)}"
+        )
+
+        ""
+    end
   end
 
   defp progress_snapshot(state) do

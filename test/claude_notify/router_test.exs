@@ -4,11 +4,22 @@ defmodule ClaudeNotify.RouterTest do
   import Plug.Test
   import Plug.Conn
 
-  alias ClaudeNotify.{MemoryStore, ReplayCache, Router, SessionStore}
+  alias ClaudeNotify.{
+    HandoffStore,
+    MemoryStore,
+    ProjectRegistry,
+    ProjectScope,
+    ReplayCache,
+    Router,
+    SessionStore
+  }
+
+  @moduletag :tmp_dir
 
   setup do
     wait_for_event_tasks()
     SessionStore.clear()
+    HandoffStore.clear()
     ReplayCache.clear()
     :ok
   end
@@ -117,6 +128,86 @@ defmodule ClaudeNotify.RouterTest do
     assert second_conn.status == 403
   end
 
+  test "POST /api/context authenticates, claims cross-engine context, and retries idempotently",
+       %{
+         tmp_dir: tmp_dir
+       } do
+    repo = create_git_repo(tmp_dir)
+    original_registry = ProjectScope.registry()
+    registry = %ProjectRegistry{projects: %{"context-project" => repo}, aliases: %{}}
+    :ok = ProjectScope.reload(registry)
+    on_exit(fn -> ProjectScope.reload(original_registry) end)
+    {:ok, scope} = ProjectScope.resolve(repo)
+
+    {:ok, :inserted, handoff} =
+      HandoffStore.upsert_automatic(%{
+        project_scope: scope,
+        source: :terminal,
+        source_engine: "claude",
+        source_session_id: "claude-source",
+        summary: "Continue the portable checkpoint.",
+        generation: "stop:one"
+      })
+
+    first_payload = %{
+      "event" => "session_start",
+      "_request" => "startup_context",
+      "request_id" => "startup-context-one",
+      "session_id" => "codex-receiver",
+      "working_dir" => repo,
+      "engine" => "codex"
+    }
+
+    first = signed_conn("/api/context", first_payload) |> Router.call(Router.init([]))
+    assert first.status == 200
+    assert first.resp_body =~ "UNTRUSTED HISTORICAL DATA"
+    assert first.resp_body =~ "Continue the portable checkpoint"
+
+    retry =
+      first_payload
+      |> Map.put("request_id", "startup-context-retry")
+      |> then(&signed_conn("/api/context", &1))
+      |> Router.call(Router.init([]))
+
+    assert retry.status == 200
+    assert retry.resp_body == first.resp_body
+    assert HandoffStore.get(handoff.id).accepted_by_session_id == "codex-receiver"
+  end
+
+  test "POST /api/context requires HMAC and rejects exact request replay", %{tmp_dir: tmp_dir} do
+    payload = %{
+      "_request" => "startup_context",
+      "session_id" => "receiver",
+      "working_dir" => tmp_dir,
+      "engine" => "claude"
+    }
+
+    unsigned =
+      conn(:post, "/api/context", Jason.encode!(payload))
+      |> put_req_header("content-type", "application/json")
+      |> Router.call(Router.init([]))
+
+    assert unsigned.status == 401
+
+    timestamp = System.system_time(:second)
+    body = Jason.encode!(payload)
+
+    wrong_domain =
+      conn(:post, "/api/context", body)
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("x-claude-notify-timestamp", Integer.to_string(timestamp))
+      |> put_req_header("x-claude-notify-signature", "sha256=#{sign_payload(timestamp, body)}")
+      |> Router.call(Router.init([]))
+
+    assert wrong_domain.status == 403
+
+    first = signed_conn("/api/context", payload, timestamp: timestamp)
+    assert Router.call(first, Router.init([])).status == 200
+
+    replay = signed_conn("/api/context", payload, timestamp: timestamp)
+    assert Router.call(replay, Router.init([])).status == 403
+  end
+
   test "durable capture stays behind the bounded queue and preserves overload responses" do
     :sys.suspend(MemoryStore)
 
@@ -180,20 +271,34 @@ defmodule ClaudeNotify.RouterTest do
   end
 
   defp signed_events_conn(payload, opts \\ []) do
+    signed_conn("/api/events", payload, opts)
+  end
+
+  defp signed_conn(path, payload, opts \\ []) do
     timestamp = Keyword.get(opts, :timestamp, System.system_time(:second))
     body = Jason.encode!(payload)
-    signature = sign_payload(timestamp, body)
+    signature = sign_payload(timestamp, body, path)
 
-    conn(:post, "/api/events", body)
+    conn(:post, path, body)
     |> put_req_header("content-type", "application/json")
     |> put_req_header("x-claude-notify-timestamp", Integer.to_string(timestamp))
     |> put_req_header("x-claude-notify-signature", "sha256=#{signature}")
   end
 
-  defp sign_payload(timestamp, body) do
+  defp create_git_repo(tmp_dir) do
+    path = Path.join(tmp_dir, "context-repo")
+    File.mkdir_p!(path)
+    {_, 0} = System.cmd("git", ["init", "-q"], cd: path)
+    path
+  end
+
+  defp sign_payload(timestamp, body, path \\ "/api/events") do
     secret = Application.fetch_env!(:claude_notify, :webhook_secret)
 
-    :crypto.mac(:hmac, :sha256, secret, "#{timestamp}.#{body}")
+    message =
+      if path == "/api/context", do: "#{timestamp}.#{path}.#{body}", else: "#{timestamp}.#{body}"
+
+    :crypto.mac(:hmac, :sha256, secret, message)
     |> Base.encode16(case: :lower)
   end
 

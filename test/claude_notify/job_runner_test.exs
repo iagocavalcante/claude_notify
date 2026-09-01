@@ -60,12 +60,14 @@ defmodule ClaudeNotify.JobRunnerTest do
 
   alias ClaudeNotify.{
     Engine,
+    HandoffStore,
     JobRunner,
     JobStore,
     JobSupervisor,
     JobTranscript,
     MemoryStore,
-    ProjectRegistry
+    ProjectRegistry,
+    ProjectScope
   }
 
   @moduletag :tmp_dir
@@ -158,6 +160,7 @@ defmodule ClaudeNotify.JobRunnerTest do
 
   setup %{tmp_dir: tmp_dir} do
     MemoryStore.clear()
+    HandoffStore.clear()
     repo_path = create_fixture_repo(tmp_dir)
     base_dir = Path.join(tmp_dir, "worktrees_base")
     previous_base_dir = Application.get_env(:claude_notify, :worktree_base_dir)
@@ -260,6 +263,15 @@ defmodule ClaudeNotify.JobRunnerTest do
       assert wrapped =~ "Stay inside this worktree"
       assert String.ends_with?(wrapped, "do the thing")
     end
+
+    test "portable context follows job rules and precedes the current task" do
+      wrapped = JobRunner.wrap_prompt("current task", "<historical>checkpoint</historical>")
+      {rules_at, _} = :binary.match(wrapped, "Never push")
+      {history_at, _} = :binary.match(wrapped, "<historical>")
+      {task_at, _} = :binary.match(wrapped, "current task")
+      assert rules_at < history_at
+      assert history_at < task_at
+    end
   end
 
   # -- JobRunner: real Port, real worktree, fixture engine script --
@@ -313,6 +325,41 @@ defmodule ClaudeNotify.JobRunnerTest do
       assert Path.expand(engine_cwd) == Path.expand(final.worktree_path)
 
       refute Process.alive?(pid)
+    end
+
+    test "a fresh dispatcher job claims an eligible cross-engine terminal handoff", %{
+      repo_path: repo_path,
+      store: store,
+      script: script
+    } do
+      registry = %ProjectRegistry{projects: %{"fixture-project" => repo_path}, aliases: %{}}
+      {:ok, scope} = ProjectScope.for_project(registry, "fixture-project")
+
+      {:ok, :inserted, handoff} =
+        HandoffStore.upsert_automatic(%{
+          project_scope: scope,
+          source: :terminal,
+          source_engine: "claude",
+          source_session_id: "terminal-source",
+          summary: "Carry this portable checkpoint into Codex.",
+          generation: "stop:portable"
+        })
+
+      {:ok, job} = JobStore.create(store, job_attrs(%{engine: "codex"}))
+      {:ok, _} = JobStore.update_status(store, job.id, :running, %{})
+
+      start_runner(job, repo_path, script,
+        job_store: store,
+        project_scope: scope,
+        engine_name: "codex"
+      )
+
+      final = wait_for_status(store, job.id, :completed)
+      received = File.read!(Path.join(final.worktree_path, ".received-prompt"))
+      assert received =~ "UNTRUSTED HISTORICAL DATA"
+      assert received =~ "Carry this portable checkpoint into Codex"
+      assert received =~ "do the thing"
+      assert HandoffStore.get(handoff.id).accepted_by_job_id == job.id
     end
 
     test "a nonzero engine exit marks the job failed, cleanly", %{

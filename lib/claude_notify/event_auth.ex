@@ -9,14 +9,14 @@ defmodule ClaudeNotify.EventAuth do
   @signature_header "x-claude-notify-signature"
   @timestamp_header "x-claude-notify-timestamp"
 
-  def verify(conn) do
+  def verify(conn, namespace \\ :events) when namespace in [:events, :context] do
     with {:ok, secret} <- fetch_secret(),
          {:ok, raw_body} <- fetch_raw_body(conn),
          {:ok, timestamp} <- parse_timestamp(Conn.get_req_header(conn, @timestamp_header)),
          :ok <- validate_timestamp_freshness(timestamp),
          {:ok, signature} <- parse_signature(Conn.get_req_header(conn, @signature_header)),
-         :ok <- validate_signature(secret, timestamp, raw_body, signature),
-         :ok <- validate_replay(timestamp, signature) do
+         :ok <- validate_signature(secret, namespace, timestamp, raw_body, signature),
+         :ok <- validate_replay(namespace, timestamp, signature) do
       :ok
     end
   end
@@ -71,9 +71,9 @@ defmodule ClaudeNotify.EventAuth do
     end
   end
 
-  defp validate_signature(secret, timestamp, raw_body, signature) do
+  defp validate_signature(secret, namespace, timestamp, raw_body, signature) do
     expected =
-      :crypto.mac(:hmac, :sha256, secret, "#{timestamp}.#{raw_body}")
+      :crypto.mac(:hmac, :sha256, secret, signed_message(namespace, timestamp, raw_body))
       |> Base.encode16(case: :lower)
 
     if Plug.Crypto.secure_compare(expected, signature) do
@@ -83,10 +83,13 @@ defmodule ClaudeNotify.EventAuth do
     end
   end
 
-  defp validate_replay(timestamp, signature) do
+  defp signed_message(:events, timestamp, raw_body), do: "#{timestamp}.#{raw_body}"
+  defp signed_message(:context, timestamp, raw_body), do: "#{timestamp}./api/context.#{raw_body}"
+
+  defp validate_replay(namespace, timestamp, signature) do
     skew = Application.get_env(:claude_notify, :webhook_max_skew_seconds, 300)
     ttl = max(skew * 2, 60)
-    key = "#{timestamp}:#{signature}"
+    key = "#{namespace}:#{timestamp}:#{signature}"
 
     case ReplayCache.check_and_put(key, ttl) do
       :ok -> :ok

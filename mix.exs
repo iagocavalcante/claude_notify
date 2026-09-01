@@ -24,7 +24,8 @@ defmodule ClaudeNotify.MixProject do
       {:plug, "~> 1.16"},
       {:jason, "~> 1.4"},
       {:req, "~> 0.5"},
-      {:dotenvy, "~> 0.8"}
+      {:dotenvy, "~> 0.8"},
+      {:exqlite, "~> 0.40"}
     ]
   end
 end

@@ -9,7 +9,8 @@ defmodule ClaudeNotify.EventHandler do
     TaskTracker,
     Dashboard,
     ProjectScope,
-    MemoryCapture
+    MemoryCapture,
+    Continuity
   }
 
   def handle_event(%{"event" => "session_start"} = params) do
@@ -87,9 +88,13 @@ defmodule ClaudeNotify.EventHandler do
     assistant_response =
       resolve_assistant_response(params["assistant_response"], resolved_transcript)
 
+    session_before_stop = SessionStore.get_session(session_id)
+
     params
     |> Map.put("assistant_response", assistant_response || "")
-    |> MemoryCapture.terminal(SessionStore.get_session(session_id))
+    |> MemoryCapture.terminal(session_before_stop)
+
+    Continuity.terminal(session_before_stop, :turn_stop)
 
     # Codex includes the final response directly in Stop. Claude falls back to
     # its transcript, preserving compatibility with older hook payloads.
@@ -105,7 +110,9 @@ defmodule ClaudeNotify.EventHandler do
 
   def handle_event(%{"event" => "session_end"} = params) do
     session_id = params["session_id"]
-    MemoryCapture.terminal(params, SessionStore.get_session(session_id))
+    session = SessionStore.get_session(session_id)
+    MemoryCapture.terminal(params, session)
+    Continuity.terminal(session, :session_end)
     SessionStore.remove_session(session_id)
     ActivityTracker.end_session(session_id)
     TaskTracker.end_session(session_id)

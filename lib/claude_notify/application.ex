@@ -12,6 +12,8 @@ defmodule ClaudeNotify.Application do
       [
         ClaudeNotify.ProjectScope,
         ClaudeNotify.MemoryStore,
+        ClaudeNotify.HandoffStore,
+        ClaudeNotify.MemoryPages,
         ClaudeNotify.SessionStore,
         ClaudeNotify.ActivityTracker,
         ClaudeNotify.TaskTracker,

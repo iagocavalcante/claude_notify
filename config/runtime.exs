@@ -48,10 +48,24 @@ if config_env() != :test do
     workspace_roots: workspace_roots,
     claude_chrome_enabled: parse_bool.(System.get_env("CLAUDE_NOTIFY_CLAUDE_CHROME"), false),
     memory_capture_enabled: parse_bool.(System.get_env("CLAUDE_NOTIFY_MEMORY_CAPTURE"), true),
+    memory_briefing_injection:
+      parse_bool.(System.get_env("CLAUDE_NOTIFY_MEMORY_BRIEFING_INJECTION"), false),
     memory_store_path:
       System.get_env(
         "CLAUDE_NOTIFY_MEMORY_STORE_PATH",
         Path.join([System.user_home!(), ".claude_notify", "memory_store.dat"])
+      )
+      |> Path.expand(),
+    handoff_store_path:
+      System.get_env(
+        "CLAUDE_NOTIFY_HANDOFF_STORE_PATH",
+        Path.join([System.user_home!(), ".claude_notify", "handoffs.dat"])
+      )
+      |> Path.expand(),
+    memory_pages_root:
+      System.get_env(
+        "CLAUDE_NOTIFY_MEMORY_PAGES_ROOT",
+        Path.join([System.user_home!(), ".claude_notify", "memory"])
       )
       |> Path.expand(),
     memory: %{
@@ -65,7 +79,21 @@ if config_env() != :test do
       max_metadata_entries:
         parse_int.(System.get_env("CLAUDE_NOTIFY_MEMORY_MAX_METADATA_ENTRIES"), 20),
       max_collection_entries:
-        parse_int.(System.get_env("CLAUDE_NOTIFY_MEMORY_MAX_FILE_PATHS"), 50)
+        parse_int.(System.get_env("CLAUDE_NOTIFY_MEMORY_MAX_FILE_PATHS"), 50),
+      max_handoff_summary_bytes:
+        parse_int.(System.get_env("CLAUDE_NOTIFY_HANDOFF_MAX_SUMMARY_BYTES"), 4_000),
+      max_handoff_item_bytes:
+        parse_int.(System.get_env("CLAUDE_NOTIFY_HANDOFF_MAX_ITEM_BYTES"), 500),
+      max_handoff_items: parse_int.(System.get_env("CLAUDE_NOTIFY_HANDOFF_MAX_ITEMS"), 20),
+      max_context_bytes:
+        parse_int.(System.get_env("CLAUDE_NOTIFY_MEMORY_MAX_CONTEXT_BYTES"), 8_000),
+      max_page_bytes: parse_int.(System.get_env("CLAUDE_NOTIFY_MEMORY_MAX_PAGE_BYTES"), 12_000),
+      max_search_results:
+        parse_int.(System.get_env("CLAUDE_NOTIFY_MEMORY_MAX_SEARCH_RESULTS"), 8),
+      max_search_snippet_bytes:
+        parse_int.(System.get_env("CLAUDE_NOTIFY_MEMORY_MAX_SNIPPET_BYTES"), 700),
+      max_briefing_bytes:
+        parse_int.(System.get_env("CLAUDE_NOTIFY_MEMORY_MAX_BRIEFING_BYTES"), 6_000)
     },
     preview: %{
       default_provider: System.get_env("CLAUDE_NOTIFY_PREVIEW_PROVIDER", "auto"),

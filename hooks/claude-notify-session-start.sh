@@ -27,4 +27,9 @@ print(json.dumps(out))
 
 post_event_payload "$PAYLOAD"
 
+CONTEXT="$(fetch_startup_context "$PAYLOAD")"
+if [ -n "$CONTEXT" ]; then
+  printf '%s\n' "$CONTEXT"
+fi
+
 exit 0

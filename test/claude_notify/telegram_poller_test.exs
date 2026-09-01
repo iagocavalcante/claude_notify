@@ -7,7 +7,9 @@ defmodule ClaudeNotify.TelegramPollerTest do
     JobStore,
     JobSupervisor,
     JobTranscript,
-    ProjectRegistry
+    MemoryPages,
+    ProjectRegistry,
+    ProjectScope
   }
 
   @moduletag :tmp_dir
@@ -272,7 +274,7 @@ defmodule ClaudeNotify.TelegramPollerTest do
       commands = TelegramPoller.bot_commands()
 
       assert Enum.map(commands, &elem(&1, 0)) == ~w(
-               new sessions approve cancel dashboard run jobs projects watch unwatch
+               new sessions approve cancel dashboard run jobs projects memory watch unwatch
                preview previews unpreview help
              )
 
@@ -729,6 +731,55 @@ defmodule ClaudeNotify.TelegramPollerTest do
       assert inspect(rows) =~ "trainer"
       assert_receive {:telegram_send, text}
       assert text =~ "Choose a project"
+    end
+
+    test "/memory search, recent, brief, and status use the selected canonical project", %{
+      state: state,
+      registry: registry,
+      tmp_dir: tmp_dir
+    } do
+      pages = :"telegram_memory_pages_#{System.unique_integer([:positive])}"
+
+      start_supervised!(
+        {MemoryPages,
+         name: pages, root: Path.join(tmp_dir, "telegram-memory"), handoff_store: nil}
+      )
+
+      {:ok, scope} = ProjectScope.for_project(registry, "trainer")
+
+      assert {:ok, :inserted, _page} =
+               MemoryPages.write_episode(pages, scope, %{
+                 completion_key: "telegram-memory-one",
+                 source: :terminal,
+                 engine: "claude",
+                 session_id: "terminal-memory",
+                 summary: "Lexical previews are durable and searchable.",
+                 next_steps: ["Verify Telegram retrieval."],
+                 created_at: 1_800_000_000_000
+               })
+
+      memory_state =
+        state
+        |> Map.put(:memory_pages, pages)
+        |> Map.put(:selected_projects, %{@chat_id => "trainer"})
+
+      TelegramPoller.handle_update(text_message("/memory lexical previews"), memory_state)
+      assert_receive {:telegram_send, search_text}
+      assert search_text =~ "Lexical previews"
+      assert search_text =~ "Source:"
+
+      TelegramPoller.handle_update(text_message("/memory recent"), memory_state)
+      assert_receive {:telegram_send, recent_text}
+      assert recent_text =~ "recent memory"
+
+      TelegramPoller.handle_update(text_message("/memory brief"), memory_state)
+      assert_receive {:telegram_send, brief_text}
+      assert brief_text =~ "Project memory briefing"
+
+      TelegramPoller.handle_update(text_message("/memory status"), memory_state)
+      assert_receive {:telegram_send, status_text}
+      assert status_text =~ "Source pages: 1"
+      assert status_text =~ "Index: healthy"
     end
 
     test "/new lets a user choose a project and launch by sending a normal message", %{

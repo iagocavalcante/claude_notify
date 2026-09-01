@@ -18,6 +18,29 @@ defmodule ClaudeNotify.Router do
     send_resp(conn, 200, Jason.encode!(%{status: "ok"}))
   end
 
+  post "/api/context" do
+    params = conn.body_params
+
+    with :ok <- ClaudeNotify.EventAuth.verify(conn, :context),
+         :ok <- validate_context_payload(params) do
+      context =
+        case ClaudeNotify.StartupContext.fetch(params) do
+          {:ok, text} ->
+            text
+
+          {:error, reason} ->
+            Logger.warning("Router: startup context unavailable: #{inspect(reason)}")
+            ""
+        end
+
+      conn
+      |> put_resp_content_type("text/plain")
+      |> send_resp(200, context)
+    else
+      {:error, reason} -> context_error_response(conn, reason)
+    end
+  end
+
   post "/api/events" do
     params = conn.body_params
 
@@ -72,6 +95,46 @@ defmodule ClaudeNotify.Router do
 
   defp validate_payload(%{"event" => _, "session_id" => _}), do: :ok
   defp validate_payload(_), do: {:error, :missing_event_or_session_id}
+
+  defp validate_context_payload(%{
+         "_request" => "startup_context",
+         "session_id" => session_id,
+         "working_dir" => working_dir,
+         "engine" => engine
+       })
+       when is_binary(session_id) and session_id != "" and is_binary(working_dir) and
+              working_dir != "" and engine in ["claude", "codex"],
+       do: :ok
+
+  defp validate_context_payload(_), do: {:error, :invalid_context_payload}
+
+  defp context_error_response(conn, reason)
+       when reason in [:missing_timestamp, :missing_signature] do
+    send_resp(conn, 401, Jason.encode!(%{error: to_string(reason)}))
+  end
+
+  defp context_error_response(conn, reason)
+       when reason in [
+              :invalid_timestamp,
+              :invalid_signature_format,
+              :missing_raw_body,
+              :invalid_context_payload
+            ] do
+    send_resp(conn, 400, Jason.encode!(%{error: to_string(reason)}))
+  end
+
+  defp context_error_response(conn, reason)
+       when reason in [:invalid_signature, :timestamp_out_of_range, :replay] do
+    send_resp(conn, 403, Jason.encode!(%{error: to_string(reason)}))
+  end
+
+  defp context_error_response(conn, :webhook_secret_not_configured) do
+    send_resp(conn, 503, Jason.encode!(%{error: "webhook auth not configured"}))
+  end
+
+  defp context_error_response(conn, _reason) do
+    send_resp(conn, 400, Jason.encode!(%{error: "invalid request"}))
+  end
 
   defp enqueue_event(params) do
     case Task.Supervisor.start_child(ClaudeNotify.EventTaskSupervisor, fn ->
