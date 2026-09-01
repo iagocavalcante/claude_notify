@@ -125,6 +125,11 @@ defmodule ClaudeNotify.TelegramPollerTest do
       {:ok, %{"result" => true}}
     end
 
+    def answer_callback_query(callback_id, text \\ nil) do
+      forward({:telegram_callback_answer, callback_id, text})
+      {:ok, %{"result" => true}}
+    end
+
     # Minimal addition for story #242 (native command menu) - forwards the
     # exact command list so tests can assert register_bot_commands/1 sends
     # everything in one call, same observability shape as every other
@@ -537,12 +542,18 @@ defmodule ClaudeNotify.TelegramPollerTest do
       end
     end
 
-    defp callback_update(data, message_id \\ 1) do
+    defp callback_update(data, message_id \\ 1, text \\ nil) do
+      message =
+        %{"chat" => %{"id" => @chat_id}, "message_id" => message_id}
+        |> then(fn message ->
+          if is_binary(text), do: Map.put(message, "text", text), else: message
+        end)
+
       %{
         "callback_query" => %{
           "id" => "cbq-#{message_id}",
           "data" => data,
-          "message" => %{"chat" => %{"id" => @chat_id}, "message_id" => message_id}
+          "message" => message
         }
       }
     end
@@ -1022,6 +1033,45 @@ defmodule ClaudeNotify.TelegramPollerTest do
         assert_receive {:telegram_send, confirmation}
         assert confirmation =~ "Sent"
       end
+    end
+
+    test "permission button leaves persistent feedback and cannot inject twice", %{state: state} do
+      session_id = "permission-#{System.unique_integer([:positive])}"
+      tty_path = "/dev/ttys325"
+
+      SessionStore.register_prompt(session_id, "waiting", "/tmp/project", %{
+        "tty_path" => tty_path,
+        "engine" => "codex"
+      })
+
+      SessionStore.update_status(session_id, :waiting_input, %{
+        pending_question_message_id: 333
+      })
+
+      on_exit(fn -> SessionStore.remove_session(session_id) end)
+
+      update =
+        callback_update(
+          "#{session_id}:yes",
+          333,
+          "Codex Question\n\nAllow Bash?\n\nSession: #{String.slice(session_id, 0, 8)}"
+        )
+
+      assert TelegramPoller.handle_update(update, state) == state
+      assert_receive {:terminal_response, ^tty_path, "yes"}
+      assert_receive {:telegram_callback_answer, "cbq-333", "✅ Allowed"}
+      assert_receive {:telegram_edit_buttons, 333, edited, []}
+      assert edited =~ "Allow Bash?"
+      assert edited =~ "✅ Allowed"
+
+      session = SessionStore.get_session(session_id)
+      assert session.status == :active
+      assert session.pending_question_message_id == nil
+      assert session.last_answered_question_id == 333
+
+      TelegramPoller.handle_update(update, state)
+      assert_receive {:telegram_callback_answer, "cbq-333", "Already answered"}
+      refute_receive {:terminal_response, ^tty_path, "yes"}, 50
     end
 
     test "terminal chat sends quietly and reuses the Telegram message as the prompt", %{

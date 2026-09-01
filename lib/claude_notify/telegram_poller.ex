@@ -62,6 +62,7 @@ defmodule ClaudeNotify.TelegramPoller do
   require Logger
 
   alias ClaudeNotify.{
+    ActivityTracker,
     Telegram,
     SessionStore,
     ConversationStore,
@@ -351,9 +352,14 @@ defmodule ClaudeNotify.TelegramPoller do
           state
 
         {:response, session_id, response} ->
-          Telegram.answer_callback_query(callback_id, response_label(response))
-          inject_response(state, session_id, response)
-          state
+          handle_permission_response(
+            callback_id,
+            message_id,
+            get_in(callback_query, ["message", "text"]),
+            session_id,
+            response,
+            state
+          )
 
         {:job_diff, job_id} ->
           Telegram.answer_callback_query(callback_id, "Fetching diff...")
@@ -511,6 +517,9 @@ defmodule ClaudeNotify.TelegramPoller do
 
               response ->
                 if inject_response(state, session_id, response) == :ok do
+                  question_id = pending_question_id(session_id, reply_message_id)
+                  resume_after_response(session_id, response, question_id)
+                  clear_question_buttons(state, question_id)
                   short = String.slice(session_id, 0, 8)
 
                   state.telegram.send_message_with_retry(
@@ -918,6 +927,9 @@ defmodule ClaudeNotify.TelegramPoller do
     case resolve_session(chat_id, state) do
       {:ok, session_id, state} ->
         if inject_response(state, session_id, response) == :ok do
+          question_id = pending_question_id(session_id, nil)
+          resume_after_response(session_id, response, question_id)
+          clear_question_buttons(state, question_id)
           label = response_label(response)
 
           state.telegram.send_message_with_retry(
@@ -3197,12 +3209,114 @@ defmodule ClaudeNotify.TelegramPoller do
     end
   end
 
+  defp handle_permission_response(
+         callback_id,
+         message_id,
+         original_text,
+         session_id,
+         response,
+         state
+       ) do
+    session = SessionStore.get_session(session_id)
+
+    cond do
+      is_nil(session) ->
+        state.telegram.answer_callback_query(callback_id, "Session is no longer available")
+        state
+
+      is_integer(message_id) and session[:last_answered_question_id] == message_id ->
+        state.telegram.answer_callback_query(callback_id, "Already answered")
+        state
+
+      inject_response(state, session_id, response) == :ok ->
+        feedback = response_feedback_label(response)
+        resume_after_response(session_id, response, message_id)
+        state.telegram.answer_callback_query(callback_id, feedback)
+        persist_question_feedback(state, message_id, original_text, feedback, session_id)
+        state
+
+      true ->
+        state.telegram.answer_callback_query(callback_id, "Could not send answer")
+        state
+    end
+  end
+
+  defp persist_question_feedback(state, message_id, original_text, feedback, session_id)
+       when is_integer(message_id) and is_binary(original_text) and original_text != "" do
+    updated_text =
+      MessageFormatter.html_escape_public(original_text) <>
+        "\n\n<b>#{MessageFormatter.html_escape_public(feedback)}</b>"
+
+    case state.telegram.edit_message_text_with_buttons_html_retry(message_id, updated_text, []) do
+      {:ok, _result} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("TelegramPoller: permission feedback edit failed: #{inspect(reason)}")
+        send_response_confirmation(state, feedback, session_id)
+    end
+  end
+
+  defp persist_question_feedback(state, message_id, _original_text, feedback, session_id) do
+    clear_question_buttons(state, message_id)
+    send_response_confirmation(state, feedback, session_id)
+  end
+
+  defp send_response_confirmation(state, feedback, session_id) do
+    short_id = String.slice(session_id, 0, 8)
+
+    state.telegram.send_message_with_retry(
+      MessageFormatter.escape_full("#{feedback} (#{short_id})")
+    )
+  end
+
+  defp clear_question_buttons(state, message_id) when is_integer(message_id) do
+    case state.telegram.edit_message_reply_markup_with_retry(message_id, []) do
+      {:ok, _result} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("TelegramPoller: failed to clear answered question: #{inspect(reason)}")
+    end
+  end
+
+  defp clear_question_buttons(_state, _message_id), do: :ok
+
+  defp pending_question_id(_session_id, explicit_message_id)
+       when is_integer(explicit_message_id),
+       do: explicit_message_id
+
+  defp pending_question_id(session_id, _explicit_message_id) do
+    case SessionStore.get_session(session_id) do
+      %{pending_question_message_id: message_id} when is_integer(message_id) -> message_id
+      _session -> nil
+    end
+  end
+
+  defp resume_after_response(session_id, response, message_id) do
+    SessionStore.update_status(session_id, :active, %{
+      last_response: response,
+      last_answered_question_id: message_id,
+      pending_question_message_id: nil
+    })
+
+    ActivityTracker.resume_session(session_id)
+    Dashboard.refresh()
+  end
+
   defp response_label("yes"), do: "Sent: Yes"
   defp response_label("yes_dont_ask"), do: "Sent: Yes (don't ask)"
   defp response_label("no"), do: "Sent: No"
   defp response_label("escape"), do: "Sent: Escape"
   defp response_label("opt_" <> n), do: "Sent: Option #{n}"
   defp response_label(_), do: "Sent"
+
+  defp response_feedback_label("yes"), do: "✅ Allowed"
+  defp response_feedback_label("yes_dont_ask"), do: "✅ Allowed · don't ask again"
+  defp response_feedback_label("no"), do: "🚫 Denied"
+  defp response_feedback_label("escape"), do: "⏹ Cancelled"
+  defp response_feedback_label("opt_" <> n), do: "✅ Chose option #{n}"
+  defp response_feedback_label(_response), do: "✅ Answer sent"
 
   defp session_status_display(:active), do: "working"
   defp session_status_display(:waiting_input), do: "waiting"

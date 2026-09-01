@@ -9,7 +9,7 @@ Elixir app that sends interactive Telegram notifications for Claude Code and Cod
 - **Consolidated diffs** — `git diff` shown inline before permission prompts and at session end so you see exactly what changed
 - **Reply-to-session** — reply to any message to send text to that session's terminal (no need to `/select` first)
 - **Restart-safe terminal companion** — the selected Claude/Codex terminal, transcript cursor, reply routing, and bounded recent chat survive bot restarts
-- **Interactive approvals** — respond to permission prompts with Yes / No / Yes (don't ask) / Esc directly from Telegram
+- **Interactive approvals** — respond to permission prompts with Yes / No / Yes (don't ask) / Esc directly from Telegram; answered prompts keep the result visible and remove stale buttons
 - **Numbered option support** — for multi-choice prompts, choose options `1..9` from inline buttons
 - **Safer terminal injection** — text input is sent via clipboard paste with TTY validation
 - **Security hardening** — signed hook events (HMAC), replay protection, and Telegram chat authorization

@@ -205,12 +205,23 @@ defmodule ClaudeNotify.EventHandler do
         do: [["📄 See more", "more:#{session_id}"] | buttons],
         else: buttons
 
-    notify_with_buttons_and_register(text, buttons, session_id,
-      full_text:
-        if(truncated?,
-          do: MessageFormatter.notification_question_full(message, session_id, engine)
-        )
-    )
+    notification_result =
+      notify_with_buttons_and_register(text, buttons, session_id,
+        full_text:
+          if(truncated?,
+            do: MessageFormatter.notification_question_full(message, session_id, engine)
+          )
+      )
+
+    case notification_result do
+      {:ok, message_id} ->
+        SessionStore.update_status(session_id, :waiting_input, %{
+          pending_question_message_id: message_id
+        })
+
+      _other ->
+        :ok
+    end
 
     Dashboard.refresh()
   end
@@ -295,7 +306,7 @@ defmodule ClaudeNotify.EventHandler do
           _ -> :ok
         end
 
-        :ok
+        {:ok, mid}
 
       {:ok, _} ->
         :ok
