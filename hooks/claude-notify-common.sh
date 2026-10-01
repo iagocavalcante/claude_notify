@@ -110,5 +110,42 @@ resolve_terminal_tty() {
     pid="$parent_pid"
   done
 
-  printf 'unknown\n'
+  resolve_codex_tui_tty "$1"
+}
+
+# Codex (daemon_auto_start) runs the agent, and therefore its hooks, inside the
+# app-server daemon, which has no terminal ancestor. Locate the interactive
+# `codex` TUI attached to a Terminal TTY whose working directory matches the
+# hook payload's cwd. Ambiguous (0 or 2+ matches) means "unknown" so a wrong
+# terminal never receives keystrokes.
+# ponytail: cwd match only; two Codex TUIs in the same directory stay unknown.
+resolve_codex_tui_tty() {
+  local cwd="$1" pid tty_dev proc_cwd found=""
+
+  if [ "${CLAUDE_NOTIFY_ENGINE:-claude}" != "codex" ] || [ -z "$cwd" ]; then
+    printf 'unknown\n'
+    return 0
+  fi
+
+  for pid in $(pgrep -f 'bin/codex' 2>/dev/null); do
+    tty_dev="$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')"
+    [[ "$tty_dev" =~ ^ttys[0-9]+$ ]] || continue
+    case "$(ps -o args= -p "$pid" 2>/dev/null)" in
+      *" exec "*|*" app-server"*|*" mcp"*|*" login"*) continue ;;
+    esac
+    proc_cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')"
+    [ "$proc_cwd" = "$cwd" ] || continue
+    if [ -n "$found" ] && [ "$found" != "/dev/$tty_dev" ]; then
+      printf 'unknown\n'
+      return 0
+    fi
+    found="/dev/$tty_dev"
+  done
+
+  printf '%s\n' "${found:-unknown}"
+}
+
+# cwd from the hook's stdin JSON, for resolve_terminal_tty's Codex fallback.
+payload_cwd() {
+  printf '%s' "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("cwd",""))' 2>/dev/null
 }

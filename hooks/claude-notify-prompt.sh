@@ -9,7 +9,7 @@ SESSION_ID="${CLAUDE_SESSION_ID:-unknown}"
 PROMPT="${CLAUDE_PROMPT:-}"
 WORKING_DIR="${CLAUDE_WORKING_DIRECTORY:-$(pwd)}"
 TERM_SID="${TERM_SESSION_ID:-unknown}"
-TTY_PATH="$(resolve_terminal_tty)"
+TTY_PATH="$(resolve_terminal_tty "$(payload_cwd "$INPUT")")"
 [ "$TTY_PATH" = "unknown" ] && exit 0
 
 # Codex provides the values on stdin; Claude also provides the same fields on

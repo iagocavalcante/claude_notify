@@ -5,7 +5,7 @@ source "$(dirname "$0")/claude-notify-common.sh"
 
 INPUT=$(cat)
 TERM_SID="${TERM_SESSION_ID:-unknown}"
-TTY_PATH="$(resolve_terminal_tty)"
+TTY_PATH="$(resolve_terminal_tty "$(payload_cwd "$INPUT")")"
 [ "$TTY_PATH" = "unknown" ] && exit 0
 
 PAYLOAD=$(echo "$INPUT" | python3 -c '

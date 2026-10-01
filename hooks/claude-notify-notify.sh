@@ -7,7 +7,7 @@ INPUT=$(cat)
 
 SESSION_ID="${CLAUDE_SESSION_ID:-unknown}"
 TERM_SID="${TERM_SESSION_ID:-unknown}"
-TTY_PATH="$(resolve_terminal_tty)"
+TTY_PATH="$(resolve_terminal_tty "$(payload_cwd "$INPUT")")"
 [ "$TTY_PATH" = "unknown" ] && exit 0
 
 # Capture git diff for the working directory
