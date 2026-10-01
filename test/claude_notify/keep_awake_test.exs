@@ -12,6 +12,24 @@ defmodule ClaudeNotify.KeepAwakeTest do
     refute KeepAwake.working?(%{"a" => %{status: :idle}}, [])
   end
 
+  test "idle terminal sessions hold the Mac awake when include_idle is set" do
+    assert KeepAwake.working?(%{"a" => %{status: :idle}}, [], [], include_idle: true)
+    refute KeepAwake.working?(%{}, [], [], include_idle: true)
+  end
+
+  test "releasing the assertion kills the caffeinate OS process" do
+    {:ok, pid} =
+      KeepAwake.start_link(name: nil, executable: "/bin/sleep", refresh_interval: :timer.hours(1))
+
+    port = Port.open({:spawn_executable, "/bin/sleep"}, [:binary, :exit_status, args: ["30"]])
+    {:os_pid, os_pid} = Port.info(port, :os_pid)
+    :sys.replace_state(pid, &%{&1 | port: port})
+
+    GenServer.stop(pid)
+    Process.sleep(100)
+    assert {_, 1} = System.cmd("kill", ["-0", Integer.to_string(os_pid)], stderr_to_stdout: true)
+  end
+
   test "unfinished dispatcher jobs keep the Mac awake" do
     for status <- [:queued, :running, :awaiting_input] do
       assert KeepAwake.working?(%{}, [%{status: status}])

@@ -135,6 +135,12 @@ if config_env() != :test do
       }
     },
     keep_awake_while_working: parse_bool.(System.get_env("CLAUDE_NOTIFY_KEEP_AWAKE"), true),
+    keep_awake_while_idle: parse_bool.(System.get_env("CLAUDE_NOTIFY_KEEP_AWAKE_IDLE"), false),
     max_event_concurrency: parse_int.(System.get_env("MAX_EVENT_CONCURRENCY"), 8),
-    webhook_max_skew_seconds: parse_int.(System.get_env("WEBHOOK_MAX_SKEW_SECONDS"), 300)
+    webhook_max_skew_seconds: parse_int.(System.get_env("WEBHOOK_MAX_SKEW_SECONDS"), 300),
+    # Optional: TypeSafe (Jev) interprets ambiguous free-text replies to a
+    # pending permission/choice prompt as a button press. Unset = feature
+    # off - ClaudeNotify.ReplyInterpreter always returns :free_text and
+    # makes no HTTP call.
+    typesafe_api_key: System.get_env("TYPESAFE_API_KEY")
 end

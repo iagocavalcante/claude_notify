@@ -197,6 +197,9 @@ WEBHOOK_MAX_SKEW_SECONDS=300
 CLAUDE_NOTIFY_WORKSPACE_ROOTS="$HOME/Workspaces"
 # Set false to disable automatic `caffeinate -i` while work is active
 CLAUDE_NOTIFY_KEEP_AWAKE=true
+# Set true to also hold the assertion while idle terminal sessions exist, so a
+# locked Mac still receives scheduled wakeups and Telegram replies
+CLAUDE_NOTIFY_KEEP_AWAKE_IDLE=false
 # Add --chrome to Claude dispatcher/resume processes (requires a paired extension)
 CLAUDE_NOTIFY_CLAUDE_CHROME=true
 

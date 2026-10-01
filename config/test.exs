@@ -18,5 +18,7 @@ config :claude_notify,
   memory_pages_root: nil,
   preview_store_path: nil,
   keep_awake_while_working: false,
+  keep_awake_while_idle: false,
   start_poller: false,
-  start_job_reconciler: false
+  start_job_reconciler: false,
+  typesafe_api_key: nil

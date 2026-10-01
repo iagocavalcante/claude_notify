@@ -5,6 +5,10 @@ defmodule ClaudeNotify.KeepAwake do
   The process owns one `caffeinate -i` child and releases it as soon as all
   terminal sessions and dispatcher jobs become idle or finish. Display sleep
   is intentionally unaffected.
+
+  With `keep_awake_while_idle: true` (`CLAUDE_NOTIFY_KEEP_AWAKE_IDLE`), any
+  registered terminal session holds the assertion, including idle ones, so a
+  locked Mac stays reachable for scheduled wakeups and Telegram replies.
   """
 
   use GenServer
@@ -22,10 +26,11 @@ defmodule ClaudeNotify.KeepAwake do
   end
 
   @doc false
-  def working?(sessions, jobs, previews \\ []) do
+  def working?(sessions, jobs, previews \\ [], opts \\ []) do
     session_values = if is_map(sessions), do: Map.values(sessions), else: sessions
+    include_idle? = Keyword.get(opts, :include_idle, false)
 
-    Enum.any?(session_values, &(&1[:status] in @working_session_statuses)) or
+    Enum.any?(session_values, &(include_idle? or &1[:status] in @working_session_statuses)) or
       Enum.any?(jobs, &(&1.status in @working_job_statuses)) or previews != []
   end
 
@@ -37,7 +42,13 @@ defmodule ClaudeNotify.KeepAwake do
      %{
        port: nil,
        executable: opts[:executable] || "/usr/bin/caffeinate",
-       refresh_interval: opts[:refresh_interval] || @refresh_interval
+       refresh_interval: opts[:refresh_interval] || @refresh_interval,
+       include_idle:
+         Keyword.get(
+           opts,
+           :include_idle,
+           Application.get_env(:claude_notify, :keep_awake_while_idle, false)
+         )
      }}
   end
 
@@ -66,7 +77,9 @@ defmodule ClaudeNotify.KeepAwake do
 
   defp reconcile(state) do
     working =
-      working?(SessionStore.terminal_sessions(), JobStore.list(), PreviewManager.list())
+      working?(SessionStore.terminal_sessions(), JobStore.list(), PreviewManager.list(),
+        include_idle: state.include_idle
+      )
 
     cond do
       working and is_nil(state.port) -> start_caffeinate(state)
@@ -102,8 +115,19 @@ defmodule ClaudeNotify.KeepAwake do
 
   defp stop_caffeinate(nil), do: :ok
 
+  # Closing the port only closes caffeinate's stdin; `caffeinate -w` keeps
+  # running until the watched VM exits, so the OS process must be killed or
+  # every work cycle leaks one more sleep assertion.
   defp stop_caffeinate(port) do
-    if Port.info(port), do: Port.close(port)
+    case Port.info(port, :os_pid) do
+      {:os_pid, os_pid} ->
+        System.cmd("kill", [Integer.to_string(os_pid)], stderr_to_stdout: true)
+        Port.close(port)
+
+      nil ->
+        :ok
+    end
+
     :ok
   rescue
     ArgumentError -> :ok
