@@ -66,6 +66,7 @@ defmodule ClaudeNotify.TelegramPoller do
     Telegram,
     SessionStore,
     ConversationStore,
+    EventHandler,
     TerminalInjector,
     MessageFormatter,
     Dashboard,
@@ -76,6 +77,7 @@ defmodule ClaudeNotify.TelegramPoller do
     PreviewManager,
     ProjectRegistry,
     ProjectScope,
+    ReplyInterpreter,
     WorktreeManager
   }
 
@@ -137,6 +139,7 @@ defmodule ClaudeNotify.TelegramPoller do
        selected_engines: %{},
        telegram: Keyword.get(opts, :telegram, Telegram),
        terminal_injector: Keyword.get(opts, :terminal_injector, TerminalInjector),
+       reply_interpreter: Keyword.get(opts, :reply_interpreter, ReplyInterpreter),
        job_store: Keyword.get(opts, :job_store, JobStore),
        conversation_store: Keyword.get(opts, :conversation_store, ConversationStore),
        job_transcript: Keyword.get(opts, :job_transcript, JobTranscript),
@@ -511,11 +514,11 @@ defmodule ClaudeNotify.TelegramPoller do
           if session do
             state = bind_terminal_chat(state, chat_id, session_id)
 
-            case shortcut_response(text) do
-              nil ->
+            case resolve_response(text, session_id, state) do
+              :free_text ->
                 inject_reply_text(text, session, inbound_message_id, state)
 
-              response ->
+              {:code, response, interpreted?} ->
                 if inject_response(state, session_id, response) == :ok do
                   question_id = pending_question_id(session_id, reply_message_id)
                   resume_after_response(session_id, response, question_id)
@@ -523,7 +526,9 @@ defmodule ClaudeNotify.TelegramPoller do
                   short = String.slice(session_id, 0, 8)
 
                   state.telegram.send_message_with_retry(
-                    MessageFormatter.escape_full("#{response_label(response)} (#{short})")
+                    MessageFormatter.escape_full(
+                      "#{confirmation_label(response, interpreted?)} (#{short})"
+                    )
                   )
                 end
 
@@ -668,6 +673,57 @@ defmodule ClaudeNotify.TelegramPoller do
   end
 
   def shortcut_response(_), do: nil
+
+  # Maps text to a button-equivalent response code: an exact shortcut first
+  # (shortcut_response/1 above), then - only when session_id names a session
+  # actually waiting on a pending question - a confident TypeSafe/Jev
+  # interpretation of free text via ClaudeNotify.ReplyInterpreter. A nil
+  # session_id (no unambiguous target - see the standalone-text call site),
+  # an idle session, or a session with no pending question never reaches the
+  # interpreter and never makes an HTTP call.
+  defp resolve_response(text, session_id, state) do
+    case shortcut_response(text) do
+      nil -> maybe_interpret_reply(text, session_id, state)
+      response -> {:code, response, false}
+    end
+  end
+
+  defp maybe_interpret_reply(text, session_id, state) do
+    case pending_question_context(session_id) do
+      nil ->
+        :free_text
+
+      {question_text, options} ->
+        interpreter = Map.get(state, :reply_interpreter, ReplyInterpreter)
+
+        case interpreter.interpret(text, question_text, options) do
+          {:ok, response} -> {:code, response, true}
+          :free_text -> :free_text
+        end
+    end
+  end
+
+  defp pending_question_context(nil), do: nil
+
+  defp pending_question_context(session_id) do
+    with %{status: :waiting_input, pending_question_message_id: mid}
+         when is_integer(mid) <- SessionStore.get_session(session_id),
+         %{text: question_text} <- latest_question_entry(session_id) do
+      {question_text, EventHandler.parse_numbered_options(question_text)}
+    else
+      _ -> nil
+    end
+  end
+
+  defp latest_question_entry(session_id) do
+    session_id
+    |> SessionStore.history(20)
+    |> Enum.filter(&(&1.role == :question))
+    |> List.last()
+  end
+
+  defp confirmation_label(response, true), do: "#{response_label(response)} (interpreted)"
+  defp confirmation_label(response, false), do: response_label(response)
 
   # --- Attachment handling ---
   #
@@ -914,26 +970,35 @@ defmodule ClaudeNotify.TelegramPoller do
         handle_text_input(chat_id, trimmed, state, inbound_message_id)
 
       true ->
-        case shortcut_response(trimmed) do
-          nil -> handle_text_input(chat_id, trimmed, state, inbound_message_id)
-          response -> handle_shortcut_command(chat_id, response, state)
+        # selected_terminal_session/2 is a read-only peek (no binding, no
+        # Telegram messages) - it only names an ALREADY selected/bound
+        # session, so a plain "go ahead and refactor X" to an idle or
+        # unselected session never reaches the interpreter and stays a
+        # prompt, exactly as before this session had a pending question.
+        case resolve_response(trimmed, selected_terminal_session(state, chat_id), state) do
+          {:code, response, interpreted?} ->
+            handle_shortcut_command(chat_id, response, state, interpreted?)
+
+          :free_text ->
+            handle_text_input(chat_id, trimmed, state, inbound_message_id)
         end
     end
   end
 
   # --- Shortcut commands (cancel/approve) ---
 
-  defp handle_shortcut_command(chat_id, response, state) do
+  defp handle_shortcut_command(chat_id, response, state, interpreted? \\ false) do
     case resolve_session(chat_id, state) do
       {:ok, session_id, state} ->
         if inject_response(state, session_id, response) == :ok do
           question_id = pending_question_id(session_id, nil)
           resume_after_response(session_id, response, question_id)
           clear_question_buttons(state, question_id)
-          label = response_label(response)
 
           state.telegram.send_message_with_retry(
-            MessageFormatter.escape_full("#{label} (#{String.slice(session_id, 0, 8)})")
+            MessageFormatter.escape_full(
+              "#{confirmation_label(response, interpreted?)} (#{String.slice(session_id, 0, 8)})"
+            )
           )
         end
 

@@ -180,6 +180,27 @@ defmodule ClaudeNotify.TelegramPollerTest do
     end
   end
 
+  # Stub for ClaudeNotify.ReplyInterpreter (story: TypeSafe/Jev free-text
+  # interpretation of replies to a pending permission/choice prompt).
+  # Records every call and returns whatever
+  # :claude_notify, :fake_reply_interpreter_response says - same
+  # Application.put_env/on_exit pattern this file already uses for
+  # telegram_chat_id, so each test controls the outcome without a real
+  # TypeSafe request.
+  defmodule FakeReplyInterpreter do
+    def interpret(text, question_text, options) do
+      forward({:reply_interpreter_call, text, question_text, options})
+      Application.get_env(:claude_notify, :fake_reply_interpreter_response, :free_text)
+    end
+
+    defp forward(message) do
+      case Process.whereis(:telegram_poller_test_process) do
+        nil -> send(self(), message)
+        pid -> send(pid, message)
+      end
+    end
+  end
+
   defmodule FakePreviewManager do
     def start_preview(_server, job) do
       forward({:preview_started, job.id})
@@ -1033,6 +1054,97 @@ defmodule ClaudeNotify.TelegramPollerTest do
         assert_receive {:telegram_send, confirmation}
         assert confirmation =~ "Sent"
       end
+    end
+
+    # -- ReplyInterpreter wiring (TypeSafe/Jev free-text interpretation) --
+
+    test "a non-shortcut reply to a session with a pending question is interpreted as a button press",
+         %{state: state} do
+      session_id = "interpret-#{System.unique_integer([:positive])}"
+      tty_path = "/dev/ttys330"
+
+      SessionStore.register_prompt(session_id, "waiting", "/tmp/project", %{
+        "tty_path" => tty_path
+      })
+
+      SessionStore.update_status(session_id, :waiting_input, %{pending_question_message_id: 900})
+      SessionStore.append_history(session_id, :question, "Allow Bash(rm -rf /tmp)?")
+
+      on_exit(fn -> SessionStore.remove_session(session_id) end)
+      on_exit(fn -> Application.delete_env(:claude_notify, :fake_reply_interpreter_response) end)
+
+      Application.put_env(:claude_notify, :fake_reply_interpreter_response, {:ok, "yes"})
+
+      state =
+        state
+        |> Map.put(:selected_sessions, %{@chat_id => session_id})
+        |> Map.put(:reply_interpreter, FakeReplyInterpreter)
+
+      assert TelegramPoller.handle_update(text_message("sim, pode rodar"), state) == state
+
+      assert_receive {:reply_interpreter_call, "sim, pode rodar", "Allow Bash(rm -rf /tmp)?", []}
+      assert_receive {:terminal_response, ^tty_path, "yes"}
+      refute_receive {:terminal_text, ^tty_path, _}, 50
+
+      assert_receive {:telegram_send, confirmation}
+      assert confirmation =~ "Sent"
+      assert confirmation =~ "interpreted"
+    end
+
+    test "a non-shortcut reply to an idle session (no pending question) is injected as text, and the interpreter is never called",
+         %{state: state} do
+      session_id = "idle-#{System.unique_integer([:positive])}"
+      tty_path = "/dev/ttys331"
+
+      SessionStore.register_prompt(session_id, "waiting", "/tmp/project", %{
+        "tty_path" => tty_path
+      })
+
+      on_exit(fn -> SessionStore.remove_session(session_id) end)
+
+      state =
+        state
+        |> Map.put(:selected_sessions, %{@chat_id => session_id})
+        |> Map.put(:reply_interpreter, FakeReplyInterpreter)
+
+      assert TelegramPoller.handle_update(text_message("go ahead and refactor X"), state) ==
+               state
+
+      assert_receive {:terminal_text, ^tty_path, "go ahead and refactor X"}
+      refute_receive {:reply_interpreter_call, _text, _question, _options}, 50
+      refute_receive {:terminal_response, ^tty_path, _response}, 50
+    end
+
+    test "a reply the interpreter does not confidently resolve falls back to plain text injection",
+         %{state: state} do
+      session_id = "freetext-#{System.unique_integer([:positive])}"
+      tty_path = "/dev/ttys332"
+
+      SessionStore.register_prompt(session_id, "waiting", "/tmp/project", %{
+        "tty_path" => tty_path
+      })
+
+      SessionStore.update_status(session_id, :waiting_input, %{pending_question_message_id: 901})
+      SessionStore.append_history(session_id, :question, "Allow Bash(rm -rf /tmp)?")
+
+      on_exit(fn -> SessionStore.remove_session(session_id) end)
+      on_exit(fn -> Application.delete_env(:claude_notify, :fake_reply_interpreter_response) end)
+
+      Application.put_env(:claude_notify, :fake_reply_interpreter_response, :free_text)
+
+      state =
+        state
+        |> Map.put(:selected_sessions, %{@chat_id => session_id})
+        |> Map.put(:reply_interpreter, FakeReplyInterpreter)
+
+      assert TelegramPoller.handle_update(text_message("why does it need that?"), state) ==
+               state
+
+      assert_receive {:reply_interpreter_call, "why does it need that?",
+                      "Allow Bash(rm -rf /tmp)?", []}
+
+      assert_receive {:terminal_text, ^tty_path, "why does it need that?"}
+      refute_receive {:terminal_response, ^tty_path, _response}, 50
     end
 
     test "permission button leaves persistent feedback and cannot inject twice", %{state: state} do

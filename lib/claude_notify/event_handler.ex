@@ -252,7 +252,12 @@ defmodule ClaudeNotify.EventHandler do
     option_buttons ++ [["Esc", "#{session_id}:escape"]]
   end
 
-  defp parse_numbered_options(message) when is_binary(message) do
+  # Public (but undocumented) so ClaudeNotify.TelegramPoller's
+  # ClaudeNotify.ReplyInterpreter wiring can parse a session's stored
+  # question text the same way this module does when the notification first
+  # arrived, without duplicating the regex.
+  @doc false
+  def parse_numbered_options(message) when is_binary(message) do
     message
     |> String.split("\n")
     |> Enum.flat_map(fn line ->
@@ -263,7 +268,7 @@ defmodule ClaudeNotify.EventHandler do
     end)
   end
 
-  defp parse_numbered_options(_), do: []
+  def parse_numbered_options(_), do: []
 
   defp maybe_send_diff(nil, _session_id), do: :ok
   defp maybe_send_diff("", _session_id), do: :ok
