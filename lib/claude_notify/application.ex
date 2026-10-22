@@ -21,6 +21,7 @@ defmodule ClaudeNotify.Application do
         ClaudeNotify.Dashboard,
         ClaudeNotify.JobStore,
         ClaudeNotify.ConversationStore,
+        ClaudeNotify.WorkspaceStore,
         ClaudeNotify.PreviewManager
       ] ++
         keep_awake_child() ++
@@ -31,6 +32,7 @@ defmodule ClaudeNotify.Application do
         ] ++
         reconciler_child() ++
         [
+          {Task.Supervisor, name: ClaudeNotify.VoiceTaskSupervisor, max_children: 1},
           {Task.Supervisor,
            name: ClaudeNotify.EventTaskSupervisor, max_children: max_event_concurrency},
           {Bandit, plug: ClaudeNotify.Router, port: port}

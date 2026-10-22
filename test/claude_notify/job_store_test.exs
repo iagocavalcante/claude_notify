@@ -161,6 +161,14 @@ defmodule ClaudeNotify.JobStoreTest do
     assert Enum.count(JobStore.list(store)) == 2
   end
 
+  test "schedule occurrence keys create exactly one durable job", %{store: store} do
+    request = Map.put(attrs(), :schedule_key, "daily:1234")
+    assert {:ok, first} = JobStore.create(store, request)
+    assert {:ok, same} = JobStore.create(store, request)
+    assert first.id == same.id
+    assert length(JobStore.list(store)) == 1
+  end
+
   test "state survives a store restart (disk reload)", %{tmp_dir: tmp_dir} do
     path = Path.join(tmp_dir, "restart.dat")
     name = :"job_store_restart_#{System.unique_integer([:positive])}"

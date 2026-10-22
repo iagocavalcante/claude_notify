@@ -112,6 +112,7 @@ defmodule ClaudeNotify.JobRunner do
     :session_id,
     :resume_session_id,
     :last_summary,
+    :last_text,
     engine_opts: [],
     buffer: "",
     finalized: false,
@@ -372,7 +373,7 @@ defmodule ClaudeNotify.JobRunner do
   end
 
   defp terminal_extras(state, :completed) do
-    %{engine_session_id: state.session_id}
+    %{engine_session_id: state.session_id, summary: state.last_summary || state.last_text}
   end
 
   defp raw_tail(%{raw_lines: []}), do: nil
@@ -395,7 +396,7 @@ defmodule ClaudeNotify.JobRunner do
 
     state.notifier.(
       {:completed, state.job_id,
-       %{status: status, summary: state.last_summary, transcript: transcript}}
+       %{status: status, summary: state.last_summary || state.last_text, transcript: transcript}}
     )
 
     JobTranscript.discard(state.job_transcript, state.job_id)
@@ -475,6 +476,7 @@ defmodule ClaudeNotify.JobRunner do
 
       {:ok, {:text, text}} ->
         state
+        |> Map.put(:last_text, text)
         |> capture_dispatcher(:assistant_text, %{body: text})
         |> record_transcript_text(text)
 

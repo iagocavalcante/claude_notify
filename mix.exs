@@ -4,7 +4,7 @@ defmodule ClaudeNotify.MixProject do
   def project do
     [
       app: :claude_notify,
-      version: "0.1.0",
+      version: "0.2.0",
       elixir: "~> 1.19",
       start_permanent: Mix.env() != :test,
       deps: deps()

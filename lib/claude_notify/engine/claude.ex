@@ -51,7 +51,8 @@ defmodule ClaudeNotify.Engine.Claude do
   @impl true
   def build_command(prompt, opts) do
     {"claude",
-     chrome_args(opts) ++
+     model_args(opts) ++
+       chrome_args(opts) ++
        [
          "-p",
          prompt,
@@ -65,7 +66,8 @@ defmodule ClaudeNotify.Engine.Claude do
   @impl true
   def resume_command(session_id, prompt, opts) do
     {"claude",
-     chrome_args(opts) ++
+     model_args(opts) ++
+       chrome_args(opts) ++
        [
          "-p",
          "--resume",
@@ -87,6 +89,13 @@ defmodule ClaudeNotify.Engine.Claude do
       )
 
     if enabled, do: ["--chrome"], else: []
+  end
+
+  defp model_args(opts) do
+    case Keyword.get(opts, :model) do
+      nil -> []
+      model when is_binary(model) -> ["--model", model]
+    end
   end
 
   @impl true

@@ -312,7 +312,7 @@ defmodule ClaudeNotify.TelegramPollerTest do
 
       assert Enum.map(commands, &elem(&1, 0)) == ~w(
                new agent fresh sessions history approve cancel dashboard run jobs projects memory watch unwatch
-               preview previews unpreview help
+               preview previews unpreview chats queue model doctor workflow schedule audit home help
              )
 
       assert Enum.all?(commands, fn {command, description} ->
@@ -415,7 +415,11 @@ defmodule ClaudeNotify.TelegramPollerTest do
          name: conversation_store, path: Path.join(tmp_dir, "conversations.dat")}
       )
 
+      workspace = :"workspace_#{System.unique_integer([:positive])}"
+      start_supervised!({ClaudeNotify.WorkspaceStore, name: workspace, path: nil})
+
       state = %{
+        workspace_store: workspace,
         offset: 0,
         selected_sessions: %{},
         telegram: FakeTelegram,
@@ -430,6 +434,327 @@ defmodule ClaudeNotify.TelegramPollerTest do
       }
 
       %{store: store, registry: registry, transcript: transcript, state: state}
+    end
+
+    test "saved chats reopen their native job chain without stealing another chat's queue", %{
+      state: state,
+      store: store
+    } do
+      selected = select_trainer(state)
+      first_state = TelegramPoller.handle_update(text_message("first chat"), selected)
+      [first] = JobStore.list(store)
+      wait_for_status(store, first.id, :completed)
+      first_chat = ConversationStore.get(state.conversation_store, @chat_id)
+      TelegramPoller.handle_update(text_message("/chats rename Login fix"), first_state)
+      fresh = TelegramPoller.handle_update(text_message("/fresh"), first_state)
+
+      reopened =
+        TelegramPoller.handle_update(callback_update("workspace:chat:#{first_chat.id}"), fresh)
+
+      assert %{name: "Login fix", head_job_id: head} =
+               ConversationStore.get(state.conversation_store, @chat_id)
+
+      assert head == first.id
+      TelegramPoller.handle_update(text_message("continue the first chat"), reopened)
+      [_, second] = JobStore.list(store)
+      second = wait_for_status(store, second.id, :completed)
+      assert second.parent_job_id == first.id
+      assert second.worktree_path == JobStore.get(store, first.id).worktree_path
+    end
+
+    test "paused queues do not drain, resume starts the next turn", %{state: state, store: store} do
+      selected = select_trainer(state)
+      running = TelegramPoller.handle_update(text_message("FIXTURE_SLOW work"), selected)
+      TelegramPoller.handle_update(text_message("/queue pause"), running)
+      TelegramPoller.handle_update(text_message("later"), running)
+      [first] = JobStore.list(store)
+      wait_for_status(store, first.id, :completed)
+
+      assert {:noreply, paused} =
+               TelegramPoller.handle_info({:watch_completed, first.id, []}, running)
+
+      assert length(JobStore.list(store)) == 1
+      TelegramPoller.handle_update(text_message("/queue resume"), paused)
+      [_, second] = JobStore.list(store)
+      wait_for_status(store, second.id, :completed)
+    end
+
+    test "a background chat drains its queue and restores the visible conversation", %{
+      state: state,
+      store: store
+    } do
+      selected = select_trainer(state)
+      running = TelegramPoller.handle_update(text_message("FIXTURE_SLOW background"), selected)
+      TelegramPoller.handle_update(text_message("background follow-up"), running)
+      [first] = JobStore.list(store)
+      fresh = TelegramPoller.handle_update(text_message("/fresh"), running)
+      visible = ConversationStore.get(state.conversation_store, @chat_id)
+      wait_for_status(store, first.id, :completed)
+      assert {:noreply, _} = TelegramPoller.handle_info({:watch_completed, first.id, []}, fresh)
+      [_, second] = JobStore.list(store)
+      second = wait_for_status(store, second.id, :completed)
+      assert second.parent_job_id == first.id
+      assert ConversationStore.get(state.conversation_store, @chat_id).id == visible.id
+    end
+
+    for lead <- ["claude", "codex"] do
+      test "workflow builds with #{lead} then reviews with the other in one worktree",
+           %{state: state, store: store} do
+        selected = select_trainer(state)
+
+        selected =
+          TelegramPoller.handle_update(text_message("/agent " <> unquote(lead)), selected)
+
+        reviewer = if unquote(lead) == "claude", do: "codex", else: "claude"
+        configured = TelegramPoller.handle_update(text_message("/workflow build"), selected)
+        running = TelegramPoller.handle_update(text_message("ship the feature"), configured)
+        [first] = JobStore.list(store)
+        first = wait_for_status(store, first.id, :completed)
+
+        assert [%{engine: ^reviewer, prompt: "[Reviewer]" <> _}] =
+                 ConversationStore.get(state.conversation_store, @chat_id).pending
+
+        assert {:noreply, _} =
+                 TelegramPoller.handle_info({:watch_completed, first.id, []}, running)
+
+        [_, review] = JobStore.list(store)
+        review = wait_for_status(store, review.id, :completed)
+        assert review.engine == reviewer
+        assert review.worktree_path == first.worktree_path
+        assert review.parent_job_id == first.id
+      end
+    end
+
+    test "model settings reach new and resumed engine options without losing fixture settings", %{
+      state: state
+    } do
+      selected = select_trainer(state)
+      TelegramPoller.handle_update(text_message("/model sonnet"), selected)
+
+      assert %{models: %{"claude" => "sonnet"}} =
+               ConversationStore.get(state.conversation_store, @chat_id)
+
+      TelegramPoller.handle_update(text_message("/model --bad flag"), selected)
+
+      assert %{models: %{"claude" => "sonnet"}} =
+               ConversationStore.get(state.conversation_store, @chat_id)
+    end
+
+    test "attachment captions become prompts in the chosen conversation", %{
+      state: state,
+      store: store,
+      tmp_dir: dir
+    } do
+      selected = select_trainer(state)
+      path = Path.join(dir, "reference.png")
+      File.write!(path, "image fixture")
+      selected = Map.put(selected, :attachment_downloader, fn _, _, _ -> {:ok, path} end)
+
+      message = %{
+        "message" => %{
+          "chat" => %{"id" => @chat_id},
+          "message_id" => 901,
+          "photo" => [%{"file_id" => "photo"}],
+          "caption" => "fix this layout"
+        }
+      }
+
+      TelegramPoller.handle_update(message, selected)
+      [job] = JobStore.list(store)
+      assert job.prompt =~ "fix this layout"
+      assert job.prompt =~ path
+      wait_for_status(store, job.id, :completed)
+    end
+
+    test "voice preview targets the original chat and is sent once", %{state: state, store: store} do
+      selected = select_trainer(state)
+      c = ConversationStore.get(state.conversation_store, @chat_id)
+
+      assert {:noreply, offered} =
+               TelegramPoller.handle_info(
+                 {:voice_transcribed, @chat_id, c.id, {:ok, "voice task"}},
+                 selected
+               )
+
+      [{id, _}] = ClaudeNotify.WorkspaceStore.list(state.workspace_store, :voice)
+      TelegramPoller.handle_update(callback_update("workspace:voice:#{id}:send"), offered)
+      [job] = JobStore.list(store)
+      assert job.prompt == "voice task"
+      wait_for_status(store, job.id, :completed)
+      TelegramPoller.handle_update(callback_update("workspace:voice:#{id}:send"), offered)
+      assert length(JobStore.list(store)) == 1
+    end
+
+    test "expired voice previews and stale queue buttons cannot launch tasks", %{
+      state: state,
+      store: store
+    } do
+      selected = select_trainer(state)
+      c = ConversationStore.get(state.conversation_store, @chat_id)
+
+      ClaudeNotify.WorkspaceStore.put(state.workspace_store, {:voice, "expired"}, %{
+        chat_id: to_string(@chat_id),
+        conversation_id: c.id,
+        text: "never",
+        expires_at: 0
+      })
+
+      TelegramPoller.handle_update(callback_update("workspace:voice:expired:send"), selected)
+      TelegramPoller.handle_update(callback_update("workspace:queue:old:resume"), selected)
+      assert JobStore.list(store) == []
+    end
+
+    test "schedules run once per due occurrence and restore the active conversation", %{
+      state: state,
+      store: store
+    } do
+      selected = select_trainer(state)
+      c = ConversationStore.get(state.conversation_store, @chat_id)
+      TelegramPoller.handle_update(text_message("/schedule every 1h check tests"), selected)
+      [{id, schedule}] = ClaudeNotify.WorkspaceStore.list(state.workspace_store, :schedule)
+
+      ClaudeNotify.WorkspaceStore.put(state.workspace_store, {:schedule, id}, %{
+        schedule
+        | next_at: 0
+      })
+
+      assert {:noreply, ticked} = TelegramPoller.handle_info(:workspace_tick, selected)
+      [job] = JobStore.list(store)
+      wait_for_status(store, job.id, :completed)
+      assert ConversationStore.get(state.conversation_store, @chat_id).id == c.id
+      assert {:noreply, _} = TelegramPoller.handle_info(:workspace_tick, ticked)
+      assert length(JobStore.list(store)) == 1
+
+      assert Enum.any?(
+               ClaudeNotify.WorkspaceStore.get(state.workspace_store, :receipts),
+               &(&1.action == "scheduled run")
+             )
+    end
+
+    test "old task actions cannot push or discard a workspace used by a running follow-up", %{
+      state: state,
+      store: store
+    } do
+      selected = select_trainer(state)
+      running = TelegramPoller.handle_update(text_message("first"), selected)
+      [first] = JobStore.list(store)
+      first = wait_for_status(store, first.id, :completed)
+
+      {:ok, _queued} =
+        JobStore.create(store, %{
+          engine: "claude",
+          project: "trainer",
+          prompt: "next",
+          parent_job_id: first.id,
+          worktree_path: first.worktree_path,
+          branch: first.branch
+        })
+
+      TelegramPoller.handle_update(callback_update("jobpr:#{first.id}"), running)
+      TelegramPoller.handle_update(callback_update("jobdiscard:#{first.id}"), running)
+      assert File.dir?(first.worktree_path)
+      receipts = ClaudeNotify.WorkspaceStore.get(state.workspace_store, :receipts)
+      assert Enum.any?(receipts, &(&1.outcome == "refused: workspace busy"))
+    end
+
+    test "an idle paused queue holds the first task until resumed", %{state: state, store: store} do
+      selected = select_trainer(state)
+      TelegramPoller.handle_update(text_message("/queue pause"), selected)
+      TelegramPoller.handle_update(text_message("first queued task"), selected)
+      assert JobStore.list(store) == []
+      TelegramPoller.handle_update(text_message("/queue resume"), selected)
+      [job] = JobStore.list(store)
+      assert job.prompt == "first queued task"
+      wait_for_status(store, job.id, :completed)
+    end
+
+    test "voice recordings are downloaded and transcribed in the supervised background worker", %{
+      state: state,
+      tmp_dir: dir
+    } do
+      selected = select_trainer(state)
+      path = Path.join(dir, "voice.ogg")
+      File.write!(path, "fixture")
+      c = ConversationStore.get(state.conversation_store, @chat_id)
+
+      configured =
+        selected
+        |> Map.put(:attachment_downloader, fn _, _, _ -> {:ok, path} end)
+        |> Map.put(:voice_transcriber, fn ^path -> {:ok, "hello from voice"} end)
+
+      message = %{
+        "message" => %{
+          "chat" => %{"id" => @chat_id},
+          "message_id" => 906,
+          "voice" => %{"file_id" => "voice", "duration" => 5}
+        }
+      }
+
+      TelegramPoller.handle_update(message, configured)
+      expected_id = c.id
+      assert_receive {:voice_transcribed, @chat_id, ^expected_id, {:ok, "hello from voice"}}, 1000
+    end
+
+    test "saved chat pages keep callbacks below Telegram's 64-byte limit", %{state: state} do
+      selected = select_trainer(state)
+      for _ <- 1..10, do: TelegramPoller.handle_update(text_message("/fresh"), selected)
+      TelegramPoller.handle_update(text_message("/chats"), selected)
+      # Drain older picker rows, then inspect all emitted callback payloads.
+      assert_receive {:telegram_button_rows, _}
+      TelegramPoller.handle_update(callback_update("workspace:chats:1"), selected)
+      assert_receive {:telegram_button_rows, rows}
+
+      assert Enum.all?(
+               List.flatten(
+                 Enum.map(rows, fn row -> Enum.map(row, fn [_, data] -> data end) end)
+               ),
+               &(byte_size(&1) <= 64)
+             )
+    end
+
+    test "completion cards are delivered after switching to a new empty chat", %{
+      state: state,
+      store: store
+    } do
+      selected = select_trainer(state)
+
+      running =
+        TelegramPoller.handle_update(text_message("FIXTURE_SLOW background completion"), selected)
+
+      [job] = JobStore.list(store)
+      TelegramPoller.handle_update(text_message("/fresh"), running)
+      wait_for_status(store, job.id, :completed)
+      assert_receive {:telegram_edit_buttons, _, text, _}, 1000
+      assert text =~ "completed"
+    end
+
+    test "a durably claimed queued schedule recovers once without duplicating dispatcher entries",
+         %{state: state, store: store} do
+      selected = select_trainer(state)
+      TelegramPoller.handle_update(text_message("/schedule in 1m recovery check"), selected)
+      [{id, schedule}] = ClaudeNotify.WorkspaceStore.list(state.workspace_store, :schedule)
+
+      {:ok, job} =
+        JobStore.create(store, %{
+          engine: "claude",
+          project: "trainer",
+          prompt: "recovery check",
+          schedule_key: "#{id}:0"
+        })
+
+      ClaudeNotify.WorkspaceStore.put(state.workspace_store, {:schedule, id}, %{
+        schedule
+        | last_job_id: job.id,
+          paused: true,
+          next_at: System.system_time(:second) + 60
+      })
+
+      dispatcher = state.job_launch_opts[:dispatcher]
+      :sys.replace_state(dispatcher, &%{&1 | cap: 0})
+      assert {:noreply, recovered} = TelegramPoller.handle_info(:workspace_tick, selected)
+      assert {:noreply, _} = TelegramPoller.handle_info(:workspace_tick, recovered)
+      assert JobSupervisor.Dispatcher.queue_length(dispatcher) == 1
+      assert length(JobStore.list(store)) == 1
     end
 
     # -- Fixtures / helpers --
@@ -1475,9 +1800,10 @@ defmodule ClaudeNotify.TelegramPollerTest do
       refute_receive {:telegram_send, _}
 
       assert ["Show diff", "jobdiff:" <> _] = Enum.at(buttons, 0)
-      assert ["Preview", "jobpreview:" <> _] = Enum.at(buttons, 1)
-      assert ["Create PR", "jobpr:" <> _] = Enum.at(buttons, 2)
-      assert ["Discard", "jobdiscard:" <> _] = Enum.at(buttons, 3)
+      assert ["Review", "workspace:review:" <> _] = Enum.at(buttons, 1)
+      assert ["Preview", "jobpreview:" <> _] = Enum.at(buttons, 2)
+      assert ["Create PR", "jobpr:" <> _] = Enum.at(buttons, 3)
+      assert ["Discard", "jobdiscard:" <> _] = Enum.at(buttons, 4)
     end
 
     test "a job completion report fires a typing indicator before the card is edited in", %{

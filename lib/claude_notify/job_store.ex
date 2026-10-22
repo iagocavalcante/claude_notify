@@ -38,6 +38,8 @@ defmodule ClaudeNotify.JobStore do
       :engine_session_id,
       :parent_job_id,
       :error_tail,
+      :summary,
+      :schedule_key,
       status: :queued,
       telegram_message_ids: [],
       inserted_at: nil,
@@ -87,28 +89,38 @@ defmodule ClaudeNotify.JobStore do
 
   @impl true
   def handle_call({:create, attrs}, _from, state) do
-    now = System.system_time(:second)
-    id = state.next_id
+    existing =
+      if attrs[:schedule_key],
+        do: Enum.find(Map.values(state.jobs), &(&1.schedule_key == attrs[:schedule_key]))
 
-    job = %Job{
-      id: id,
-      engine: attrs[:engine],
-      project: attrs[:project],
-      project_id: attrs[:project_id],
-      prompt: attrs[:prompt],
-      worktree_path: attrs[:worktree_path],
-      branch: attrs[:branch],
-      engine_session_id: attrs[:engine_session_id],
-      parent_job_id: attrs[:parent_job_id],
-      status: :queued,
-      telegram_message_ids: attrs[:telegram_message_ids] || [],
-      inserted_at: now,
-      updated_at: now
-    }
+    if existing do
+      {:reply, {:ok, existing}, state}
+    else
+      now = System.system_time(:second)
+      id = state.next_id
 
-    new_state = %{state | jobs: Map.put(state.jobs, id, job), next_id: id + 1}
-    persist(new_state)
-    {:reply, {:ok, job}, new_state}
+      job = %Job{
+        id: id,
+        engine: attrs[:engine],
+        project: attrs[:project],
+        project_id: attrs[:project_id],
+        prompt: attrs[:prompt],
+        summary: attrs[:summary],
+        schedule_key: attrs[:schedule_key],
+        worktree_path: attrs[:worktree_path],
+        branch: attrs[:branch],
+        engine_session_id: attrs[:engine_session_id],
+        parent_job_id: attrs[:parent_job_id],
+        status: :queued,
+        telegram_message_ids: attrs[:telegram_message_ids] || [],
+        inserted_at: now,
+        updated_at: now
+      }
+
+      new_state = %{state | jobs: Map.put(state.jobs, id, job), next_id: id + 1}
+      persist(new_state)
+      {:reply, {:ok, job}, new_state}
+    end
   end
 
   @impl true
@@ -195,6 +207,7 @@ defmodule ClaudeNotify.JobStore do
 
     File.mkdir_p!(Path.dirname(state.path))
     File.write!(tmp_path, data)
+    File.chmod!(tmp_path, 0o600)
     File.rename!(tmp_path, state.path)
     :ok
   end

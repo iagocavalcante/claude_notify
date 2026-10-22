@@ -183,7 +183,9 @@ defmodule ClaudeNotify.Telegram do
   defp inline_keyboard([]), do: []
 
   defp inline_keyboard(buttons) do
-    [Enum.map(buttons, fn [label, data] -> %{text: label, callback_data: data} end)]
+    buttons
+    |> Enum.map(fn [label, data] -> %{text: label, callback_data: data} end)
+    |> Enum.chunk_every(if(length(buttons) > 4, do: 2, else: 4))
   end
 
   @doc """
