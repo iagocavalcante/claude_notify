@@ -912,31 +912,39 @@ defmodule ClaudeNotify.TelegramPollerTest do
       assert job.prompt == "review this repository"
     end
 
-    test "ordinary follow-ups resume the native agent in the exact same worktree", %{
-      state: state,
-      store: store
-    } do
-      selected_state = select_trainer(state)
-      assert_receive {:telegram_send, _selected_text}
+    for engine <- ["claude", "codex"] do
+      test "ordinary follow-ups resume the native agent in the exact same worktree (#{engine})",
+           %{
+             state: state,
+             store: store
+           } do
+        selected_state = select_trainer(state)
+        assert_receive {:telegram_send, _selected_text}
 
-      first_state =
-        TelegramPoller.handle_update(text_message("make the first change"), selected_state)
+        selected_state =
+          TelegramPoller.handle_update(text_message("/agent " <> unquote(engine)), selected_state)
 
-      assert_receive {:telegram_send, _starting_text}
-      [first] = JobStore.list(store)
-      completed = wait_for_status(store, first.id, :completed)
+        assert_receive {:telegram_send, _agent_text}
 
-      TelegramPoller.handle_update(text_message("now refine it"), first_state)
-      assert_receive {:telegram_send, continuation_text}
-      assert continuation_text =~ "continuing the conversation"
+        first_state =
+          TelegramPoller.handle_update(text_message("make the first change"), selected_state)
 
-      [_, second] = JobStore.list(store)
-      second = wait_for_status(store, second.id, :completed)
+        assert_receive {:telegram_send, _starting_text}
+        [first] = JobStore.list(store)
+        completed = wait_for_status(store, first.id, :completed)
 
-      assert second.parent_job_id == completed.id
-      assert second.worktree_path == completed.worktree_path
-      assert second.branch == completed.branch
-      assert File.read!(Path.join(second.worktree_path, ".received-prompt")) == "--resume\n"
+        TelegramPoller.handle_update(text_message("now refine it"), first_state)
+        assert_receive {:telegram_send, continuation_text}
+        assert continuation_text =~ "continuing the conversation"
+
+        [_, second] = JobStore.list(store)
+        second = wait_for_status(store, second.id, :completed)
+
+        assert second.parent_job_id == completed.id
+        assert second.worktree_path == completed.worktree_path
+        assert second.branch == completed.branch
+        assert File.read!(Path.join(second.worktree_path, ".received-prompt")) == "--resume\n"
+      end
     end
 
     test "follow-ups sent while busy queue and launch automatically after completion", %{
@@ -1007,31 +1015,39 @@ defmodule ClaudeNotify.TelegramPollerTest do
       refute File.read!(Path.join(second.worktree_path, ".received-prompt")) == "--resume\n"
     end
 
-    test "/fresh makes the next message start a new isolated conversation workspace", %{
-      state: state,
-      store: store
-    } do
-      selected_state = select_trainer(state)
-      assert_receive {:telegram_send, _selected_text}
+    for engine <- ["claude", "codex"] do
+      test "/fresh makes the next message start a new isolated conversation workspace (#{engine})",
+           %{
+             state: state,
+             store: store
+           } do
+        selected_state = select_trainer(state)
+        assert_receive {:telegram_send, _selected_text}
 
-      first_state =
-        TelegramPoller.handle_update(text_message("first conversation"), selected_state)
+        selected_state =
+          TelegramPoller.handle_update(text_message("/agent " <> unquote(engine)), selected_state)
 
-      assert_receive {:telegram_send, _starting_text}
-      [first] = JobStore.list(store)
-      first = wait_for_status(store, first.id, :completed)
+        assert_receive {:telegram_send, _agent_text}
 
-      fresh_state = TelegramPoller.handle_update(text_message("/fresh"), first_state)
-      assert_receive {:telegram_send, fresh_text}
-      assert fresh_text =~ "Fresh conversation ready"
+        first_state =
+          TelegramPoller.handle_update(text_message("first conversation"), selected_state)
 
-      TelegramPoller.handle_update(text_message("different conversation"), fresh_state)
-      assert_receive {:telegram_send, _starting_text}
-      [_, second] = JobStore.list(store)
-      second = wait_for_status(store, second.id, :completed)
+        assert_receive {:telegram_send, _starting_text}
+        [first] = JobStore.list(store)
+        first = wait_for_status(store, first.id, :completed)
 
-      assert second.parent_job_id == nil
-      refute second.worktree_path == first.worktree_path
+        fresh_state = TelegramPoller.handle_update(text_message("/fresh"), first_state)
+        assert_receive {:telegram_send, fresh_text}
+        assert fresh_text =~ "Fresh conversation ready"
+
+        TelegramPoller.handle_update(text_message("different conversation"), fresh_state)
+        assert_receive {:telegram_send, _starting_text}
+        [_, second] = JobStore.list(store)
+        second = wait_for_status(store, second.id, :completed)
+
+        assert second.parent_job_id == nil
+        refute second.worktree_path == first.worktree_path
+      end
     end
 
     test "standalone yes/no shortcuts use response keystrokes instead of text injection", %{

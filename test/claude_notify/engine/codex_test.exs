@@ -5,7 +5,7 @@ defmodule ClaudeNotify.Engine.CodexFixture do
   binary, so `CodexTest` can drive a real `Port` end to end without ever
   invoking the actual CLI. Event parsing is delegated to
   `ClaudeNotify.Engine.Codex` since the fixture script emits the same
-  `--experimental-json` shape. Mirrors `ClaudeNotify.Engine.Fixture` (see
+  `--json` shape. Mirrors `ClaudeNotify.Engine.Fixture` (see
   `job_runner_test.exs`), which does the same thing for Claude.
   """
 
@@ -14,13 +14,15 @@ defmodule ClaudeNotify.Engine.CodexFixture do
   @impl true
   def build_command(prompt, opts) do
     script = Keyword.fetch!(opts, :script)
-    {script, [prompt]}
+    {"codex", args} = ClaudeNotify.Engine.Codex.build_command(prompt, opts)
+    {script, args}
   end
 
   @impl true
   def resume_command(session_id, prompt, opts) do
-    {cmd, args} = build_command(prompt, opts)
-    {cmd, ["--resume", session_id | args]}
+    script = Keyword.fetch!(opts, :script)
+    {"codex", args} = ClaudeNotify.Engine.Codex.resume_command(session_id, prompt, opts)
+    {script, args}
   end
 
   @impl true
@@ -67,13 +69,16 @@ defmodule ClaudeNotify.Engine.CodexTest do
   describe "build_command/2" do
     test "builds the codex exec invocation, sandboxed and headless" do
       assert {"codex", args} = Engine.Codex.build_command("do the thing", [])
-      assert "exec" in args
-      assert "--experimental-json" in args
-      assert "--sandbox" in args
-      assert "workspace-write" in args
-      assert "--ask-for-approval" in args
-      assert "never" in args
-      assert "do the thing" in args
+
+      assert args == [
+               "--ask-for-approval",
+               "never",
+               "--sandbox",
+               "workspace-write",
+               "exec",
+               "--json",
+               "do the thing"
+             ]
     end
 
     test "does not pass a -C/--cd flag - the worktree cwd comes from the Port, not argv" do
@@ -84,14 +89,39 @@ defmodule ClaudeNotify.Engine.CodexTest do
   end
 
   describe "resume_command/3" do
-    test "issues codex exec resume with the stored session id, no sandbox/approval flags" do
+    test "resumes with the stored session id and explicit sandbox/approval policy" do
       assert {"codex", args} = Engine.Codex.resume_command("thread-abc-123", "continue", [])
-      assert args == ["exec", "resume", "thread-abc-123", "--experimental-json", "continue"]
 
-      # resume does not accept these (confirmed via `codex exec resume --help`
-      # and a clap "unexpected argument" probe - see the moduledoc)
-      refute "--sandbox" in args
-      refute "--ask-for-approval" in args
+      assert args == [
+               "--ask-for-approval",
+               "never",
+               "--sandbox",
+               "workspace-write",
+               "exec",
+               "resume",
+               "thread-abc-123",
+               "--json",
+               "continue"
+             ]
+
+      refute "--worktree" in args
+    end
+  end
+
+  test "installed Codex accepts new and resumed command arguments without invoking a model" do
+    case System.find_executable("codex") do
+      nil ->
+        :ok
+
+      executable ->
+        for {_, args} <- [
+              Engine.Codex.build_command("do the thing", []),
+              Engine.Codex.resume_command("thread-abc-123", "continue", [])
+            ] do
+          {output, status} = System.cmd(executable, args ++ ["--help"], stderr_to_stdout: true)
+          assert status == 0, output
+          assert output =~ "Usage: codex exec"
+        end
     end
   end
 
@@ -156,7 +186,7 @@ defmodule ClaudeNotify.Engine.CodexTest do
     path
   end
 
-  # Emits the `--experimental-json` shape modeled in `Engine.Codex`'s
+  # Emits the `--json` shape modeled in `Engine.Codex`'s
   # moduledoc: a `thread.started` id, one `agent_message` item, one
   # non-agent_message item (proving the generic :tool_use fallback), then a
   # successful `turn.completed`.
@@ -165,8 +195,19 @@ defmodule ClaudeNotify.Engine.CodexTest do
 
     File.write!(path, """
     #!/usr/bin/env bash
-    prompt="$1"
-    echo "$prompt" > .received-prompt
+    set -eu
+    [[ "$1" == "--ask-for-approval" && "$2" == "never" ]]
+    [[ "$3" == "--sandbox" && "$4" == "workspace-write" && "$5" == "exec" ]]
+    shift 5
+    if [[ "$1" == "resume" ]]; then
+      [[ "$2" == "codex-fixture-thread-1" ]]
+      [[ -f .first-turn ]]
+      shift 2
+    else
+      touch .first-turn
+    fi
+    [[ "$1" == "--json" ]]
+    echo "$2" > .received-prompt
     pwd > .engine-cwd
 
     cat <<'JSON'
@@ -258,6 +299,7 @@ defmodule ClaudeNotify.Engine.CodexTest do
     assert final.engine_session_id == "codex-fixture-thread-1"
     assert final.worktree_path
     assert File.dir?(final.worktree_path)
+    refute File.exists?(Path.join(repo_path, ".first-turn"))
 
     engine_cwd =
       final.worktree_path
@@ -266,6 +308,44 @@ defmodule ClaudeNotify.Engine.CodexTest do
       |> String.trim()
 
     assert Path.expand(engine_cwd) == Path.expand(final.worktree_path)
+  end
+
+  test "a Codex follow-up resumes its native session in the existing worktree", %{
+    repo_path: repo_path,
+    store: store,
+    script: script
+  } do
+    {:ok, first} = JobStore.create(store, job_attrs())
+    {:ok, _} = JobStore.update_status(store, first.id, :running, %{})
+
+    start_runner(first, repo_path, Engine.CodexFixture,
+      job_store: store,
+      engine_opts: [script: script]
+    )
+
+    first = wait_for_status(store, first.id, :completed)
+
+    {:ok, worktree} =
+      ClaudeNotify.WorktreeManager.reuse(repo_path, first.worktree_path, first.branch)
+
+    {:ok, second} =
+      JobStore.create(store, job_attrs(%{prompt: "continue", parent_job_id: first.id}))
+
+    {:ok, _} = JobStore.update_status(store, second.id, :running, %{})
+
+    start_runner(second, repo_path, Engine.CodexFixture,
+      job_store: store,
+      engine_opts: [script: script],
+      existing_worktree: worktree,
+      resume_session_id: first.engine_session_id
+    )
+
+    second = wait_for_status(store, second.id, :completed)
+
+    assert second.engine_session_id == first.engine_session_id
+    assert second.worktree_path == first.worktree_path
+    assert second.branch == first.branch
+    assert File.read!(Path.join(second.worktree_path, ".received-prompt")) =~ "continue"
   end
 
   test "a codex binary missing from PATH fails the job with a clear error, not a crash", %{

@@ -578,7 +578,7 @@ Off by default (quiet mode) — a job's activity message only ever shows an aggr
 | Engine | Status |
 |--------|--------|
 | `claude` | Drives the `claude` CLI (`claude [--chrome] -p ... --output-format stream-json --verbose --dangerously-skip-permissions`) via `ClaudeNotify.Engine.Claude`. `--chrome` is added when `CLAUDE_NOTIFY_CLAUDE_CHROME=true`, including for resumed jobs. Its `stream-json` event parsing and browser-tool connection were confirmed against real invocations. |
-| `codex` | Drives the `codex` CLI (`codex exec --experimental-json --sandbox workspace-write --ask-for-approval never ...`) via `ClaudeNotify.Engine.Codex`. Fully implemented and unit-tested, but its event-shape parsing was verified only from the `@openai/codex-sdk` source and offline CLI flag-parsing probes, not a live run — see `ClaudeNotify.Engine.Codex`'s moduledoc for exactly what is and isn't confirmed. `--experimental-json` is an undocumented, explicitly "experimental" upstream flag; a future `codex-cli` release could change or remove it. |
+| `codex` | Drives `codex --ask-for-approval never --sandbox workspace-write exec --json ...` via `ClaudeNotify.Engine.Codex`. Follow-ups use `exec resume` with the same explicit approval/sandbox policy and the existing app-owned worktree. Command parsing is checked against the installed CLI; event handling is fixture-tested without a live model run. |
 
 ### Concurrency
 

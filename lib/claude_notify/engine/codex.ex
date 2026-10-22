@@ -2,65 +2,17 @@ defmodule ClaudeNotify.Engine.Codex do
   @moduledoc """
   `ClaudeNotify.Engine` implementation for the Codex CLI (`codex exec`).
 
-  Launches `codex exec --experimental-json --sandbox workspace-write
-  --ask-for-approval never <prompt>`. As with `ClaudeNotify.Engine.Claude`,
-  auto-approving every action is safe ONLY because `JobRunner` always runs
-  this with `cwd` set to the job's throwaway git worktree (see
-  `ClaudeNotify.WorktreeManager`) - the worktree boundary is the actual
-  safety mechanism, and `--sandbox workspace-write` additionally confines
-  the *engine's own* filesystem writes to that cwd at the OS level (unlike
-  Claude Code, which has no sandbox of its own and relies entirely on the
-  worktree boundary).
+  Launches `codex --ask-for-approval never --sandbox workspace-write exec
+  --json <prompt>`. The approval and sandbox options precede `exec` so they
+  also apply to resumed sessions. `JobRunner` sets the process cwd to the
+  app-owned worktree; do not pass `--worktree`, which would create a second
+  workspace outside the job's tracked path.
 
-  ## What's verified, and how
+  ## JSONL events
 
-  Codex, unlike Claude Code, was not run for real to confirm its output
-  shape (that would cost real API quota - out of scope for this story). Two
-  free, local sources were used instead:
-
-    * `codex --help` / `codex exec --help` / `codex exec resume --help`
-      (installed `codex-cli 0.145.0`) - confirms all flag names and enum
-      values used below (`--sandbox {read-only,workspace-write,
-      danger-full-access}`, `--ask-for-approval {untrusted,on-request,
-      never}`), and confirms `resume` does NOT list `--sandbox` or
-      `--ask-for-approval` as accepted options.
-    * The official `@openai/codex-sdk` JS package, version 0.145.0 - an
-      *exact* version match to the installed CLI, bundled locally (read
-      from `node_modules/@openai/codex-sdk/dist/index.js` inside another
-      local app's `app.asar.unpacked` tree, no network access). This SDK
-      spawns `codex exec --experimental-json ...` itself and parses its
-      stdout, so its source is a direct, version-locked reference for the
-      undocumented `--experimental-json` flag and the event shape it
-      produces.
-
-  Two free, local, zero-cost CLI probes (argument-parsing errors only, no
-  model ever invoked) confirmed the SDK's flag choices still hold against
-  the installed binary:
-
-    * `codex exec --experimental-json --sandbox not-a-real-mode` fails with
-      clap's "invalid value ... for '--sandbox'" - i.e. `--experimental-json`
-      itself parsed fine; it's a real (if undocumented/"experimental") flag
-      on this version.
-    * `codex exec resume <id> --sandbox ...` / `--ask-for-approval ...` both
-      fail with clap's "unexpected argument" - resume genuinely does not
-      accept either flag (it presumably inherits them from the original
-      session), while `codex exec resume <id> --experimental-json` parses
-      fine and reaches normal prompt handling.
-
-  `--experimental-json` was chosen over the documented, stable `--json` flag
-  because it is the more structured of the two: `--json` streams Codex's
-  low-level internal protocol events (`task_started`, `exec_command_begin`,
-  `agent_reasoning_delta`, `token_count`, ...), while `--experimental-json`
-  streams a higher-level "thread/item/turn" shape analogous to Claude Code's
-  content blocks (`thread.started`, `item.completed` wrapping a typed
-  `item`, `turn.completed`, `turn.failed`). Being "experimental" is a real
-  risk worth flagging: the flag's name signals upstream may change or
-  remove it in a future `codex-cli` release, unlike `--json`.
-
-  ## `--experimental-json` shape
-
-  Verified from the SDK source (`src/thread.ts` / `src/exec.ts` in
-  `@openai/codex-sdk@0.145.0`):
+  Uses the documented `--json` stream. Command parsing was checked against
+  codex-cli 0.163.0 with `--help`, without invoking a model. Event parsing
+  is covered by fixture runs, not a live model run.
 
     * `{"type":"thread.started","thread_id":"..."}` - one per invocation
       (including resumed ones - the SDK unconditionally re-reads
@@ -73,20 +25,8 @@ defmodule ClaudeNotify.Engine.Codex do
     * `{"type":"turn.failed","error":{"message":"..."}}` - the turn failed;
       the SDK reads `event.error.message`.
 
-  NOT verified - modeled by analogy, since the SDK only ever branches on
-  `item.type == "agent_message"` and otherwise treats `item` as an opaque
-  blob it stores unread:
-
-    * an `item.completed` event whose `item.type` is anything other than
-      `"agent_message"` (e.g. a command execution, file change, or
-      reasoning item) is mapped to `:tool_use` with the item's `"type"` as
-      the tool name and the whole item map as `input`. The real field names
-      Codex uses for these item kinds have not been confirmed against a
-      live run.
-    * whether `turn.completed`/`turn.failed` themselves repeat `thread_id`
-      is unconfirmed either way (the SDK never reads it there, since it
-      already captured it from `thread.started`); this module does not
-      assume they do - see the note on `thread.started` below.
+  Non-message completed items map to `:tool_use`, retaining the whole item
+  as input. Completion events need not repeat the thread id captured at start.
 
   ## Why `thread.started` is a `:session` event, not a `:result`
 
@@ -109,19 +49,30 @@ defmodule ClaudeNotify.Engine.Codex do
   def build_command(prompt, _opts) do
     {"codex",
      [
-       "exec",
-       "--experimental-json",
-       "--sandbox",
-       "workspace-write",
        "--ask-for-approval",
        "never",
+       "--sandbox",
+       "workspace-write",
+       "exec",
+       "--json",
        prompt
      ]}
   end
 
   @impl true
   def resume_command(session_id, prompt, _opts) do
-    {"codex", ["exec", "resume", session_id, "--experimental-json", prompt]}
+    {"codex",
+     [
+       "--ask-for-approval",
+       "never",
+       "--sandbox",
+       "workspace-write",
+       "exec",
+       "resume",
+       session_id,
+       "--json",
+       prompt
+     ]}
   end
 
   @impl true
