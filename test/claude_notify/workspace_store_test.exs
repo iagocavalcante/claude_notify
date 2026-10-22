@@ -7,6 +7,7 @@ defmodule ClaudeNotify.WorkspaceStoreTest do
     path = Path.join(dir, "workspace.dat")
     name = :"workspace_#{System.unique_integer([:positive])}"
     {:ok, store} = WorkspaceStore.start_link(name: name, path: path)
+    assert {:error, :invalid_entry} = WorkspaceStore.put(store, {:unknown, "one"}, %{})
     assert :ok = WorkspaceStore.put(store, {:schedule, "one"}, %{prompt: "check"})
     assert :ok = WorkspaceStore.put(store, {:voice, "one"}, %{text: "hello"})
     assert {:ok, %{text: "hello"}} = WorkspaceStore.take(store, {:voice, "one"})

@@ -56,7 +56,8 @@ defmodule ClaudeNotify.WorkspaceStore do
   end
 
   def handle_call({:put, key, value}, _, state) do
-    if is_map(value) and Enum.all?(Map.keys(value), &(&1 in @entry_fields)) do
+    if match?({kind, id} when kind in [:voice, :schedule] and is_binary(id), key) and
+         is_map(value) and Enum.all?(Map.keys(value), &(&1 in @entry_fields)) do
       save_reply(state, Map.put(state.entries, key, value), :ok)
     else
       {:reply, {:error, :invalid_entry}, state}
