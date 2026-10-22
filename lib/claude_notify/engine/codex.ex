@@ -46,33 +46,42 @@ defmodule ClaudeNotify.Engine.Codex do
   @behaviour ClaudeNotify.Engine
 
   @impl true
-  def build_command(prompt, _opts) do
+  def build_command(prompt, opts) do
     {"codex",
-     [
-       "--ask-for-approval",
-       "never",
-       "--sandbox",
-       "workspace-write",
-       "exec",
-       "--json",
-       prompt
-     ]}
+     model_args(opts) ++
+       [
+         "--ask-for-approval",
+         "never",
+         "--sandbox",
+         "workspace-write",
+         "exec",
+         "--json",
+         prompt
+       ]}
   end
 
   @impl true
-  def resume_command(session_id, prompt, _opts) do
+  def resume_command(session_id, prompt, opts) do
     {"codex",
-     [
-       "--ask-for-approval",
-       "never",
-       "--sandbox",
-       "workspace-write",
-       "exec",
-       "resume",
-       session_id,
-       "--json",
-       prompt
-     ]}
+     model_args(opts) ++
+       [
+         "--ask-for-approval",
+         "never",
+         "--sandbox",
+         "workspace-write",
+         "exec",
+         "resume",
+         session_id,
+         "--json",
+         prompt
+       ]}
+  end
+
+  defp model_args(opts) do
+    case Keyword.get(opts, :model) do
+      nil -> []
+      model when is_binary(model) -> ["--model", model]
+    end
   end
 
   @impl true

@@ -173,10 +173,18 @@ defmodule ClaudeNotify.JobSupervisor do
 
     @impl true
     def handle_call({:start_job, job, opts}, _from, state) do
-      if map_size(state.running) < state.cap do
-        {:reply, :started, launch(job, opts, state)}
-      else
-        {:reply, :queued, %{state | queue: :queue.in({job, opts}, state.queue)}}
+      cond do
+        job.id in Map.values(state.running) ->
+          {:reply, :started, state}
+
+        Enum.any?(:queue.to_list(state.queue), fn {queued, _} -> queued.id == job.id end) ->
+          {:reply, :queued, state}
+
+        map_size(state.running) < state.cap ->
+          {:reply, :started, launch(job, opts, state)}
+
+        true ->
+          {:reply, :queued, %{state | queue: :queue.in({job, opts}, state.queue)}}
       end
     end
 

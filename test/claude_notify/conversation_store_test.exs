@@ -83,6 +83,67 @@ defmodule ClaudeNotify.ConversationStoreTest do
              ConversationStore.select_project(store, 42, scope(tmp_dir), "claude")
   end
 
+  test "fresh conversations preserve and restore independent workspaces and queues", %{
+    tmp_dir: tmp_dir
+  } do
+    store = start_store(tmp_dir)
+    {:ok, first} = ConversationStore.select_project(store, 42, scope(tmp_dir), "claude")
+    ConversationStore.configure(store, 42, %{name: "Login fix", models: %{"claude" => "sonnet"}})
+    ConversationStore.bind_job(store, 42, job(7, "claude"))
+    ConversationStore.enqueue(store, 42, "later")
+    {:ok, fresh} = ConversationStore.fresh(store, 42)
+    refute first.id == fresh.id
+    assert length(ConversationStore.list(store)) == 2
+
+    assert {:ok,
+            %{head_job_id: 7, name: "Login fix", pending: [_], models: %{"claude" => "sonnet"}}} =
+             ConversationStore.select(store, 42, first.id)
+
+    assert {:error, :not_found} = ConversationStore.select(store, 99, first.id)
+  end
+
+  test "queue pause, reorder and remove preserve identities and reject stale turns", %{
+    tmp_dir: tmp_dir
+  } do
+    store = start_store(tmp_dir)
+    ConversationStore.select_project(store, 42, scope(tmp_dir), "claude")
+    ConversationStore.enqueue(store, 42, "one")
+    ConversationStore.enqueue(store, 42, "two", "codex")
+    %{pending: [one, two]} = ConversationStore.get(store, 42)
+    assert {:ok, _} = ConversationStore.queue_action(store, 42, :pause)
+    assert :paused = ConversationStore.pop_pending(store, 42)
+    assert {:ok, _} = ConversationStore.queue_action(store, 42, :next, two.id)
+    assert {:ok, _} = ConversationStore.queue_action(store, 42, :remove, one.id)
+    assert {:error, :stale_turn} = ConversationStore.queue_action(store, 42, :remove, one.id)
+    assert {:ok, _} = ConversationStore.queue_action(store, 42, :resume)
+    assert {:ok, %{prompt: "two", engine: "codex"}} = ConversationStore.pop_pending(store, 42)
+  end
+
+  test "archive and per-engine settings survive restart and invalid settings fail closed", %{
+    tmp_dir: tmp_dir
+  } do
+    path = Path.join(tmp_dir, "archive.dat")
+    {:ok, store} = ConversationStore.start_link(name: nil, path: path)
+    {:ok, first} = ConversationStore.select_project(store, 42, scope(tmp_dir), "claude")
+
+    assert {:ok, _} =
+             ConversationStore.configure(store, 42, %{
+               models: %{"claude" => "sonnet", "codex" => "test-model"},
+               workflow: "build"
+             })
+
+    assert {:error, :invalid_settings} =
+             ConversationStore.configure(store, 42, %{models: %{"codex" => "--dangerous flag"}})
+
+    ConversationStore.fresh(store, 42)
+    GenServer.stop(store)
+    {:ok, restored} = ConversationStore.start_link(name: nil, path: path)
+    on_exit(fn -> if Process.alive?(restored), do: GenServer.stop(restored) end)
+
+    assert {:ok, %{workflow: "build", models: %{"codex" => "test-model"}}} =
+             ConversationStore.select(restored, 42, first.id)
+  end
+
   defp start_store(tmp_dir, opts \\ []) do
     name = :"conversation_store_#{System.unique_integer([:positive])}"
 

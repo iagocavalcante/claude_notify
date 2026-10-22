@@ -3,12 +3,17 @@ defmodule ClaudeNotify.ConversationStore.Conversation do
 
   @enforce_keys [:chat_id, :project, :project_id, :engine, :updated_at]
   defstruct [
+    :id,
+    :name,
     :chat_id,
     :project,
     :project_id,
     :engine,
     :head_job_id,
     :updated_at,
+    workflow: "single",
+    models: %{},
+    paused: false,
     pending: []
   ]
 
@@ -38,6 +43,7 @@ defmodule ClaudeNotify.ConversationStore do
 
   defstruct schema_version: @schema_version,
             conversations: %{},
+            archived: %{},
             path: nil,
             max_pending: @default_max_pending,
             max_prompt_bytes: @default_max_prompt_bytes,
@@ -81,6 +87,15 @@ defmodule ClaudeNotify.ConversationStore do
     GenServer.call(pid, {:pop_pending, chat_key(chat_id)})
   end
 
+  def select(pid \\ __MODULE__, chat_id, id),
+    do: GenServer.call(pid, {:select, chat_key(chat_id), id})
+
+  def configure(pid \\ __MODULE__, chat_id, attrs),
+    do: GenServer.call(pid, {:configure, chat_key(chat_id), attrs})
+
+  def queue_action(pid \\ __MODULE__, chat_id, action, turn_id \\ nil),
+    do: GenServer.call(pid, {:queue_action, chat_key(chat_id), action, turn_id})
+
   def clear(pid \\ __MODULE__), do: GenServer.call(pid, :clear)
 
   @impl true
@@ -109,11 +124,13 @@ defmodule ClaudeNotify.ConversationStore do
   end
 
   def handle_call(:list, _from, state) do
-    {:reply, state.conversations |> Map.values() |> Enum.sort_by(& &1.updated_at, :desc), state}
+    {:reply, all_conversations(state) |> Enum.sort_by(& &1.updated_at, :desc), state}
   end
 
   def handle_call({:select_project, key, scope, engine}, _from, state) do
     conversation = %Conversation{
+      id: new_id(),
+      name: scope.name,
       chat_id: key,
       project: scope.name,
       project_id: scope.id,
@@ -163,7 +180,10 @@ defmodule ClaudeNotify.ConversationStore do
       conversation ->
         put_and_reply(state, key, %{
           conversation
-          | head_job_id: nil,
+          | id: new_id(),
+            name: conversation.project,
+            paused: false,
+            head_job_id: nil,
             pending: [],
             updated_at: now_ms()
         })
@@ -185,6 +205,8 @@ defmodule ClaudeNotify.ConversationStore do
           {:reply, {:error, :empty_prompt}, state}
         else
           turn = %{
+            id: new_id(),
+            models: conversation.models,
             prompt: prompt,
             engine: normalize_engine(engine || conversation.engine),
             enqueued_at: now_ms()
@@ -213,6 +235,9 @@ defmodule ClaudeNotify.ConversationStore do
       nil ->
         {:reply, {:error, :no_conversation}, state}
 
+      %{paused: true} ->
+        {:reply, :paused, state}
+
       %{pending: []} ->
         {:reply, :empty, state}
 
@@ -227,8 +252,53 @@ defmodule ClaudeNotify.ConversationStore do
     end
   end
 
+  def handle_call({:select, key, id}, _from, state) do
+    case Enum.find(all_conversations(state), &(&1.chat_id == key and &1.id == id)) do
+      nil -> {:reply, {:error, :not_found}, state}
+      conversation -> put_and_reply(state, key, conversation)
+    end
+  end
+
+  def handle_call({:configure, key, attrs}, _from, state) do
+    with %Conversation{} = conversation <- state.conversations[key],
+         true <- valid_settings?(attrs) do
+      put_and_reply(state, key, struct(conversation, Map.put(attrs, :updated_at, now_ms())))
+    else
+      _ -> {:reply, {:error, :invalid_settings}, state}
+    end
+  end
+
+  def handle_call({:queue_action, key, action, id}, _from, state) do
+    case state.conversations[key] do
+      nil ->
+        {:reply, {:error, :no_conversation}, state}
+
+      conversation ->
+        turn = Enum.find(conversation.pending, &(Map.get(&1, :id) == id))
+
+        cond do
+          action == :pause ->
+            put_and_reply(state, key, %{conversation | paused: true})
+
+          action == :resume ->
+            put_and_reply(state, key, %{conversation | paused: false})
+
+          is_nil(turn) ->
+            {:reply, {:error, :stale_turn}, state}
+
+          action in [:remove, :next] ->
+            remaining = Enum.reject(conversation.pending, &(Map.get(&1, :id) == id))
+            pending = if action == :next, do: [turn | remaining], else: remaining
+            put_and_reply(state, key, %{conversation | pending: pending})
+
+          true ->
+            {:reply, {:error, :invalid_action}, state}
+        end
+    end
+  end
+
   def handle_call(:clear, _from, state) do
-    next = %{state | conversations: %{}, load_error: nil}
+    next = %{state | conversations: %{}, archived: %{}, load_error: nil}
 
     case persist(next) do
       :ok -> {:reply, :ok, next}
@@ -237,12 +307,47 @@ defmodule ClaudeNotify.ConversationStore do
   end
 
   defp put_and_reply(state, key, conversation) do
-    next = %{state | conversations: Map.put(state.conversations, key, conversation)}
+    archived =
+      case state.conversations[key] do
+        %{id: id} = previous when id != conversation.id -> Map.put(state.archived, id, previous)
+        _ -> state.archived
+      end
+
+    next = %{
+      state
+      | conversations: Map.put(state.conversations, key, conversation),
+        archived: Map.delete(archived, conversation.id)
+    }
 
     case persist(next) do
       :ok -> {:reply, {:ok, conversation}, next}
       {:error, reason} -> {:reply, {:error, {:persist_failed, reason}}, state}
     end
+  end
+
+  defp new_id, do: :crypto.strong_rand_bytes(6) |> Base.encode16(case: :lower)
+
+  defp all_conversations(state), do: Map.values(state.conversations) ++ Map.values(state.archived)
+
+  defp valid_settings?(attrs) do
+    is_map(attrs) and map_size(attrs) > 0 and
+      Enum.all?(attrs, fn
+        {:workflow, workflow} ->
+          workflow in ["single", "build", "bug", "release"]
+
+        {:name, name} ->
+          is_binary(name) and String.length(String.trim(name)) in 1..60
+
+        {:models, models} when is_map(models) ->
+          Enum.all?(models, fn {engine, model} ->
+            engine in ["claude", "codex"] and
+              (is_nil(model) or
+                 (is_binary(model) and model =~ ~r/^[a-zA-Z0-9][a-zA-Z0-9._:\/-]{0,119}$/))
+          end)
+
+        _ ->
+          false
+      end)
   end
 
   defp chat_key(value) when is_binary(value), do: value
@@ -283,7 +388,8 @@ defmodule ClaudeNotify.ConversationStore do
     binary =
       :erlang.term_to_binary(%{
         schema_version: @schema_version,
-        conversations: state.conversations
+        conversations: state.conversations,
+        archived: state.archived
       })
 
     temporary = state.path <> ".tmp"
@@ -303,7 +409,10 @@ defmodule ClaudeNotify.ConversationStore do
          {:ok, binary} <- File.read(path),
          {:ok, data} <- safe_decode(binary),
          {:ok, conversations} <- load_version(data) do
-      %__MODULE__{conversations: normalize_conversations(conversations)}
+      %__MODULE__{
+        conversations: normalize_conversations(conversations),
+        archived: normalize_conversations(Map.get(data, :archived, %{}))
+      }
     else
       false ->
         %__MODULE__{}
@@ -329,6 +438,13 @@ defmodule ClaudeNotify.ConversationStore do
 
     Map.new(conversations, fn {key, value} ->
       attrs = value |> Map.delete(:__struct__) |> Map.take(allowed)
+      attrs = attrs |> Map.put_new(:id, new_id()) |> Map.put_new(:name, attrs[:project])
+
+      attrs =
+        Map.update(attrs, :pending, [], fn turns ->
+          Enum.map(turns, &Map.put_new(&1, :id, new_id()))
+        end)
+
       {chat_key(key), struct(Conversation, attrs)}
     end)
   end

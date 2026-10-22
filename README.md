@@ -15,6 +15,11 @@ Elixir app that sends interactive Telegram notifications for Claude Code and Cod
 - **Security hardening** — signed hook events (HMAC), replay protection, and Telegram chat authorization
 - **Job dispatcher** — run a coding-agent CLI (`claude` or `codex`) headlessly against a discovered or registered project in its own isolated git worktree, with progress/completion reports and a `Create PR` button as the only push path
 - **Watch mode** — opt in to a live, throttled transcript of a running job; off by default to keep the dispatcher quiet
+- **Saved conversations** — named, paginated project chats preserve independent workspaces and queues; reopen with `/chats`
+- **Controlled queues** — pause, resume, remove and move pending messages to the front without stopping the current turn
+- **Local voice prompts** — transcribe a voice message on the host, review it, then Send or Cancel; confirmations expire after ten minutes
+- **Mixed-engine workflows** — implement, investigate or check a release with one engine, then review in the same worktree with the other
+- **Scheduled tasks and receipts** — durable one-off and recurring jobs, model snapshots, execution history, and app-owned action auditing
 - **Message-first tasks** — `/new`, tap a repository, then send ordinary messages instead of memorizing `/run` syntax
 - **Durable project chats** — follow-up messages automatically resume the same Claude/Codex conversation and exact worktree; messages sent while busy queue as later turns and survive service restarts
 - **One-command agent handoff** — `/agent` switches the next turn between Claude and Codex while preserving the workspace and delivering bounded project memory
@@ -158,6 +163,14 @@ This table also drives Telegram's native "/" command menu, which self-registers 
 | `/preview <job-id> [cloudflare\|tailscale]` | Start a secure preview using the default or selected provider |
 | `/previews` | List active web previews and remaining lifetime |
 | `/unpreview <preview-id>` | Stop a preview and remove its provider route/resources |
+| `/chats [rename <name>]` | Reopen a saved conversation or rename the current one |
+| `/queue [pause\|resume\|remove <turn-id>\|next <turn-id>]` | View and control pending messages |
+| `/model [<model-id>\|default]` | Set this conversation's model for its selected engine |
+| `/doctor` | Check local CLI versions, sign-in and launch compatibility without model calls |
+| `/workflow [single\|build\|bug\|release]` | Choose a saved single-agent or mixed-engine workflow |
+| `/schedule [every\|in] <duration> <task>` | Schedule recurring or one-off tasks; open without arguments to manage them |
+| `/audit` | View recent app actions and scheduled execution receipts |
+| `/home` | Open the workspace home and navigation buttons |
 | `/help` | Show available commands |
 
 Reply to any terminal message to send text to that terminal session. Selecting or replying to a terminal makes it the persistent destination for that Telegram chat, including after Claude Notify restarts. If only one session is open, it is auto-selected. A successful Telegram prompt is not echoed by the bot; assistant messages reply to the original Telegram message. Standalone `yes`, `no`, `yes!`, `esc`, or a digit from `1` to `9` uses the same direct response keystroke as the matching permission button.
@@ -470,6 +483,45 @@ Replace `/path/to/claude_notify` with the actual absolute path to the project.
 chmod +x hooks/*.sh
 ```
 
+### Saved chats, workflows and schedules
+
+Use `/home` for the current conversation, project, agent and model, with buttons for saved chats, queues, workflows, schedules and engine diagnostics. Replies to an earlier job return to that job's saved conversation, rather than redirecting the currently selected project. Existing persisted conversations are migrated without deleting their history.
+
+`/chats rename Fix login` gives the current conversation a recognizable name. `/queue` shows each pending message with **Run next** and **Remove** buttons. **Pause queue** holds future turns while the current turn finishes; **Resume queue** starts the next waiting turn when the workspace is idle. Queue buttons identify both the conversation and the queued message, so stale buttons cannot modify a different chat.
+
+Send a photo or document with a caption, such as “fix this layout”, to deliver the file and request directly to the selected conversation. Files up to 20 MB are kept in the private local inbox; attachment content is labeled untrusted. Without a selected destination, the bot saves the file and explains how to use it.
+
+Each conversation remembers a separate model setting for Claude and Codex. `/model <model-id>` applies to future executions, `/model default` returns to the installed CLI's default, and `/doctor` checks installation, authentication and argument compatibility without spending model quota. A model ID does not grant access to a model your account cannot use.
+
+Workflow presets:
+
+- `single`: one agent handles each turn.
+- `build`: the selected agent implements and runs checks; the other engine independently reviews.
+- `bug`: investigate the root cause, implement a fix and regression checks, then request independent review.
+- `release`: inspect release readiness, followed by independent review; publication remains manual.
+
+Choose the lead engine with `/agent`, then select a preset with `/workflow`. Each review is a separate job with the same validated worktree and shared task brief. A failed or cancelled first step skips its automatic review and pauses the remaining queue. Completed cards offer **Review**, **Fix findings**, **Show diff**, **Preview**, **Create PR**, and **Discard**. Final summaries are retained with jobs so a fix can receive the review findings even after the live transcript is cleared. Reviews use task instructions to avoid edits; this is not a separate operating-system permission boundary.
+
+Schedules capture the selected project, engine and model settings:
+
+```text
+/schedule every 1h Check the test suite and report regressions
+/schedule every 1d Review dependency and release readiness
+/schedule in 30m Inspect the current CI failures
+```
+
+Durations use `m`, `h` or `d`, from one minute to one year. Open `/schedule` for pause, resume and delete buttons, or use `/schedule pause <id>`, `/schedule resume <id>` and `/schedule delete <id>`. The service checks every 30 seconds, coalesces missed intervals into one run, and avoids overlapping executions of the same schedule. Each run has its own saved conversation and worktree; it restores your previous active chat after dispatch. The host and service must stay running. Each occurrence is recorded as a durable queued job before dispatch, with a stable occurrence key to prevent duplicate retries. A queued execution is recovered after restart. A running execution interrupted by restart is marked failed rather than automatically replaying uncertain side effects.
+
+`/audit` shows the latest 20 of up to 200 durable receipts for app-owned PR, push, preview, discard and schedule operations. Receipts contain IDs, outcomes and UTC timestamps, without credentials or conversation text. PR and discard requests are refused when another turn is using that worktree. This history governs the bot's own actions; it does not intercept arbitrary commands executed inside an agent CLI.
+
+### Local voice setup
+
+The bot uses the installed `whisper-cli` from whisper.cpp and `ffmpeg`, without a transcription API key. Set `CLAUDE_NOTIFY_WHISPER_MODEL` to an existing multilingual GGML model file and restart the service. This host is configured with the multilingual base model.
+
+Voice messages are limited to three minutes and 20 MB. Audio is converted to a private temporary mono WAV, transcribed locally with automatic language detection, and the conversion/transcript files are removed afterward. Only one voice transcription runs at a time. The downloaded recording remains in the local inbox, like other attachments.
+
+The preview's **Send prompt** button targets the conversation where the recording was received, even if you switch chats meanwhile. **Cancel** sends nothing to an agent. Previews survive a restart, expire after ten minutes, and can be consumed only once. Review the text before sending; speech recognition can make mistakes.
+
 ### Codex hooks
 
 Codex uses the same lifecycle scripts through `~/.codex/hooks.json`. The setup script merges these entries automatically: `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `PostToolUse`, `Stop`, and `SessionEnd`. Each command is prefixed with `CLAUDE_NOTIFY_ENGINE=codex` so Telegram and the dashboard label the terminal correctly.
@@ -523,7 +575,7 @@ File entries take precedence over application-config entries with the same name.
 
 **`/agent [claude|codex]`** — changes the agent for the next turn without changing the current worktree. A same-agent turn uses native Claude/Codex resume. A cross-agent turn starts the other engine in that workspace and consumes the bounded durable handoff produced by the previous turn. With no argument, `/agent` shows one-tap agent buttons.
 
-**`/fresh`** — clears the active conversation chain and pending turns while retaining the selected project and agent. The next message receives a new isolated worktree. `/new` is the broader reset when the project should change too.
+**`/fresh`** — saves the current conversation and starts another while retaining the selected project, agent and model settings. The next message receives a new isolated worktree. Reopen earlier work with `/chats`; its workspace and pending messages remain intact. Background turns and their queues can continue, so use `/queue pause` first when you want to hold the previous chat. `/new` starts a conversation in a different project.
 
 **`/run [claude|codex] <project> <prompt>`** — launches a job. `<project>` is a discovered name, explicit name, or alias; the rest of the message after it is the prompt verbatim. The engine defaults to `claude` when omitted.
 
