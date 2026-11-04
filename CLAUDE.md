@@ -25,7 +25,7 @@ mix test
 - `ClaudeNotify.Telegram` - Sends messages via Telegram Bot API (supports inline keyboard buttons)
 - `ClaudeNotify.MessageFormatter` - MarkdownV2 formatted messages
 - `ClaudeNotify.TelegramPoller` - GenServer long-polling getUpdates for inline keyboard callbacks
-- `ClaudeNotify.TerminalInjector` - AppleScript keystroke injection into Terminal.app by TTY path
+- `ClaudeNotify.TerminalInjector` - delivers input to a session: `tmux send-keys` when the session runs in tmux (works while the screen is locked), else AppleScript keystroke injection into Terminal.app by TTY path (returns `:screen_locked` when the Mac is locked)
 
 ## Interactive responses
 Notification events (permission prompts) are sent to Telegram with inline keyboard buttons (Yes / Yes don't ask / No / Esc).

@@ -161,22 +161,26 @@ defmodule ClaudeNotify.TelegramPollerTest do
   end
 
   defmodule FakeTerminalInjector do
-    def send_text(tty_path, text) do
-      case Process.whereis(:telegram_poller_test_process) do
-        nil -> send(self(), {:terminal_text, tty_path, text})
-        pid -> send(pid, {:terminal_text, tty_path, text})
-      end
+    @locked_tty "/dev/ttys999"
 
-      :ok
+    def send_text(session, text) do
+      notify({:terminal_text, session[:tty_path], text})
+      result(session)
     end
 
-    def send_response(tty_path, response) do
-      case Process.whereis(:telegram_poller_test_process) do
-        nil -> send(self(), {:terminal_response, tty_path, response})
-        pid -> send(pid, {:terminal_response, tty_path, response})
-      end
+    def send_response(session, response) do
+      notify({:terminal_response, session[:tty_path], response})
+      result(session)
+    end
 
-      :ok
+    defp result(%{tty_path: @locked_tty}), do: {:error, :screen_locked}
+    defp result(_session), do: :ok
+
+    defp notify(message) do
+      case Process.whereis(:telegram_poller_test_process) do
+        nil -> send(self(), message)
+        pid -> send(pid, message)
+      end
     end
   end
 
@@ -1430,6 +1434,27 @@ defmodule ClaudeNotify.TelegramPollerTest do
       assert_receive {:telegram_send, confirmation}
       assert confirmation =~ "Sent"
       assert confirmation =~ "interpreted"
+    end
+
+    test "a locked screen yields an actionable message for text and button input", %{
+      state: state
+    } do
+      session_id = "locked-#{System.unique_integer([:positive])}"
+
+      SessionStore.register_prompt(session_id, "waiting", "/tmp/project", %{
+        "tty_path" => "/dev/ttys999"
+      })
+
+      on_exit(fn -> SessionStore.remove_session(session_id) end)
+
+      state = %{state | selected_sessions: %{@chat_id => session_id}}
+
+      for text <- ["keep going", "yes"] do
+        assert TelegramPoller.handle_update(text_message(text), state) == state
+        assert_receive {:telegram_send, message}
+        assert message =~ "Mac is locked"
+        assert message =~ "tmux"
+      end
     end
 
     test "a non-shortcut reply to an idle session (no pending question) is injected as text, and the interpreter is never called",

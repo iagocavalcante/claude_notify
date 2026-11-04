@@ -1,9 +1,10 @@
 defmodule ClaudeNotify.SessionStore do
   use GenServer
 
+  alias ClaudeNotify.TerminalInjector
+
   @stale_interval :timer.minutes(30)
   @stale_threshold :timer.hours(24)
-  @tty_regex ~r|^/dev/ttys[0-9]+$|
 
   defstruct sessions: %{},
             message_map: %{},
@@ -593,6 +594,8 @@ defmodule ClaudeNotify.SessionStore do
   defp maybe_update_tty(session, opts) do
     session
     |> maybe_put(:tty_path, opts["tty_path"])
+    |> put_tmux(:tmux_pane, opts["tmux_pane"], &TerminalInjector.valid_tmux_pane?/1)
+    |> put_tmux(:tmux_socket, opts["tmux_socket"], &TerminalInjector.valid_tmux_socket?/1)
     |> maybe_put(:term_session_id, opts["term_session_id"])
     |> maybe_put_transcript_path(opts["transcript_path"])
     |> maybe_put(:project_scope, opts["project_scope"])
@@ -773,13 +776,18 @@ defmodule ClaudeNotify.SessionStore do
   defp filter_terminal_sessions(sessions) do
     sessions
     |> Enum.filter(fn {session_id, session} ->
-      session_id != "unknown" and valid_tty?(session[:tty_path])
+      session_id != "unknown" and TerminalInjector.injectable?(session)
     end)
     |> Map.new()
   end
 
-  defp valid_tty?(tty_path) when is_binary(tty_path), do: Regex.match?(@tty_regex, tty_path)
-  defp valid_tty?(_tty_path), do: false
+  # "" means the hook ran outside tmux (session moved out); absent or invalid
+  # values leave the stored field untouched.
+  defp put_tmux(session, key, "", _valid?), do: Map.put(session, key, nil)
+
+  defp put_tmux(session, key, value, valid?) do
+    if valid?.(value), do: Map.put(session, key, value), else: session
+  end
 
   defp default_path do
     Application.get_env(

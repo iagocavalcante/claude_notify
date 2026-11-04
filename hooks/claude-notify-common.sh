@@ -145,6 +145,16 @@ resolve_codex_tui_tty() {
   printf '%s\n' "${found:-unknown}"
 }
 
+# tmux pane id (e.g. %3) and server socket path, so the server can drive the
+# session with `tmux send-keys` even while the screen is locked. Empty outside tmux.
+tmux_pane_id() {
+  printf '%s' "${TMUX_PANE:-}"
+}
+
+tmux_socket_path() {
+  [ -n "${TMUX:-}" ] && printf '%s' "${TMUX%%,*}"
+}
+
 # cwd from the hook's stdin JSON, for resolve_terminal_tty's Codex fallback.
 payload_cwd() {
   printf '%s' "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("cwd",""))' 2>/dev/null

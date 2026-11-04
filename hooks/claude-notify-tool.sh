@@ -34,6 +34,8 @@ out = {
     "session_id": d.get("session_id", sys.argv[1]),
     "term_session_id": sys.argv[2],
     "tty_path": sys.argv[3],
+    "tmux_pane": sys.argv[6],
+    "tmux_socket": sys.argv[7],
     "working_dir": d.get("cwd", sys.argv[4]),
     "tool_name": d.get("tool_name", "unknown"),
     "tool_input": tool_input,
@@ -41,7 +43,7 @@ out = {
     "transcript_path": d.get("transcript_path", "")
 }
 print(json.dumps(out))
-' "$SESSION_ID" "$TERM_SID" "$TTY_PATH" "$PWD" "${CLAUDE_NOTIFY_ENGINE:-claude}" 2>/dev/null)
+' "$SESSION_ID" "$TERM_SID" "$TTY_PATH" "$PWD" "${CLAUDE_NOTIFY_ENGINE:-claude}" "$(tmux_pane_id)" "$(tmux_socket_path)" 2>/dev/null)
 
 post_event_payload "$PAYLOAD"
 

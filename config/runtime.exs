@@ -134,6 +134,8 @@ if config_env() != :test do
         remote_port_end: 45_399
       }
     },
+    # Optional absolute path to tmux; launchd's PATH often lacks Homebrew.
+    tmux_path: System.get_env("CLAUDE_NOTIFY_TMUX_PATH"),
     keep_awake_while_working: parse_bool.(System.get_env("CLAUDE_NOTIFY_KEEP_AWAKE"), true),
     keep_awake_while_idle: parse_bool.(System.get_env("CLAUDE_NOTIFY_KEEP_AWAKE_IDLE"), false),
     max_event_concurrency: parse_int.(System.get_env("MAX_EVENT_CONCURRENCY"), 8),

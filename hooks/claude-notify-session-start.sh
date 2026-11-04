@@ -21,10 +21,12 @@ out = {
     "source": d.get("source", "startup"),
     "transcript_path": d.get("transcript_path", ""),
     "term_session_id": sys.argv[1],
-    "tty_path": sys.argv[2]
+    "tty_path": sys.argv[2],
+    "tmux_pane": sys.argv[4],
+    "tmux_socket": sys.argv[5]
 }
 print(json.dumps(out))
-' "$TERM_SID" "$TTY_PATH" "${CLAUDE_NOTIFY_ENGINE:-claude}" 2>/dev/null)
+' "$TERM_SID" "$TTY_PATH" "${CLAUDE_NOTIFY_ENGINE:-claude}" "$(tmux_pane_id)" "$(tmux_socket_path)" 2>/dev/null)
 
 post_event_payload "$PAYLOAD"
 
