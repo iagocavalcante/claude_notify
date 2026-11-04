@@ -594,14 +594,8 @@ defmodule ClaudeNotify.SessionStore do
   defp maybe_update_tty(session, opts) do
     session
     |> maybe_put(:tty_path, opts["tty_path"])
-    |> maybe_put(
-      :tmux_pane,
-      valid_or_nil(opts["tmux_pane"], &TerminalInjector.valid_tmux_pane?/1)
-    )
-    |> maybe_put(
-      :tmux_socket,
-      valid_or_nil(opts["tmux_socket"], &TerminalInjector.valid_tmux_socket?/1)
-    )
+    |> put_tmux(:tmux_pane, opts["tmux_pane"], &TerminalInjector.valid_tmux_pane?/1)
+    |> put_tmux(:tmux_socket, opts["tmux_socket"], &TerminalInjector.valid_tmux_socket?/1)
     |> maybe_put(:term_session_id, opts["term_session_id"])
     |> maybe_put_transcript_path(opts["transcript_path"])
     |> maybe_put(:project_scope, opts["project_scope"])
@@ -787,7 +781,13 @@ defmodule ClaudeNotify.SessionStore do
     |> Map.new()
   end
 
-  defp valid_or_nil(value, valid?), do: if(valid?.(value), do: value)
+  # "" means the hook ran outside tmux (session moved out); absent or invalid
+  # values leave the stored field untouched.
+  defp put_tmux(session, key, "", _valid?), do: Map.put(session, key, nil)
+
+  defp put_tmux(session, key, value, valid?) do
+    if valid?.(value), do: Map.put(session, key, value), else: session
+  end
 
   defp default_path do
     Application.get_env(

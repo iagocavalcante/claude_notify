@@ -115,13 +115,30 @@ defmodule ClaudeNotify.TerminalInjector do
     do: terminal_app(keystroke_applescript(), [tty, key], opts)
 
   defp deliver_text({:tmux, pane, socket}, text, opts) do
-    with :ok <- tmux(socket, ["send-keys", "-t", pane, "-l", "--", text], opts) do
+    # Bracketed paste keeps embedded newlines from submitting early. The buffer
+    # name is unique per call so concurrent sends can't clobber each other.
+    buffer = "claude_notify_" <> Integer.to_string(System.unique_integer([:positive]))
+
+    with :ok <- tmux(socket, ["set-buffer", "-b", buffer, "--", text], opts),
+         :ok <- paste_buffer(socket, buffer, pane, opts) do
       tmux(socket, ["send-keys", "-t", pane, "Enter"], opts)
     end
   end
 
   defp deliver_text({:terminal, tty}, text, opts),
     do: terminal_app(type_text_applescript(), [tty, text], opts)
+
+  defp paste_buffer(socket, buffer, pane, opts) do
+    case tmux(socket, ["paste-buffer", "-b", buffer, "-d", "-p", "-t", pane], opts) do
+      :ok ->
+        :ok
+
+      error ->
+        # -d only deletes on success; don't leak the buffer.
+        tmux(socket, ["delete-buffer", "-b", buffer], opts)
+        error
+    end
+  end
 
   defp tmux(socket, args, opts) do
     resolve = Keyword.get(opts, :resolve_tmux, &resolve_tmux/0)

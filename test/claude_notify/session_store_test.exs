@@ -75,6 +75,31 @@ defmodule ClaudeNotify.SessionStoreTest do
     refute SessionStore.get_session("bad-tmux")[:tmux_socket]
   end
 
+  test "empty tmux fields clear the stored pane; absent fields leave it untouched" do
+    SessionStore.register_prompt("moves", "hi", "/tmp/a", %{
+      "tty_path" => "/dev/ttys004",
+      "tmux_pane" => "%3",
+      "tmux_socket" => "/tmp/tmux-501/default"
+    })
+
+    SessionStore.register_prompt("moves", "hi", "/tmp/a", %{"tty_path" => "/dev/ttys004"})
+
+    assert %{tmux_pane: "%3", tmux_socket: "/tmp/tmux-501/default"} =
+             SessionStore.get_session("moves")
+
+    SessionStore.register_prompt("moves", "hi", "/tmp/a", %{"tmux_pane" => "bogus"})
+    assert %{tmux_pane: "%3"} = SessionStore.get_session("moves")
+
+    SessionStore.register_prompt("moves", "hi", "/tmp/a", %{
+      "tmux_pane" => "",
+      "tmux_socket" => ""
+    })
+
+    session = SessionStore.get_session("moves")
+    assert session.tmux_pane == nil
+    assert session.tmux_socket == nil
+  end
+
   test "terminal_sessions excludes headless and unknown sessions" do
     SessionStore.register_prompt("interactive", "hello", "/tmp/a", %{
       "tty_path" => "/dev/ttys004"

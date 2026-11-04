@@ -25,13 +25,25 @@ defmodule ClaudeNotify.TerminalInjectorTest do
     ]
   end
 
-  test "tmux text sends literal text then Enter" do
+  test "tmux text is pasted via a unique buffer, then Enter" do
     session = %{tmux_pane: "%3", tty_path: "/dev/ttys001"}
 
-    assert :ok = TerminalInjector.send_text(session, "-n hello", opts())
-    assert_received {:cmd, "/bin/tmux", ["send-keys", "-t", "%3", "-l", "--", "-n hello"]}
+    assert :ok = TerminalInjector.send_text(session, "-n line1\nline2", opts())
+
+    assert_received {:cmd, "/bin/tmux", ["set-buffer", "-b", buffer, "--", "-n line1\nline2"]}
+    assert buffer =~ ~r/^claude_notify_\d+$/
+    assert_received {:cmd, "/bin/tmux", ["paste-buffer", "-b", ^buffer, "-d", "-p", "-t", "%3"]}
     assert_received {:cmd, "/bin/tmux", ["send-keys", "-t", "%3", "Enter"]}
     refute_received {:cmd, "osascript", _}
+  end
+
+  test "tmux text honours the socket on every command" do
+    session = %{tmux_pane: "%3", tmux_socket: "/tmp/tmux-501/default"}
+    assert :ok = TerminalInjector.send_text(session, "hi", opts())
+
+    for sub <- ["set-buffer", "paste-buffer", "send-keys"] do
+      assert_received {:cmd, "/bin/tmux", ["-S", "/tmp/tmux-501/default", ^sub | _]}
+    end
   end
 
   test "tmux honours the socket path" do
@@ -74,7 +86,7 @@ defmodule ClaudeNotify.TerminalInjectorTest do
     assert {:error, {:tmux_failed, 1, "can't find pane: %3"}} =
              TerminalInjector.send_text(%{tmux_pane: "%3"}, "x", opts)
 
-    refute_received {:cmd, "/bin/tmux", [_, _, _, "Enter"]}
+    refute_received {:cmd, "/bin/tmux", ["paste-buffer" | _]}
   end
 
   test "Terminal.app backend refuses to run osascript while locked" do
