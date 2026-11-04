@@ -191,7 +191,14 @@ defmodule ClaudeNotify.TerminalInjector do
         set targetTab to missing value
         set targetWindow to missing value
         repeat with w in every window
-          repeat with t in every tab of w
+          -- Terminal can list non-terminal windows (Settings, sheets) that have no
+          -- tabs; reading their tabs errors (-1728), so skip them.
+          try
+            set windowTabs to every tab of w
+          on error
+            set windowTabs to {}
+          end try
+          repeat with t in windowTabs
             if tty of t is ttyPath then
               set targetTab to t
               set targetWindow to w
@@ -239,7 +246,14 @@ defmodule ClaudeNotify.TerminalInjector do
         set targetTab to missing value
         set targetWindow to missing value
         repeat with w in every window
-          repeat with t in every tab of w
+          -- Terminal can list non-terminal windows (Settings, sheets) that have no
+          -- tabs; reading their tabs errors (-1728), so skip them.
+          try
+            set windowTabs to every tab of w
+          on error
+            set windowTabs to {}
+          end try
+          repeat with t in windowTabs
             if tty of t is ttyPath then
               set targetTab to t
               set targetWindow to w
@@ -276,7 +290,14 @@ defmodule ClaudeNotify.TerminalInjector do
         set targetTab to missing value
         set targetWindow to missing value
         repeat with w in every window
-          repeat with t in every tab of w
+          -- Terminal can list non-terminal windows (Settings, sheets) that have no
+          -- tabs; reading their tabs errors (-1728), so skip them.
+          try
+            set windowTabs to every tab of w
+          on error
+            set windowTabs to {}
+          end try
+          repeat with t in windowTabs
             if tty of t is ttyPath then
               set targetTab to t
               set targetWindow to w
