@@ -1,6 +1,8 @@
 defmodule ClaudeNotify.EventHandler do
   require Logger
 
+  @session_opt_keys ~w(tty_path tmux_pane tmux_socket term_session_id transcript_path engine)
+
   alias ClaudeNotify.{
     SessionStore,
     MessageFormatter,
@@ -19,7 +21,7 @@ defmodule ClaudeNotify.EventHandler do
 
     opts =
       params
-      |> Map.take(["tty_path", "term_session_id", "transcript_path", "engine"])
+      |> Map.take(@session_opt_keys)
       |> attach_project_scope(session_id, working_dir)
       |> sanitize_opts()
 
@@ -38,7 +40,7 @@ defmodule ClaudeNotify.EventHandler do
 
     opts =
       params
-      |> Map.take(["tty_path", "term_session_id", "transcript_path", "engine"])
+      |> Map.take(@session_opt_keys)
       |> attach_project_scope(session_id, working_dir)
       |> sanitize_opts()
 
@@ -71,7 +73,7 @@ defmodule ClaudeNotify.EventHandler do
 
     opts =
       params
-      |> Map.take(["tty_path", "term_session_id", "transcript_path", "engine"])
+      |> Map.take(@session_opt_keys)
       |> attach_project_scope(session_id, working_dir)
       |> sanitize_opts()
 
@@ -139,7 +141,7 @@ defmodule ClaudeNotify.EventHandler do
 
     opts =
       params
-      |> Map.take(["tty_path", "term_session_id", "transcript_path", "engine"])
+      |> Map.take(@session_opt_keys)
       |> attach_project_scope(session_id, working_dir)
       |> sanitize_opts()
 
@@ -172,7 +174,7 @@ defmodule ClaudeNotify.EventHandler do
 
     opts =
       params
-      |> Map.take(["tty_path", "term_session_id", "transcript_path", "engine"])
+      |> Map.take(@session_opt_keys)
       |> attach_project_scope(session_id, working_dir)
       |> sanitize_opts()
 

@@ -56,6 +56,25 @@ defmodule ClaudeNotify.SessionStoreTest do
     assert map_size(sessions) == 2
   end
 
+  test "tmux fields are stored, make a session injectable, and invalid ones are dropped" do
+    SessionStore.register_prompt("tmux-only", "hello", "/tmp/a", %{
+      "tmux_pane" => "%3",
+      "tmux_socket" => "/tmp/tmux-501/default"
+    })
+
+    SessionStore.register_prompt("bad-tmux", "hello", "/tmp/b", %{
+      "tmux_pane" => "%3; rm -rf",
+      "tmux_socket" => "tmp/../x"
+    })
+
+    assert %{"tmux-only" => %{tmux_pane: "%3", tmux_socket: "/tmp/tmux-501/default"}} =
+             terminals = SessionStore.terminal_sessions()
+
+    refute Map.has_key?(terminals, "bad-tmux")
+    refute SessionStore.get_session("bad-tmux")[:tmux_pane]
+    refute SessionStore.get_session("bad-tmux")[:tmux_socket]
+  end
+
   test "terminal_sessions excludes headless and unknown sessions" do
     SessionStore.register_prompt("interactive", "hello", "/tmp/a", %{
       "tty_path" => "/dev/ttys004"

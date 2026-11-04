@@ -680,11 +680,10 @@ defmodule ClaudeNotify.TelegramPoller do
   end
 
   defp inject_reply_text(text, session, inbound_message_id, state) do
-    tty_path = session[:tty_path]
     project = ProjectScope.display_name(session)
     injector = Map.get(state, :terminal_injector, TerminalInjector)
 
-    case injector.send_text(tty_path, text) do
+    case injector.send_text(session, text) do
       :ok ->
         mark_terminal_prompt(session.id, text, inbound_message_id)
         state
@@ -693,7 +692,9 @@ defmodule ClaudeNotify.TelegramPoller do
         Logger.warning("TelegramPoller: reply inject failed: #{inspect(reason)}")
 
         state.telegram.send_message_with_retry(
-          MessageFormatter.escape_full("Failed to send to #{project}")
+          MessageFormatter.escape_full(
+            injection_error_message(reason, "Failed to send to #{project}")
+          )
         )
 
         state
@@ -1582,11 +1583,10 @@ defmodule ClaudeNotify.TelegramPoller do
     case resolve_session(chat_id, state) do
       {:ok, session_id, state} ->
         session = SessionStore.get_session(session_id)
-        tty_path = session[:tty_path]
         short_id = String.slice(session_id, 0, 8)
         injector = Map.get(state, :terminal_injector, TerminalInjector)
 
-        case injector.send_text(tty_path, text) do
+        case injector.send_text(session, text) do
           :ok ->
             mark_terminal_prompt(session_id, text, inbound_message_id)
 
@@ -1595,7 +1595,10 @@ defmodule ClaudeNotify.TelegramPoller do
 
             state.telegram.send_message_with_retry(
               MessageFormatter.escape_full(
-                "Failed to send to #{short_id} (tty: #{tty_path || "none"}): #{inspect(reason)}"
+                injection_error_message(
+                  reason,
+                  "Failed to send to #{short_id}: #{inspect(reason)}"
+                )
               )
             )
         end
@@ -3443,6 +3446,22 @@ defmodule ClaudeNotify.TelegramPoller do
     end
   end
 
+  defp injection_error_message(:screen_locked, _default) do
+    "🔒 Mac is locked — keystrokes can't reach Terminal.app. Unlock it, or run Claude " <>
+      "inside tmux so Telegram can drive the session while locked. For unattended work, " <>
+      "start a project chat (/new) — background jobs run fine while locked."
+  end
+
+  defp injection_error_message(:tmux_not_found, _default) do
+    "tmux was not found. Install it or set CLAUDE_NOTIFY_TMUX_PATH."
+  end
+
+  defp injection_error_message({:tmux_failed, _status, _output}, _default) do
+    "tmux could not deliver the input (is the pane still open?)."
+  end
+
+  defp injection_error_message(_reason, default), do: default
+
   defp inject_response(state, session_id, response) do
     case SessionStore.get_session(session_id) do
       nil ->
@@ -3450,11 +3469,9 @@ defmodule ClaudeNotify.TelegramPoller do
         {:error, :session_not_found}
 
       session ->
-        tty_path = session[:tty_path]
-
         injector = Map.get(state, :terminal_injector, TerminalInjector)
 
-        case injector.send_response(tty_path, response) do
+        case injector.send_response(session, response) do
           :ok ->
             :ok
 
@@ -3465,7 +3482,10 @@ defmodule ClaudeNotify.TelegramPoller do
 
             state.telegram.send_message_with_retry(
               MessageFormatter.escape_full(
-                "Failed to inject #{response_label(response)} into #{short_id}"
+                injection_error_message(
+                  reason,
+                  "Failed to inject #{response_label(response)} into #{short_id}"
+                )
               )
             )
 

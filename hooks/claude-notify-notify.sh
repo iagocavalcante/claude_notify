@@ -48,12 +48,14 @@ out = {
     "message": message,
     "term_session_id": sys.argv[2],
     "tty_path": sys.argv[3],
+    "tmux_pane": sys.argv[7],
+    "tmux_socket": sys.argv[8],
     "working_dir": d.get("cwd", sys.argv[4]),
     "transcript_path": d.get("transcript_path", ""),
     "git_diff": sys.argv[5]
 }
 print(json.dumps(out))
-' "$SESSION_ID" "$TERM_SID" "$TTY_PATH" "$PWD" "$GIT_DIFF" "${CLAUDE_NOTIFY_ENGINE:-claude}" 2>/dev/null)
+' "$SESSION_ID" "$TERM_SID" "$TTY_PATH" "$PWD" "$GIT_DIFF" "${CLAUDE_NOTIFY_ENGINE:-claude}" "$(tmux_pane_id)" "$(tmux_socket_path)" 2>/dev/null)
 
 post_event_payload "$PAYLOAD"
 

@@ -26,6 +26,23 @@ defmodule ClaudeNotify.EventHandlerTest do
     assert session.tty_path == "/dev/ttys009"
   end
 
+  test "session_start stores tmux pane and socket" do
+    assert :ok =
+             EventHandler.handle_event(%{
+               "event" => "session_start",
+               "session_id" => "tmux-sess",
+               "working_dir" => "/tmp/project",
+               "source" => "startup",
+               "tty_path" => "/dev/ttys009",
+               "tmux_pane" => "%7",
+               "tmux_socket" => "/tmp/tmux-501/default"
+             })
+
+    session = SessionStore.get_session("tmux-sess")
+    assert session.tmux_pane == "%7"
+    assert session.tmux_socket == "/tmp/tmux-501/default"
+  end
+
   test "session_start stores the canonical project scope for a nested cwd" do
     tmp = Path.join(System.tmp_dir!(), "event_scope_#{System.unique_integer([:positive])}")
     repo = Path.join(tmp, "canonical-project")

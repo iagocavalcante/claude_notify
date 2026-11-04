@@ -179,6 +179,27 @@ Already-running Claude Code and Codex terminals do not need to be relaunched. Us
 
 Registered bot commands in the table above are handled by Claude Notify. Every other slash command is forwarded verbatim to the selected destination, so project skills such as `/post-shorts make three variants` work like they do in Claude Code. A selected terminal session receives the text in its existing Terminal.app tab. A selected project behaves as a durable chat: the first message creates an isolated dispatcher workspace, later messages resume it, and follow-ups sent while the agent is busy run sequentially from a bounded durable queue.
 
+## Controlling sessions while the Mac is locked
+
+macOS drops synthetic keystrokes while the screen is locked, so the Terminal.app
+backend cannot deliver replies or buttons then. Instead of failing silently, the
+bot answers with a "Mac is locked" message.
+
+- **Recommended: run Claude inside tmux.** `tmux new -s claude`, then run
+  `claude`. The hooks report `$TMUX_PANE` and the tmux socket, and replies are
+  delivered with `tmux send-keys`, which works with the screen locked.
+- **Terminal.app (no tmux):** input is refused with a clear error while locked;
+  unlock the Mac and resend.
+- **tmux location:** launchd's PATH often lacks Homebrew. Set
+  `CLAUDE_NOTIFY_TMUX_PATH=/opt/homebrew/bin/tmux` to override; otherwise `PATH`,
+  `/opt/homebrew/bin/tmux` and `/usr/local/bin/tmux` are tried.
+- **Unattended work:** start a project chat (`/new`); background jobs run fine
+  while locked.
+
+Sleep caveats: `caffeinate -i` only prevents idle sleep. Closing the lid sleeps
+the Mac unless it is on power with an external display. Set
+`CLAUDE_NOTIFY_KEEP_AWAKE_IDLE=true` to stay reachable while sessions sit idle.
+
 ## Security Model
 
 - Only the configured `TELEGRAM_CHAT_ID` can control sessions from Telegram messages/callbacks.
